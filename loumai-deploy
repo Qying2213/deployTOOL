@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+TOOL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET="${1:-}"
+
+case "${TARGET}" in
+  frontend)
+    shift
+    exec node "${TOOL_ROOT}/frontend/h5-release.mjs" "$@"
+    ;;
+  backend)
+    shift
+    exec node "${TOOL_ROOT}/backend/backend-release.mjs" "$@"
+    ;;
+  help|-h|--help|"")
+    cat <<'EOF'
+楼脉统一部署工具
+
+用法：
+  ./loumai-deploy frontend build --env test
+  ./loumai-deploy frontend deploy --env test --dry-run
+  ./loumai-deploy frontend deploy --env test --yes
+  ./loumai-deploy frontend status
+  ./loumai-deploy frontend rollback --release RELEASE_ID --yes
+
+  ./loumai-deploy backend build
+  ./loumai-deploy backend deploy --dry-run
+  ./loumai-deploy backend deploy --yes
+  ./loumai-deploy backend status
+  ./loumai-deploy backend rollback --release RELEASE_ID --yes --ack-db-schema-compatible
+EOF
+    ;;
+  *)
+    printf '未知目标：%s（只能是 frontend 或 backend）\n' "${TARGET}" >&2
+    exit 2
+    ;;
+esac

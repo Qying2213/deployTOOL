@@ -1,0 +1,640 @@
+#!/bin/bash
+
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS
+umask 022
+
+readonly HELPER_VERSION="2"
+readonly CONFIG_FILE="/etc/loumai/h5-release.env"
+
+config_parent="${CONFIG_FILE%/*}"
+checked_parent="$config_parent"
+[[ -d "$config_parent" && ! -L "$config_parent" ]] \
+  || { printf 'ERROR: 配置目录不存在或是软链接：%s\n' "$config_parent" >&2; exit 1; }
+[[ "$(readlink -f "$config_parent")" == "$config_parent" ]] \
+  || { printf 'ERROR: 配置目录路径包含软链接\n' >&2; exit 1; }
+while [[ "$checked_parent" != "/" ]]; do
+  [[ "$(stat -c '%u' "$checked_parent")" == "0" ]] \
+    || { printf 'ERROR: 配置目录及父目录必须归 root 所有：%s\n' "$checked_parent" >&2; exit 1; }
+  [[ -z "$(find "$checked_parent" -maxdepth 0 -perm /022 -print -quit)" ]] \
+    || { printf 'ERROR: 配置目录及父目录不能被组或其他用户写入：%s\n' "$checked_parent" >&2; exit 1; }
+  checked_parent="${checked_parent%/*}"
+  [[ -n "$checked_parent" ]] || checked_parent="/"
+done
+unset checked_parent config_parent
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "服务器缺少命令：$1"
+}
+
+valid_absolute_path() {
+  local value="$1"
+  [[ "$value" == /* ]] \
+    && [[ "$value" != "/" ]] \
+    && [[ "$value" != *".."* ]] \
+    && [[ "$value" =~ ^/[A-Za-z0-9._/-]+$ ]]
+}
+
+valid_release_id() {
+  [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}$ ]]
+}
+
+valid_commit() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+valid_sha256() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  fail "找不到服务器配置：$CONFIG_FILE"
+fi
+[[ ! -L "$CONFIG_FILE" ]] || fail "服务器配置不能是软链接"
+[[ "$(stat -c '%u' "$CONFIG_FILE")" == "0" ]] \
+  || fail "服务器配置必须归 root 所有"
+[[ -z "$(find "$CONFIG_FILE" -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "服务器配置不能允许组或其他用户写入"
+
+# This file is installed and owned by root during one-time server setup.
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS
+
+: "${LOUMAI_H5_REMOTE_ROOT:?缺少 LOUMAI_H5_REMOTE_ROOT}"
+: "${LOUMAI_H5_STAGING_ROOT:?缺少 LOUMAI_H5_STAGING_ROOT}"
+: "${LOUMAI_H5_PUBLIC_URL:?缺少 LOUMAI_H5_PUBLIC_URL}"
+: "${LOUMAI_H5_DEPLOY_USER:?缺少 LOUMAI_H5_DEPLOY_USER}"
+
+readonly REMOTE_ROOT="$LOUMAI_H5_REMOTE_ROOT"
+readonly STAGING_ROOT="$LOUMAI_H5_STAGING_ROOT"
+readonly PUBLIC_URL="${LOUMAI_H5_PUBLIC_URL%/}"
+readonly DEPLOY_USER="$LOUMAI_H5_DEPLOY_USER"
+readonly WEB_USER="${LOUMAI_H5_WEB_USER:-www-data}"
+readonly NGINX_BIN="${LOUMAI_H5_NGINX_BIN:-/usr/sbin/nginx}"
+readonly RELEASES_ROOT="$REMOTE_ROOT/frontend-releases"
+readonly CURRENT_LINK="$REMOTE_ROOT/frontend-current"
+readonly LOCK_FILE="$REMOTE_ROOT/.frontend-release.lock"
+
+ROLLBACK_ARMED=0
+ROLLBACK_PREVIOUS=""
+ROLLBACK_TARGET=""
+ROLLBACK_RELEASE_ID=""
+
+valid_absolute_path "$REMOTE_ROOT" || fail "REMOTE_ROOT 不是安全绝对路径"
+valid_absolute_path "$STAGING_ROOT" || fail "STAGING_ROOT 不是安全绝对路径"
+[[ "$PUBLIC_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] \
+  || fail "PUBLIC_URL 必须是 HTTPS 根地址"
+[[ "$NGINX_BIN" == /* ]] || fail "NGINX_BIN 必须是绝对路径"
+
+for command_name in flock rsync sha256sum curl find grep readlink mv ln cmp runuser awk sed head wc tr id mktemp rm stat chown chmod install cp tar sort; do
+  require_command "$command_name"
+done
+[[ -x "$NGINX_BIN" ]] || fail "Nginx 命令不可执行：$NGINX_BIN"
+
+assert_root_controlled_directory() {
+  local directory="$1"
+  local canonical unsafe checked
+
+  [[ -d "$directory" && ! -L "$directory" ]] \
+    || fail "目录不存在或是软链接：$directory"
+  canonical="$(readlink -f "$directory")"
+  [[ "$canonical" == "$directory" ]] || fail "目录路径包含软链接：$directory"
+  checked="$directory"
+  while [[ "$checked" != "/" ]]; do
+    [[ "$(stat -c '%u' "$checked")" == "0" ]] \
+      || fail "目录及其父目录必须归 root 所有：$checked"
+    unsafe="$(find "$checked" -maxdepth 0 -perm /022 -print -quit)"
+    [[ -z "$unsafe" ]] || fail "目录及其父目录不能允许组或其他用户写入：$checked"
+    checked="${checked%/*}"
+    [[ -n "$checked" ]] || checked="/"
+  done
+}
+
+assert_release_directories() {
+  assert_root_controlled_directory "$REMOTE_ROOT"
+  assert_root_controlled_directory "$RELEASES_ROOT"
+  assert_root_controlled_directory "$STAGING_ROOT"
+  id "$DEPLOY_USER" >/dev/null 2>&1 || fail "服务器不存在发布用户：$DEPLOY_USER"
+}
+
+current_target() {
+  local target
+
+  if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+    printf '\n'
+    return 0
+  fi
+  [[ -L "$CURRENT_LINK" ]] || fail "frontend-current 必须是软链接"
+  target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+  [[ -n "$target" ]] || fail "frontend-current 是失效软链接"
+  if [[ -n "$target" ]]; then
+    [[ "$target" == "$RELEASES_ROOT"/*/frontend ]] \
+      || fail "frontend-current 指向受控前端版本目录之外：$target"
+    assert_root_controlled_directory "$target"
+  fi
+  printf '%s\n' "$target"
+}
+
+acquire_lock() {
+  assert_release_directories
+  [[ ! -L "$LOCK_FILE" ]] || fail "发布锁不能是软链接"
+  exec 9>"$LOCK_FILE"
+  flock -w 120 9 || fail "另一个前端发布仍在执行"
+}
+
+assert_stage_safety() {
+  local stage_dir="$1"
+  local unsafe_path
+
+  [[ -d "$stage_dir" ]] || fail "上传暂存目录不存在：$stage_dir"
+  [[ ! -L "$stage_dir" ]] || fail "暂存目录不能是软链接"
+  [[ -f "$stage_dir/index.html" ]] || fail "暂存产物缺少 index.html"
+  [[ -f "$stage_dir/release.json" ]] || fail "暂存产物缺少 release.json"
+  [[ -f "$stage_dir/SHA256SUMS" ]] || fail "暂存产物缺少 SHA256SUMS"
+
+  unsafe_path="$(find "$stage_dir" -type l -print -quit)"
+  [[ -z "$unsafe_path" ]] || fail "暂存产物包含软链接：$unsafe_path"
+  unsafe_path="$(find "$stage_dir" ! -type d ! -type f -print -quit)"
+  [[ -z "$unsafe_path" ]] || fail "暂存产物包含特殊文件：$unsafe_path"
+  unsafe_path="$(find "$stage_dir" -type f -links +1 -print -quit)"
+  [[ -z "$unsafe_path" ]] || fail "暂存产物包含硬链接文件：$unsafe_path"
+}
+
+assert_upload_safety() {
+  local stage_dir="$1"
+  local unexpected
+
+  [[ -d "$stage_dir" && ! -L "$stage_dir" ]] \
+    || fail "上传暂存目录不存在或是软链接：$stage_dir"
+  [[ -f "$stage_dir/frontend.tar" && ! -L "$stage_dir/frontend.tar" ]] \
+    || fail "上传暂存目录缺少普通 frontend.tar"
+  unexpected="$(find "$stage_dir" -mindepth 1 -maxdepth 1 \
+    ! -name frontend.tar -print -quit)"
+  [[ -z "$unexpected" ]] || fail "上传暂存目录包含额外内容：$unexpected"
+}
+
+verify_checksums() {
+  local frontend_dir="$1"
+  local mode="${2:-exact}"
+  local line hash relative absolute
+  local -A expected_paths=()
+
+  [[ "$mode" == "exact" || "$mode" == "allow-inherited-assets" ]] \
+    || fail "未知哈希校验模式：$mode"
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([0-9a-f]{64})\ \ ([A-Za-z0-9._/-]+)$ ]] \
+      || fail "SHA256SUMS 格式非法"
+    hash="${BASH_REMATCH[1]}"
+    relative="${BASH_REMATCH[2]}"
+    valid_sha256 "$hash" || fail "SHA256SUMS 包含非法哈希"
+    [[ "$relative" != /* ]] \
+      && [[ "$relative" != *".."* ]] \
+      && [[ "$relative" != "-" ]] \
+      && [[ "$relative" != "SHA256SUMS" ]] \
+      || fail "SHA256SUMS 包含不安全路径：$relative"
+    [[ -z "${expected_paths[$relative]+x}" ]] \
+      || fail "SHA256SUMS 包含重复路径：$relative"
+    expected_paths[$relative]=1
+  done < "$frontend_dir/SHA256SUMS"
+
+  [[ "${#expected_paths[@]}" -gt 0 ]] || fail "SHA256SUMS 为空"
+  (
+    cd "$frontend_dir"
+    sha256sum -c SHA256SUMS >/dev/null
+  ) || fail "远端文件哈希校验失败"
+
+  while IFS= read -r -d '' absolute; do
+    relative="${absolute#"$frontend_dir"/}"
+    [[ "$relative" == "SHA256SUMS" ]] && continue
+    if [[ -z "${expected_paths[$relative]+x}" ]]; then
+      [[ "$mode" == "allow-inherited-assets" && "$relative" == assets/* ]] \
+        || fail "远端存在哈希清单之外的文件：$relative"
+    fi
+  done < <(find "$frontend_dir" -type f -print0)
+}
+
+verify_release_metadata() {
+  local frontend_dir="$1"
+  local release_id="$2"
+  local expected_commit="$3"
+  local expected_index_sha="$4"
+  local actual_index_sha
+
+  grep -Fq "\"release_id\": \"$release_id\"" "$frontend_dir/release.json" \
+    || fail "release.json 的 release_id 不匹配"
+  grep -Fq "\"commit\": \"$expected_commit\"" "$frontend_dir/release.json" \
+    || fail "release.json 的 commit 不匹配"
+  grep -Fq "\"index_sha256\": \"$expected_index_sha\"" "$frontend_dir/release.json" \
+    || fail "release.json 的 index_sha256 不匹配"
+
+  actual_index_sha="$(sha256sum "$frontend_dir/index.html" | awk '{print $1}')"
+  [[ "$actual_index_sha" == "$expected_index_sha" ]] \
+    || fail "index.html 哈希与 release.json 不一致"
+}
+
+assert_asset_collisions_safe() {
+  local source_frontend="$1"
+  local current_frontend="$2"
+  local source_file relative current_file
+
+  [[ -d "$current_frontend" ]] || return 0
+
+  if [[ -d "$source_frontend/assets" && -d "$current_frontend/assets" ]]; then
+    while IFS= read -r source_file; do
+      relative="${source_file#"$source_frontend"/}"
+      current_file="$current_frontend/$relative"
+      if [[ -f "$current_file" ]] && ! cmp -s -- "$source_file" "$current_file"; then
+        fail "内容哈希资源发生同名不同内容冲突：$relative"
+      fi
+    done < <(find "$source_frontend/assets" -type f -print)
+  fi
+
+  while IFS= read -r source_file; do
+    relative="${source_file#"$source_frontend"/}"
+    case "$relative" in
+      assets/*|index.html|release.json|SHA256SUMS)
+        continue
+        ;;
+      *.js|*.css|*.png|*.jpg|*.jpeg|*.gif|*.svg|*.webp|*.ico|*.woff|*.woff2)
+        current_file="$current_frontend/$relative"
+        if [[ -f "$current_file" ]] && ! cmp -s -- "$source_file" "$current_file"; then
+          fail "非哈希静态资源内容变化，可能被 immutable 缓存：$relative"
+        fi
+        ;;
+    esac
+  done < <(find "$source_frontend" -type f -print)
+}
+
+merge_previous_assets() {
+  local current_frontend="$1"
+  local target_frontend="$2"
+
+  [[ -n "$current_frontend" ]] || return 0
+  if [[ -d "$current_frontend/assets" ]]; then
+    mkdir -p -- "$target_frontend/assets"
+    rsync -a --no-owner --no-group --ignore-existing -- \
+      "$current_frontend/assets/" "$target_frontend/assets/"
+  fi
+}
+
+switch_current_link() {
+  local target_frontend="$1"
+  local release_id="$2"
+  local next_link="$REMOTE_ROOT/.frontend-current.next.$release_id.$$"
+
+  [[ ! -e "$next_link" && ! -L "$next_link" ]] || fail "临时软链接已存在：$next_link"
+  ln -s -- "$target_frontend" "$next_link"
+  mv -Tf -- "$next_link" "$CURRENT_LINK"
+}
+
+restore_previous_current() {
+  local status="$?"
+  local current=""
+
+  trap - EXIT INT TERM HUP
+  if [[ "$ROLLBACK_ARMED" == "1" ]]; then
+    set +e
+    current="$(current_target 2>/dev/null)"
+    if [[ "$current" == "$ROLLBACK_TARGET" ]]; then
+      if [[ -n "$ROLLBACK_PREVIOUS" ]]; then
+        switch_current_link \
+          "$ROLLBACK_PREVIOUS" "interrupted-$ROLLBACK_RELEASE_ID"
+      elif [[ -L "$CURRENT_LINK" ]]; then
+        rm -f -- "$CURRENT_LINK"
+      fi
+    fi
+  fi
+  exit "$status"
+}
+
+arm_current_rollback() {
+  ROLLBACK_PREVIOUS="$1"
+  ROLLBACK_TARGET="$2"
+  ROLLBACK_RELEASE_ID="$3"
+  ROLLBACK_ARMED=1
+  trap restore_previous_current EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+disarm_current_rollback() {
+  ROLLBACK_ARMED=0
+  trap - EXIT INT TERM HUP
+}
+
+public_verify() {
+  local release_id="$1"
+  local expected_commit="$2"
+  local expected_index_sha="$3"
+  local target_frontend="$4"
+  local response_file actual_index_sha result=0
+  local asset_path relative_asset expected_asset_sha actual_asset_sha
+  local -a asset_paths=()
+
+  response_file="$(mktemp /tmp/loumai-h5-release.XXXXXX)"
+  if ! curl -fsSL --connect-timeout 5 --max-time 30 \
+    --retry 2 --retry-delay 1 --retry-max-time 60 --max-filesize 1048576 \
+    "$PUBLIC_URL/release.json?release_check=$release_id" \
+    -o "$response_file"; then
+    result=1
+  elif ! grep -Fq "\"release_id\": \"$release_id\"" "$response_file"; then
+    result=1
+  elif ! grep -Fq "\"commit\": \"$expected_commit\"" "$response_file"; then
+    result=1
+  elif ! curl -fsSL --connect-timeout 5 --max-time 30 \
+    --retry 2 --retry-delay 1 --retry-max-time 60 --max-filesize 8388608 \
+    "$PUBLIC_URL/?release_check=$release_id" \
+    -o "$response_file"; then
+    result=1
+  else
+    actual_index_sha="$(sha256sum "$response_file" | awk '{print $1}')"
+    [[ "$actual_index_sha" == "$expected_index_sha" ]] || result=1
+  fi
+  if [[ "$result" == "0" ]]; then
+    mapfile -t asset_paths < <(
+      grep -oE '(src|href)="/assets/[A-Za-z0-9._/-]+"' \
+        "$target_frontend/index.html" \
+        | sed -E 's/^(src|href)="([^"]+)"$/\2/' \
+        | sort -u
+    )
+    [[ "${#asset_paths[@]}" -gt 0 ]] || result=1
+  fi
+  if [[ "$result" == "0" ]]; then
+    for asset_path in "${asset_paths[@]}"; do
+      relative_asset="${asset_path#/}"
+      expected_asset_sha="$(awk -v path="$relative_asset" \
+        '$2 == path { print $1; exit }' "$target_frontend/SHA256SUMS")"
+      if ! valid_sha256 "$expected_asset_sha"; then
+        result=1
+        break
+      fi
+      if ! curl -fsSL --connect-timeout 5 --max-time 30 \
+        --retry 2 --retry-delay 1 --retry-max-time 60 --max-filesize 33554432 \
+        "$PUBLIC_URL$asset_path?release_check=$release_id" \
+        -o "$response_file"; then
+        result=1
+        break
+      fi
+      actual_asset_sha="$(sha256sum "$response_file" | awk '{print $1}')"
+      if [[ "$actual_asset_sha" != "$expected_asset_sha" ]]; then
+        result=1
+        break
+      fi
+    done
+  fi
+  rm -f -- "$response_file"
+  return "$result"
+}
+
+extract_release_field() {
+  local manifest="$1"
+  local field="$2"
+  sed -n "s/.*\"$field\": \"\([^\"]*\)\".*/\1/p" "$manifest" | head -1
+}
+
+action_preflight() {
+  assert_release_directories
+  "$NGINX_BIN" -t >/dev/null
+  printf 'HELPER_VERSION=%s\n' "$HELPER_VERSION"
+  printf 'REMOTE_ROOT=%s\n' "$REMOTE_ROOT"
+  printf 'STAGING_ROOT=%s\n' "$STAGING_ROOT"
+  printf 'CURRENT=%s\n' "$(current_target)"
+}
+
+action_prepare() {
+  local release_id="$1"
+  local stage_dir deploy_group
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  [[ ! -e "$stage_dir" && ! -L "$stage_dir" ]] \
+    || fail "staging 版本目录已存在：$stage_dir"
+  deploy_group="$(id -gn "$DEPLOY_USER")"
+  install -d -m 0700 -o "$DEPLOY_USER" -g "$deploy_group" -- "$stage_dir"
+  printf 'STAGE_DIR=%s\n' "$stage_dir"
+}
+
+action_abort() {
+  local release_id="$1"
+  local stage_dir
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  if [[ ! -e "$stage_dir" && ! -L "$stage_dir" ]]; then
+    printf 'ABORTED=NONE\n'
+    return 0
+  fi
+  [[ -d "$stage_dir" && ! -L "$stage_dir" ]] \
+    || fail "拒绝清理异常 staging 路径：$stage_dir"
+  case "$stage_dir" in
+    "$STAGING_ROOT"/"$release_id".partial)
+      rm -rf -- "$stage_dir"
+      ;;
+    *)
+      fail "staging 清理路径越界"
+      ;;
+  esac
+  printf 'ABORTED=%s\n' "$stage_dir"
+}
+
+action_status() {
+  local current
+  assert_release_directories
+  current="$(current_target)"
+  printf 'CURRENT=%s\n' "$current"
+  if [[ -n "$current" && -f "$current/release.json" ]]; then
+    cat "$current/release.json"
+  fi
+}
+
+action_activate() {
+  local release_id="$1"
+  local expected_commit="$2"
+  local expected_index_sha="$3"
+  local expected_checksums_sha="$4"
+  local expected_archive_sha="$5"
+  local expected_current="$6"
+  local stage_dir release_root partial_root target_frontend archive_path
+  local actual_current actual_checksums_sha actual_archive_sha
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  valid_commit "$expected_commit" || fail "commit 格式非法"
+  valid_sha256 "$expected_index_sha" || fail "index sha256 格式非法"
+  valid_sha256 "$expected_checksums_sha" || fail "checksums sha256 格式非法"
+  valid_sha256 "$expected_archive_sha" || fail "archive sha256 格式非法"
+
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  release_root="$RELEASES_ROOT/$release_id"
+  partial_root="$RELEASES_ROOT/.$release_id.frontend.partial"
+  target_frontend="$release_root/frontend"
+
+  acquire_lock
+  actual_current="$(current_target)"
+  [[ "${actual_current:-NONE}" == "$expected_current" ]] \
+    || fail "frontend-current 已被其他发布修改，拒绝覆盖"
+
+  assert_upload_safety "$stage_dir"
+
+  [[ ! -e "$release_root" && ! -L "$release_root" ]] \
+    || fail "版本目录已存在：$release_root"
+  [[ ! -e "$partial_root" && ! -L "$partial_root" ]] \
+    || fail "残留 partial 目录需要人工检查：$partial_root"
+
+  install -d -m 0700 -o root -g root -- "$partial_root"
+  archive_path="$partial_root/frontend.tar"
+  actual_archive_sha="$(sha256sum "$stage_dir/frontend.tar" | awk '{print $1}')"
+  [[ "$actual_archive_sha" == "$expected_archive_sha" ]] \
+    || fail "上传归档与本地哈希不一致"
+  cp --reflink=never -- "$stage_dir/frontend.tar" "$archive_path"
+  chown root:root -- "$archive_path"
+  chmod 0600 -- "$archive_path"
+  actual_archive_sha="$(sha256sum "$archive_path" | awk '{print $1}')"
+  [[ "$actual_archive_sha" == "$expected_archive_sha" ]] \
+    || fail "root 私有归档与本地哈希不一致"
+  install -d -m 0755 -o root -g root -- "$partial_root/frontend"
+  tar --extract --file "$archive_path" --directory "$partial_root/frontend" \
+    --no-same-owner --no-same-permissions --delay-directory-restore
+  rm -f -- "$archive_path"
+  assert_stage_safety "$partial_root/frontend"
+  chown -R -- root:root "$partial_root"
+  find "$partial_root" -type d -exec chmod 0755 {} +
+  find "$partial_root" -type f -exec chmod 0644 {} +
+  [[ -z "$(find "$partial_root" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "安装目录存在非 root 所有文件"
+  actual_checksums_sha="$(sha256sum "$partial_root/frontend/SHA256SUMS" | awk '{print $1}')"
+  [[ "$actual_checksums_sha" == "$expected_checksums_sha" ]] \
+    || fail "安装后的 SHA256SUMS 与本地不一致"
+  verify_checksums "$partial_root/frontend"
+  if [[ -n "$actual_current" ]]; then
+    assert_stage_safety "$actual_current"
+    [[ -z "$(find "$actual_current" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+      || fail "当前版本包含非 root 所有内容"
+  fi
+  assert_asset_collisions_safe "$partial_root/frontend" "$actual_current"
+  merge_previous_assets "$actual_current" "$partial_root/frontend"
+  assert_stage_safety "$partial_root/frontend"
+  [[ -z "$(find "$partial_root/frontend" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "合并后的版本包含非 root 所有内容"
+  verify_checksums "$partial_root/frontend" allow-inherited-assets
+  verify_release_metadata \
+    "$partial_root/frontend" "$release_id" "$expected_commit" "$expected_index_sha"
+  id "$WEB_USER" >/dev/null 2>&1 || fail "服务器不存在 Web 用户：$WEB_USER"
+  runuser -u "$WEB_USER" -- test -r "$partial_root/frontend/index.html" \
+    || fail "Web 用户无法读取新 index.html"
+  "$NGINX_BIN" -t >/dev/null
+
+  mv -- "$partial_root" "$release_root"
+  arm_current_rollback "$actual_current" "$target_frontend" "$release_id"
+  switch_current_link "$target_frontend" "$release_id"
+
+  if ! public_verify \
+    "$release_id" "$expected_commit" "$expected_index_sha" "$target_frontend"; then
+    fail "线上校验失败，将按当前指向执行安全回滚"
+  fi
+  disarm_current_rollback
+
+  case "$stage_dir" in
+    "$STAGING_ROOT"/"$release_id".partial)
+      rm -rf -- "$stage_dir"
+      ;;
+    *)
+      fail "暂存目录越界，拒绝清理"
+      ;;
+  esac
+
+  printf 'ACTIVATED=%s\n' "$target_frontend"
+}
+
+action_rollback() {
+  local release_id="$1"
+  local expected_current="$2"
+  local target_frontend actual_current expected_commit expected_index_sha
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  actual_current="$(current_target)"
+  [[ -n "$actual_current" && -d "$actual_current" ]] \
+    || fail "当前前端版本不存在，不能执行 rollback"
+  [[ "${actual_current:-NONE}" == "$expected_current" ]] \
+    || fail "frontend-current 已被其他发布修改，拒绝回滚"
+  assert_stage_safety "$actual_current"
+  [[ -z "$(find "$actual_current" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "当前版本包含非 root 所有内容"
+
+  target_frontend="$RELEASES_ROOT/$release_id/frontend"
+  [[ -d "$target_frontend" ]] || fail "回滚版本不存在：$target_frontend"
+  [[ -f "$target_frontend/release.json" ]] || fail "回滚版本缺少 release.json"
+  assert_root_controlled_directory "$target_frontend"
+  assert_stage_safety "$target_frontend"
+  [[ -z "$(find "$target_frontend" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "回滚版本包含非 root 所有内容"
+
+  expected_commit="$(extract_release_field "$target_frontend/release.json" commit)"
+  expected_index_sha="$(extract_release_field "$target_frontend/release.json" index_sha256)"
+  valid_commit "$expected_commit" || fail "回滚版本 commit 非法"
+  valid_sha256 "$expected_index_sha" || fail "回滚版本 index sha256 非法"
+  verify_checksums "$target_frontend" allow-inherited-assets
+  verify_release_metadata "$target_frontend" "$release_id" "$expected_commit" "$expected_index_sha"
+
+  [[ "$actual_current" != "$target_frontend" ]] || fail "目标版本已经是当前版本"
+
+  assert_asset_collisions_safe "$actual_current" "$target_frontend"
+  merge_previous_assets "$actual_current" "$target_frontend"
+  assert_stage_safety "$target_frontend"
+  [[ -z "$(find "$target_frontend" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "回滚版本合并后包含非 root 所有内容"
+  verify_checksums "$target_frontend" allow-inherited-assets
+  "$NGINX_BIN" -t >/dev/null
+  arm_current_rollback "$actual_current" "$target_frontend" "$release_id"
+  switch_current_link "$target_frontend" "$release_id"
+
+  if ! public_verify \
+    "$release_id" "$expected_commit" "$expected_index_sha" "$target_frontend"; then
+    fail "回滚后的线上校验失败，将按当前指向恢复原版本"
+  fi
+  disarm_current_rollback
+
+  printf 'ROLLED_BACK=%s\n' "$target_frontend"
+}
+
+case "${1:-}" in
+  version)
+    printf '%s\n' "$HELPER_VERSION"
+    ;;
+  preflight)
+    action_preflight
+    ;;
+  prepare)
+    [[ "$#" -eq 2 ]] || fail "prepare 参数数量错误"
+    action_prepare "$2"
+    ;;
+  abort)
+    [[ "$#" -eq 2 ]] || fail "abort 参数数量错误"
+    action_abort "$2"
+    ;;
+  status)
+    action_status
+    ;;
+  activate)
+    [[ "$#" -eq 7 ]] || fail "activate 参数数量错误"
+    action_activate "$2" "$3" "$4" "$5" "$6" "$7"
+    ;;
+  rollback)
+    [[ "$#" -eq 3 ]] || fail "rollback 参数数量错误"
+    action_rollback "$2" "$3"
+    ;;
+  *)
+    fail "用法：loumai-h5-release version|preflight|prepare|abort|status|activate|rollback"
+    ;;
+esac

@@ -1,0 +1,807 @@
+#!/bin/bash
+
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+umask 022
+
+readonly HELPER_VERSION="1"
+readonly CONFIG_FILE="/etc/loumai/backend-release.env"
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "服务器缺少命令：$1"
+}
+
+valid_absolute_path() {
+  [[ "$1" == /* && "$1" != "/" && "$1" != *".."* && "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
+}
+
+valid_release_id() {
+  [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}$ ]]
+}
+
+valid_commit() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+valid_revision() {
+  [[ "$1" =~ ^[A-Za-z0-9_]+$ ]]
+}
+
+valid_sha256() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+assert_root_owned_file() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || fail "文件不存在或是软链接：$path"
+  [[ "$(stat -c '%u' "$path")" == "0" ]] || fail "文件必须归 root 所有：$path"
+  [[ -z "$(find "$path" -maxdepth 0 -perm /022 -print -quit)" ]] \
+    || fail "文件不能被组或其他用户写入：$path"
+}
+
+assert_root_owned_directory() {
+  local path="$1"
+  [[ -d "$path" && ! -L "$path" ]] || fail "目录不存在或是软链接：$path"
+  [[ "$(readlink -f "$path")" == "$path" ]] || fail "目录路径包含软链接：$path"
+  [[ "$(stat -c '%u' "$path")" == "0" ]] || fail "目录必须归 root 所有：$path"
+  [[ -z "$(find "$path" -maxdepth 0 -perm /022 -print -quit)" ]] \
+    || fail "目录不能被组或其他用户写入：$path"
+}
+
+[[ -r "$CONFIG_FILE" ]] || fail "找不到服务器配置：$CONFIG_FILE"
+assert_root_owned_directory "${CONFIG_FILE%/*}"
+assert_root_owned_file "$CONFIG_FILE"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+
+: "${LOUMAI_BACKEND_REMOTE_ROOT:?缺少 LOUMAI_BACKEND_REMOTE_ROOT}"
+: "${LOUMAI_BACKEND_STAGING_ROOT:?缺少 LOUMAI_BACKEND_STAGING_ROOT}"
+: "${LOUMAI_BACKEND_DEPLOY_USER:?缺少 LOUMAI_BACKEND_DEPLOY_USER}"
+: "${LOUMAI_BACKEND_SERVICE_USER:?缺少 LOUMAI_BACKEND_SERVICE_USER}"
+: "${LOUMAI_BACKEND_BUILD_USER:?缺少 LOUMAI_BACKEND_BUILD_USER}"
+: "${LOUMAI_BACKEND_CURRENT_LINK:?缺少 LOUMAI_BACKEND_CURRENT_LINK}"
+: "${LOUMAI_BACKEND_ENV_FILES:?缺少 LOUMAI_BACKEND_ENV_FILES}"
+: "${LOUMAI_BACKEND_UV_BIN:?缺少 LOUMAI_BACKEND_UV_BIN}"
+: "${LOUMAI_BACKEND_BASE_PYTHON:?缺少 LOUMAI_BACKEND_BASE_PYTHON}"
+: "${LOUMAI_BACKEND_RUNTIME_ROOT:?缺少 LOUMAI_BACKEND_RUNTIME_ROOT}"
+: "${LOUMAI_BACKEND_DATABASE_NAME:?缺少 LOUMAI_BACKEND_DATABASE_NAME}"
+: "${LOUMAI_BACKEND_BACKUP_ROOT:?缺少 LOUMAI_BACKEND_BACKUP_ROOT}"
+: "${LOUMAI_BACKEND_SERVICES:?缺少 LOUMAI_BACKEND_SERVICES}"
+: "${LOUMAI_BACKEND_LOCAL_HEALTH_URL:?缺少 LOUMAI_BACKEND_LOCAL_HEALTH_URL}"
+: "${LOUMAI_BACKEND_PUBLIC_HEALTH_URL:?缺少 LOUMAI_BACKEND_PUBLIC_HEALTH_URL}"
+
+readonly REMOTE_ROOT="$LOUMAI_BACKEND_REMOTE_ROOT"
+readonly STAGING_ROOT="$LOUMAI_BACKEND_STAGING_ROOT"
+readonly DEPLOY_USER="$LOUMAI_BACKEND_DEPLOY_USER"
+readonly SERVICE_USER="$LOUMAI_BACKEND_SERVICE_USER"
+readonly BUILD_USER="$LOUMAI_BACKEND_BUILD_USER"
+readonly CURRENT_LINK="$LOUMAI_BACKEND_CURRENT_LINK"
+readonly UV_BIN="$LOUMAI_BACKEND_UV_BIN"
+readonly BASE_PYTHON="$LOUMAI_BACKEND_BASE_PYTHON"
+readonly RUNTIME_ROOT="$LOUMAI_BACKEND_RUNTIME_ROOT"
+readonly DATABASE_NAME="$LOUMAI_BACKEND_DATABASE_NAME"
+readonly BACKUP_ROOT="$LOUMAI_BACKEND_BACKUP_ROOT"
+readonly LOCAL_HEALTH_URL="$LOUMAI_BACKEND_LOCAL_HEALTH_URL"
+readonly PUBLIC_HEALTH_URL="$LOUMAI_BACKEND_PUBLIC_HEALTH_URL"
+readonly RELEASES_ROOT="$REMOTE_ROOT/backend-releases"
+readonly LOCK_FILE="$REMOTE_ROOT/.backend-release.lock"
+
+read -r -a ENV_FILES <<< "$LOUMAI_BACKEND_ENV_FILES"
+read -r -a SERVICES <<< "$LOUMAI_BACKEND_SERVICES"
+read -r -a TIMERS <<< "${LOUMAI_BACKEND_TIMERS:-}"
+
+for path in "$REMOTE_ROOT" "$STAGING_ROOT" "$CURRENT_LINK" "$BACKUP_ROOT" "$RUNTIME_ROOT"; do
+  valid_absolute_path "$path" || fail "配置包含不安全绝对路径：$path"
+done
+[[ "$LOCAL_HEALTH_URL" =~ ^http://127\.0\.0\.1:[0-9]+/[A-Za-z0-9._/-]+$ ]] \
+  || fail "LOCAL_HEALTH_URL 必须是 127.0.0.1 HTTP 地址"
+[[ "$PUBLIC_HEALTH_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+$ ]] \
+  || fail "PUBLIC_HEALTH_URL 必须是 HTTPS 地址"
+[[ "$DATABASE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "数据库名格式非法"
+
+for command_name in awk basename cat chmod chown cp curl env find flock getent grep id install ln mktemp mv pg_dump pg_restore readlink rm runuser seq sha256sum sleep sort stat systemctl tar tr wc; do
+  require_command "$command_name"
+done
+[[ -x /usr/bin/python3 ]] || fail "缺少 /usr/bin/python3"
+
+validate_units() {
+  local unit
+  [[ "${#SERVICES[@]}" -gt 0 ]] || fail "至少配置一个后端 service"
+  for unit in "${SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    [[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || fail "systemd unit 格式非法：$unit"
+    systemctl cat "$unit" >/dev/null || fail "systemd unit 不存在：$unit"
+  done
+}
+
+validate_environment_files() {
+  local path
+  [[ "${#ENV_FILES[@]}" -gt 0 ]] || fail "未配置应用环境文件"
+  for path in "${ENV_FILES[@]}"; do
+    valid_absolute_path "$path" || fail "环境文件路径非法：$path"
+    assert_root_owned_directory "${path%/*}"
+    assert_root_owned_file "$path"
+  done
+}
+
+validate_runtime_tools() {
+	assert_root_owned_directory "$RUNTIME_ROOT"
+	[[ "$UV_BIN" == "$RUNTIME_ROOT/"* && "$BASE_PYTHON" == "$RUNTIME_ROOT/"* ]] \
+		|| fail "uv/Python 必须位于受控 runtime 根目录"
+  [[ -x "$UV_BIN" && ! -L "$UV_BIN" ]] || fail "uv 不存在或是软链接：$UV_BIN"
+  [[ -x "$BASE_PYTHON" && ! -L "$BASE_PYTHON" ]] || fail "基础 Python 不存在或是软链接：$BASE_PYTHON"
+  [[ -z "$(find "$RUNTIME_ROOT" \( -type d -o -type f \) ! -user root -print -quit)" ]] \
+		|| fail "runtime 必须完全归 root 所有"
+  [[ -z "$(find "$RUNTIME_ROOT" \( -type d -o -type f \) -perm /022 -print -quit)" ]] \
+		|| fail "runtime 不能被非 root 写入"
+	local link resolved
+	while IFS= read -r -d '' link; do
+		[[ "$(stat -c '%u' "$link")" == "0" ]] || fail "runtime 软链接必须归 root 所有：$link"
+		resolved="$(readlink -f "$link")"
+		[[ -e "$resolved" && "$resolved" == "$RUNTIME_ROOT/"* ]] \
+			|| fail "runtime 软链接越界或失效：$link"
+	done < <(find "$RUNTIME_ROOT" -type l -print0)
+}
+
+validate_backup_root() {
+  local postgres_uid owner_uid
+  assert_root_owned_directory "${BACKUP_ROOT%/*}"
+  [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" ]] || fail "数据库备份目录不存在"
+  [[ "$(readlink -f "$BACKUP_ROOT")" == "$BACKUP_ROOT" ]] || fail "备份目录路径包含软链接"
+  postgres_uid="$(id -u postgres)"
+  owner_uid="$(stat -c '%u' "$BACKUP_ROOT")"
+  [[ "$owner_uid" == "0" || "$owner_uid" == "$postgres_uid" ]] \
+		|| fail "备份目录必须归 root 或 postgres 所有"
+  [[ -z "$(find "$BACKUP_ROOT" -maxdepth 0 -perm /022 -print -quit)" ]] \
+		|| fail "备份目录不能被组或其他用户写入"
+}
+
+validate_server_contract() {
+  local deploy_uid service_uid build_uid build_home build_shell
+  [[ "$STAGING_ROOT" == "$REMOTE_ROOT/incoming" ]] || fail "staging 必须位于受控后端根目录"
+  [[ "$CURRENT_LINK" == "$REMOTE_ROOT/backend-current" ]] || fail "current link 必须位于受控后端根目录"
+  assert_root_owned_directory "$REMOTE_ROOT"
+  assert_root_owned_directory "$RELEASES_ROOT"
+  assert_root_owned_directory "$STAGING_ROOT"
+  validate_environment_files
+  validate_runtime_tools
+  validate_units
+  id "$DEPLOY_USER" >/dev/null 2>&1 || fail "部署用户不存在"
+  id "$SERVICE_USER" >/dev/null 2>&1 || fail "服务用户不存在"
+  id "$BUILD_USER" >/dev/null 2>&1 || fail "构建用户不存在"
+  deploy_uid="$(id -u "$DEPLOY_USER")"
+  service_uid="$(id -u "$SERVICE_USER")"
+  build_uid="$(id -u "$BUILD_USER")"
+  [[ "$build_uid" != "0" && "$build_uid" != "$deploy_uid" && "$build_uid" != "$service_uid" ]] \
+    || fail "构建用户 UID 必须非 root 且与部署用户、服务用户分离"
+  build_home="$(getent passwd "$BUILD_USER" | awk -F: '{print $6}')"
+  build_shell="$(getent passwd "$BUILD_USER" | awk -F: '{print $7}')"
+  [[ -n "$build_home" && -d "$build_home" && ! -L "$build_home" ]] \
+    || fail "构建用户 HOME 不存在或是软链接"
+  [[ "$(readlink -f "$build_home")" == "$build_home" ]] || fail "构建用户 HOME 路径包含软链接"
+  [[ "$(stat -c '%u' "$build_home")" == "$build_uid" ]] || fail "构建用户 HOME 所有权错误"
+  [[ -z "$(find "$build_home" -maxdepth 0 -perm /022 -print -quit)" ]] \
+    || fail "构建用户 HOME 不能被组或其他用户写入"
+  [[ "$build_shell" == "/usr/sbin/nologin" || "$build_shell" == "/sbin/nologin" ]] \
+    || fail "构建用户必须禁止交互登录"
+  validate_backup_root
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  flock -w 120 9 || fail "另一个后端发布任务正在运行"
+}
+
+current_target() {
+  if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+    printf 'NONE\n'
+    return
+  fi
+  [[ -L "$CURRENT_LINK" ]] || fail "backend-current 必须是软链接"
+  local target
+  target="$(readlink -f "$CURRENT_LINK")"
+  [[ -d "$target" ]] || fail "backend-current 目标不存在"
+  valid_absolute_path "$target" || fail "backend-current 目标路径非法"
+	[[ "$target" == "$RELEASES_ROOT/"*/backend ]] || fail "backend-current 目标不在受控版本目录"
+	assert_installed_release_safety "$target"
+  printf '%s\n' "$target"
+}
+
+load_app_environment() {
+  local parsed_file key value
+  parsed_file="$(mktemp "$REMOTE_ROOT/.backend-env.XXXXXX")"
+  chmod 0600 "$parsed_file"
+  if ! /usr/bin/python3 - "${ENV_FILES[@]}" > "$parsed_file" <<'PY'
+import re
+import sys
+
+
+def parse_value(raw: str, filename: str, line_number: int) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] == "'":
+        if len(value) < 2 or value[-1] != "'" or "'" in value[1:-1]:
+            raise SystemExit(f"invalid single-quoted value: {filename}:{line_number}")
+        return value[1:-1]
+    if value[0] == '"':
+        if len(value) < 2 or value[-1] != '"':
+            raise SystemExit(f"invalid double-quoted value: {filename}:{line_number}")
+        inner = value[1:-1]
+        parsed: list[str] = []
+        index = 0
+        while index < len(inner):
+            character = inner[index]
+            if character == "\\" and index + 1 < len(inner) and inner[index + 1] in {'"', "\\"}:
+                parsed.append(inner[index + 1])
+                index += 2
+                continue
+            parsed.append(character)
+            index += 1
+        return "".join(parsed)
+    if any(character.isspace() for character in value):
+        raise SystemExit(f"unquoted whitespace in environment value: {filename}:{line_number}")
+    return value
+
+key_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+values: dict[str, str] = {}
+for filename in sys.argv[1:]:
+    with open(filename, encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            line = raw_line.rstrip("\r\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            if "=" not in line:
+                raise SystemExit(f"invalid environment line: {filename}:{line_number}")
+            key, raw_value = line.split("=", 1)
+            key = key.strip()
+            if not key_pattern.fullmatch(key):
+                raise SystemExit(f"invalid environment key: {filename}:{line_number}")
+            value = parse_value(raw_value, filename, line_number)
+            if "\x00" in value or "\n" in value or "\r" in value:
+                raise SystemExit(f"invalid control byte in environment value: {filename}:{line_number}")
+            values[key] = value
+
+for key, value in values.items():
+    sys.stdout.buffer.write(key.encode() + b"\0" + value.encode() + b"\0")
+PY
+  then
+    rm -f -- "$parsed_file"
+    fail "应用环境文件解析失败"
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    printf -v "$key" '%s' "$value"
+    export "$key"
+  done < "$parsed_file"
+  rm -f -- "$parsed_file"
+}
+
+run_in_release() (
+  local release="$1"
+  shift
+  cd "$release"
+  load_app_environment
+  export HOME="$(getent passwd "$SERVICE_USER" | awk -F: '{print $6}')"
+  export USER="$SERVICE_USER" LOGNAME="$SERVICE_USER" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+  runuser -u "$SERVICE_USER" --preserve-environment -- "$@"
+)
+
+db_revision_for_release() {
+  local release="$1"
+  [[ -x "$release/.venv/bin/python" ]] || fail "版本缺少 Python：$release"
+  run_in_release "$release" "$release/.venv/bin/python" -c \
+    'from sqlalchemy import text; from app.db.session import engine; c=engine.connect(); print(c.execute(text("select version_num from alembic_version")).scalar_one()); c.close()'
+}
+
+current_db_revision() {
+  local current
+  current="$(current_target)"
+  [[ "$current" != "NONE" ]] || fail "没有当前后端，无法读取数据库版本"
+  db_revision_for_release "$current"
+}
+
+json_field() {
+  /usr/bin/python3 -c 'import json,sys; value=json.load(open(sys.argv[1],encoding="utf-8"))[sys.argv[2]]; print(value)' "$1" "$2"
+}
+
+assert_upload_safety() {
+  local stage_dir="$1"
+  [[ -d "$stage_dir" && ! -L "$stage_dir" ]] || fail "staging 目录不存在或异常"
+  [[ "$(stat -c '%U' "$stage_dir")" == "$DEPLOY_USER" ]] || fail "staging 目录 owner 错误"
+  [[ -z "$(find "$stage_dir" -mindepth 1 -maxdepth 1 ! -name backend.tar -print -quit)" ]] \
+    || fail "staging 只能包含 backend.tar"
+  [[ -f "$stage_dir/backend.tar" && ! -L "$stage_dir/backend.tar" ]] || fail "backend.tar 不存在或异常"
+  [[ "$(stat -c '%h' "$stage_dir/backend.tar")" == "1" ]] || fail "backend.tar 不能是硬链接"
+}
+
+assert_archive_members() {
+  local archive="$1" member
+  while IFS= read -r member; do
+    [[ "$member" =~ ^backend(/[-A-Za-z0-9._/]+)?/?$ ]] || fail "归档包含不安全路径：$member"
+    [[ "$member" != *"//"* && "$member" != *"/../"* && "$member" != *"/./"* ]] \
+      || fail "归档路径未规范化：$member"
+  done < <(tar -tf "$archive")
+}
+
+assert_source_safety() {
+  local backend="$1"
+  [[ -d "$backend" && ! -L "$backend" ]] || fail "backend 目录异常"
+  [[ -z "$(find "$backend" -type l -print -quit)" ]] || fail "源码包不能包含软链接"
+  [[ -z "$(find "$backend" ! -type d ! -type f -print -quit)" ]] || fail "源码包包含特殊文件"
+  [[ -z "$(find "$backend" -type f -links +1 -print -quit)" ]] || fail "源码包包含硬链接"
+  [[ -z "$(find "$backend" -perm /022 -print -quit)" ]] || fail "源码包包含组或其他用户可写内容"
+}
+
+verify_source_checksums() {
+  local backend="$1" exact="${2:-false}" line sha relative actual_count expected_count
+  local -A expected=()
+  [[ -f "$backend/SHA256SUMS" ]] || fail "源码包缺少 SHA256SUMS"
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([0-9a-f]{64})\ \ ([A-Za-z0-9._/-]+)$ ]] || fail "SHA256SUMS 行格式非法"
+    sha="${BASH_REMATCH[1]}"
+    relative="${BASH_REMATCH[2]}"
+    [[ "$relative" != "-" && "$relative" != /* && "$relative" != *".."* ]] \
+      || fail "SHA256SUMS 包含不安全路径"
+    [[ -z "${expected[$relative]:-}" ]] || fail "SHA256SUMS 路径重复：$relative"
+    expected[$relative]="$sha"
+    [[ -f "$backend/$relative" && ! -L "$backend/$relative" ]] || fail "清单文件不存在：$relative"
+  done < "$backend/SHA256SUMS"
+  (cd "$backend" && sha256sum -c --strict SHA256SUMS >/dev/null)
+  if [[ "$exact" == "true" ]]; then
+    expected_count="${#expected[@]}"
+    actual_count="$(find "$backend" -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
+    [[ "$actual_count" == "$expected_count" ]] || fail "源码文件集合与 SHA256SUMS 不一致"
+  fi
+}
+
+verify_release_metadata() {
+  local backend="$1" release_id="$2" commit="$3" db_head="$4"
+  [[ -f "$backend/release.json" ]] || fail "版本缺少 release.json"
+  [[ "$(json_field "$backend/release.json" release_id)" == "$release_id" ]] || fail "release_id 不匹配"
+  [[ "$(json_field "$backend/release.json" commit)" == "$commit" ]] || fail "commit 不匹配"
+  [[ "$(json_field "$backend/release.json" artifact_db_head)" == "$db_head" ]] || fail "DB head 不匹配"
+  [[ "$(json_field "$backend/release.json" database_rollback_policy)" == "NO_AUTOMATIC_DOWNGRADE_OR_RESTORE" ]] \
+    || fail "数据库回滚策略不匹配"
+}
+
+assert_installed_release_safety() {
+  local backend="$1" link resolved
+  [[ -d "$backend" && ! -L "$backend" ]] || fail "已安装版本目录异常"
+  [[ -z "$(find "$backend" ! -type d ! -type f ! -type l -print -quit)" ]] \
+    || fail "已安装版本包含特殊文件"
+  [[ -z "$(find "$backend" \( -type d -o -type f \) ! -user root -print -quit)" ]] \
+    || fail "已安装版本必须归 root 所有"
+  [[ -z "$(find "$backend" \( -type d -o -type f \) -perm /022 -print -quit)" ]] \
+    || fail "已安装版本不能被非 root 写入"
+  while IFS= read -r -d '' link; do
+    [[ "$(stat -c '%u' "$link")" == "0" ]] || fail "版本软链接必须归 root 所有：$link"
+    resolved="$(readlink -f "$link")"
+    [[ -e "$resolved" ]] || fail "版本包含失效软链接：$link"
+    [[ "$resolved" == "$backend/"* || "$resolved" == "$RUNTIME_ROOT/"* ]] \
+      || fail "版本软链接越界：$link"
+  done < <(find "$backend" -type l -print0)
+}
+
+install_runtime() {
+  local backend="$1" expected_checksums="$2" build_dir build_source build_home build_group
+  build_dir="${backend%/*}/.runtime-build"
+  build_source="$build_dir/source"
+  build_home="$(getent passwd "$BUILD_USER" | awk -F: '{print $6}')"
+  [[ -n "$build_home" && -d "$build_home" ]] || fail "构建用户 HOME 无效"
+  build_group="$(id -gn "$BUILD_USER")"
+  install -d -m 0700 -o "$BUILD_USER" -g "$build_group" -- "$build_dir" "$build_source"
+  cp -a --no-preserve=ownership -- "$backend/." "$build_source/"
+  chown -hR "$BUILD_USER:$build_group" "$build_source"
+  install -d -m 0700 -o "$BUILD_USER" -g "$build_group" -- "$backend/.venv"
+  runuser -u "$BUILD_USER" -- /usr/bin/env \
+    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+    "$UV_BIN" venv --python "$BASE_PYTHON" --seed "$backend/.venv"
+  runuser -u "$BUILD_USER" -- /usr/bin/env \
+    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+    "$UV_BIN" pip install \
+      --python "$backend/.venv/bin/python" \
+      --no-build-isolation \
+      --constraint "$backend/runtime-constraints.txt" \
+      "$build_source"
+  runuser -u "$BUILD_USER" -- /usr/bin/env \
+    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+    "$UV_BIN" pip freeze --python "$backend/.venv/bin/python" \
+      > "$backend/installed-requirements.txt"
+  rm -rf -- "$build_dir"
+  chown -hR root:root "$backend/.venv"
+  chmod -R a+rX,go-w "$backend/.venv"
+  [[ "$(sha256sum "$backend/SHA256SUMS" | awk '{print $1}')" == "$expected_checksums" ]] \
+    || fail "依赖安装期间源码清单被修改"
+  verify_source_checksums "$backend" false
+  assert_installed_release_safety "$backend"
+  [[ -x "$backend/.venv/bin/python" ]] || fail "新版本虚拟环境无效"
+  runuser -u "$SERVICE_USER" -- "$backend/.venv/bin/python" -c \
+    'import sys; raise SystemExit(0 if sys.prefix else 1)' \
+    || fail "服务用户无法执行新版本虚拟环境"
+}
+
+assert_database_targets() {
+  local backend="$1"
+  run_in_release "$backend" "$backend/.venv/bin/python" -c '
+import os
+import sys
+from sqlalchemy.engine import make_url
+from sqlalchemy import create_engine, text
+
+expected_database = sys.argv[1]
+targets = {}
+application_url = os.getenv("DATABASE_URL")
+for name, raw in (
+    ("DATABASE_URL", application_url),
+    ("MIGRATION_DATABASE_URL", os.getenv("MIGRATION_DATABASE_URL") or application_url),
+):
+    if not raw:
+        raise SystemExit(f"missing {name}")
+    url = make_url(raw)
+    if not url.drivername.startswith("postgresql"):
+        raise SystemExit(f"{name} must use PostgreSQL")
+    forbidden_routing_keys = {"host", "hostaddr", "port", "service", "servicefile", "dbname"}
+    if forbidden_routing_keys.intersection(url.query):
+        raise SystemExit(f"{name} contains forbidden connection-routing query parameters")
+    engine = create_engine(raw, pool_pre_ping=True)
+    try:
+        with engine.connect() as connection:
+            database, address, port = connection.execute(
+                text("SELECT current_database(), inet_server_addr()::text, inet_server_port()")
+            ).one()
+    except Exception:
+        raise SystemExit(f"unable to verify {name} target") from None
+    finally:
+        engine.dispose()
+    if database != expected_database or address not in {None, "127.0.0.1", "::1"} or port != 5432:
+        raise SystemExit(f"{name} does not match the configured local backup target")
+    targets[name] = (address or "local", port, database)
+if targets["DATABASE_URL"] != targets["MIGRATION_DATABASE_URL"]:
+    raise SystemExit("application and migration database targets differ")
+' "$DATABASE_NAME"
+}
+
+assert_revision_path() {
+  local backend="$1" current_revision="$2" target_revision="$3"
+  run_in_release "$backend" "$backend/.venv/bin/python" -c \
+    'import sys; from alembic.config import Config; from alembic.script import ScriptDirectory; current,target=sys.argv[1:3]; c=Config("alembic.ini"); c.set_main_option("script_location","alembic"); s=ScriptDirectory.from_config(c); revisions={r.revision for r in s.walk_revisions(target,"base")}; raise SystemExit(0 if current==target or current in revisions else 2)' \
+    "$current_revision" "$target_revision" || fail "当前 DB revision 不是目标迁移的祖先"
+}
+
+stop_writers() {
+  local unit
+  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl stop "$unit"; done
+  for unit in "${SERVICES[@]}"; do systemctl stop "$unit"; done
+}
+
+start_services() {
+  local unit
+  for unit in "${SERVICES[@]}"; do systemctl start "$unit"; done
+}
+
+start_timers() {
+  local unit
+  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl start "$unit"; done
+}
+
+stop_all_units() {
+  local unit
+  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl stop "$unit" || true; done
+  for unit in "${SERVICES[@]}"; do systemctl stop "$unit" || true; done
+}
+
+switch_current() {
+  local target="$1" next="$REMOTE_ROOT/.backend-current.next.$$"
+  [[ -d "$target" ]] || fail "切换目标不存在：$target"
+  rm -f -- "$next"
+  ln -s -- "$target" "$next"
+  mv -Tf -- "$next" "$CURRENT_LINK"
+}
+
+create_database_backup() {
+  local release_id="$1" backup="$BACKUP_ROOT/${DATABASE_NAME}_before_${release_id}.dump"
+  local partial sha_partial digest
+  partial="$BACKUP_ROOT/.${DATABASE_NAME}_before_${release_id}.dump.partial.$$"
+  sha_partial="$BACKUP_ROOT/.${DATABASE_NAME}_before_${release_id}.dump.sha256.partial.$$"
+  [[ ! -e "$backup" && ! -L "$backup" ]] || fail "数据库备份已存在：$backup"
+  [[ ! -e "$partial" && ! -e "$sha_partial" ]] || fail "数据库临时备份路径已存在"
+  if ! runuser -u postgres -- pg_dump -Fc --no-owner --no-acl --file "$partial" "$DATABASE_NAME"; then
+    rm -f -- "$partial" "$sha_partial"
+    return 1
+  fi
+  if ! runuser -u postgres -- pg_restore --list "$partial" >/dev/null; then
+    rm -f -- "$partial" "$sha_partial"
+    return 1
+  fi
+  digest="$(sha256sum "$partial" | awk '{print $1}')"
+  printf '%s  %s\n' "$digest" "$(basename "$backup")" > "$sha_partial"
+  chmod 0600 "$partial" "$sha_partial"
+  chown postgres:postgres "$partial" "$sha_partial"
+  mv -- "$partial" "$backup"
+  mv -- "$sha_partial" "$backup.sha256"
+  printf 'BACKUP=%s\n' "$backup"
+}
+
+run_migrations() {
+  local backend="$1"
+  run_in_release "$backend" "$backend/.venv/bin/python" -c \
+    'import os,runpy; migration=os.getenv("MIGRATION_DATABASE_URL"); os.environ["DATABASE_URL"]=migration or os.environ["DATABASE_URL"]; runpy.run_path("scripts/run_alembic_upgrade.py",run_name="__main__")'
+  run_in_release "$backend" "$backend/.venv/bin/python" -c \
+    'import os,runpy; migration=os.getenv("MIGRATION_DATABASE_URL"); os.environ["DATABASE_URL"]=migration or os.environ["DATABASE_URL"]; runpy.run_path("scripts/verify_database_schema.py",run_name="__main__")'
+}
+
+wait_for_health() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if curl -fsS --connect-timeout 2 --max-time 5 "$LOCAL_HEALTH_URL" >/dev/null \
+      && curl -fsS --connect-timeout 5 --max-time 10 "$PUBLIC_HEALTH_URL" >/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+verify_service_release() {
+  local expected="$1" unit pid cwd
+  for unit in "${SERVICES[@]}"; do
+    [[ "$(systemctl is-active "$unit")" == "active" ]] || fail "服务未运行：$unit"
+    pid="$(systemctl show "$unit" -p MainPID --value)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "服务 MainPID 无效：$unit"
+    cwd="$(readlink -f "/proc/$pid/cwd")"
+    [[ "$cwd" == "$expected" ]] || fail "服务运行目录不是目标版本：$unit -> $cwd"
+  done
+}
+
+action_preflight() {
+  local current revision
+  validate_server_contract
+  current="$(current_target)"
+  revision="$(current_db_revision)"
+  valid_revision "$revision" || fail "数据库 revision 非法"
+  printf 'HELPER_VERSION=%s\n' "$HELPER_VERSION"
+  printf 'STAGING_ROOT=%s\n' "$STAGING_ROOT"
+  printf 'CURRENT=%s\n' "$current"
+  printf 'DB_REVISION=%s\n' "$revision"
+}
+
+action_prepare() {
+  local release_id="$1" stage_dir group
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  validate_server_contract
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  [[ ! -e "$stage_dir" && ! -L "$stage_dir" ]] || fail "staging 已存在"
+  group="$(id -gn "$DEPLOY_USER")"
+  install -d -m 0700 -o "$DEPLOY_USER" -g "$group" -- "$stage_dir"
+  printf 'STAGE_DIR=%s\n' "$stage_dir"
+}
+
+action_abort() {
+  local release_id="$1" stage_dir
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  assert_root_owned_directory "$REMOTE_ROOT"
+  assert_root_owned_directory "$STAGING_ROOT"
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  if [[ ! -e "$stage_dir" && ! -L "$stage_dir" ]]; then printf 'ABORTED=NONE\n'; return; fi
+  [[ -d "$stage_dir" && ! -L "$stage_dir" ]] || fail "staging 路径异常"
+  rm -rf -- "$stage_dir"
+  printf 'ABORTED=%s\n' "$stage_dir"
+}
+
+action_status() {
+  local current revision unit
+  validate_server_contract
+  current="$(current_target)"
+  revision="$(current_db_revision)"
+  printf 'CURRENT=%s\nDB_REVISION=%s\n' "$current" "$revision"
+  for unit in "${SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    printf 'UNIT_%s=%s\n' "${unit//[^A-Za-z0-9]/_}" "$(systemctl is-active "$unit" 2>/dev/null || true)"
+  done
+  if [[ -f "$current/release.json" ]]; then cat "$current/release.json"; fi
+}
+
+action_activate() {
+  local release_id="$1" expected_commit="$2" artifact_db_head="$3" expected_checksums="$4"
+  local expected_archive="$5" expected_current="$6" expected_db_revision="$7"
+  local stage_dir partial_root release_root backend actual_current actual_db archive_sha checksums_sha final_db
+  local migration_required=0 writers_stopped=0 migration_attempted=0 switched=0 partial_created=0
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  valid_commit "$expected_commit" || fail "commit 格式非法"
+  valid_revision "$artifact_db_head" || fail "artifact DB head 格式非法"
+  valid_sha256 "$expected_checksums" || fail "checksums sha 格式非法"
+  valid_sha256 "$expected_archive" || fail "archive sha 格式非法"
+  valid_revision "$expected_db_revision" || fail "expected DB revision 格式非法"
+
+  stage_dir="$STAGING_ROOT/$release_id.partial"
+  partial_root="$RELEASES_ROOT/.$release_id.partial"
+  release_root="$RELEASES_ROOT/$release_id"
+  backend="$partial_root/backend"
+
+  acquire_lock
+  validate_server_contract
+  actual_current="$(current_target)"
+  actual_db="$(current_db_revision)"
+  [[ "$actual_current" == "$expected_current" ]] || fail "backend-current 已被其他发布修改"
+  [[ "$actual_db" == "$expected_db_revision" ]] || fail "数据库 revision 已被其他发布修改"
+
+  activation_failure() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+    [[ "$exit_code" -ne 0 ]] || exit_code=1
+    if [[ "$partial_created" == "1" && -d "$partial_root" && ! -e "$release_root" ]]; then
+      rm -rf -- "$partial_root"
+    fi
+    if [[ "$writers_stopped" == "1" ]]; then
+      stop_all_units
+      if [[ "$migration_attempted" == "0" ]]; then
+        if [[ "$switched" == "1" ]]; then switch_current "$actual_current"; fi
+        start_services || true
+        start_timers || true
+        printf 'ERROR: 发布失败，数据库未迁移，已尝试恢复旧应用。\n' >&2
+      else
+        printf 'CRITICAL: 数据库迁移已经尝试；所有 writer 保持停止。禁止自动 downgrade/restore，请人工前向修复或评估备份恢复。\n' >&2
+        printf 'CRITICAL_BACKUP=%s/%s_before_%s.dump\n' "$BACKUP_ROOT" "$DATABASE_NAME" "$release_id" >&2
+      fi
+    fi
+    exit "$exit_code"
+  }
+  activation_signal() {
+    trap - INT TERM HUP
+    exit 130
+  }
+  trap activation_failure EXIT
+  trap activation_signal INT TERM HUP
+
+  assert_upload_safety "$stage_dir"
+  [[ ! -e "$partial_root" && ! -L "$partial_root" ]] || fail "partial 目录已存在"
+  [[ ! -e "$release_root" && ! -L "$release_root" ]] || fail "版本目录已存在"
+
+  install -d -m 0755 -o root -g root -- "$partial_root"
+  partial_created=1
+  cp --no-dereference --reflink=never -- "$stage_dir/backend.tar" "$partial_root/backend.tar"
+  [[ -f "$partial_root/backend.tar" && ! -L "$partial_root/backend.tar" ]] \
+    || fail "接管后的 backend.tar 不是普通文件"
+  [[ "$(stat -c '%h' "$partial_root/backend.tar")" == "1" ]] \
+    || fail "接管后的 backend.tar 不能是硬链接"
+  chown root:root "$partial_root/backend.tar"
+  chmod 0600 "$partial_root/backend.tar"
+  archive_sha="$(sha256sum "$partial_root/backend.tar" | awk '{print $1}')"
+  [[ "$archive_sha" == "$expected_archive" ]] || fail "上传归档哈希不一致"
+  assert_archive_members "$partial_root/backend.tar"
+  tar --extract --file "$partial_root/backend.tar" --directory "$partial_root" \
+    --no-same-owner --no-same-permissions --delay-directory-restore
+  rm -f -- "$partial_root/backend.tar"
+  assert_source_safety "$backend"
+  checksums_sha="$(sha256sum "$backend/SHA256SUMS" | awk '{print $1}')"
+  [[ "$checksums_sha" == "$expected_checksums" ]] || fail "SHA256SUMS 哈希不一致"
+  verify_source_checksums "$backend" true
+  verify_release_metadata "$backend" "$release_id" "$expected_commit" "$artifact_db_head"
+  install_runtime "$backend" "$expected_checksums"
+  assert_revision_path "$backend" "$actual_db" "$artifact_db_head"
+  assert_database_targets "$backend"
+  chown -hR root:root "$partial_root"
+  chmod -R go-w "$partial_root"
+  mv -- "$partial_root" "$release_root"
+  partial_created=0
+  backend="$release_root/backend"
+  [[ "$artifact_db_head" == "$actual_db" ]] || migration_required=1
+
+  writers_stopped=1
+  stop_writers
+  if [[ "$migration_required" == "1" ]]; then
+    create_database_backup "$release_id"
+    migration_attempted=1
+    run_migrations "$backend"
+    [[ "$(db_revision_for_release "$backend")" == "$artifact_db_head" ]] || fail "迁移后 DB revision 不正确"
+  fi
+  switch_current "$backend"
+  switched=1
+  start_services
+  wait_for_health || fail "新版本健康检查失败"
+  verify_service_release "$backend"
+  start_timers
+  final_db="$(db_revision_for_release "$backend")"
+  writers_stopped=0
+  trap - EXIT INT TERM HUP
+  rm -rf -- "$stage_dir" || printf 'WARNING: staging 清理失败：%s\n' "$stage_dir" >&2
+  printf 'ACTIVATED=%s\nDB_REVISION=%s\n' "$backend" "$final_db"
+}
+
+action_rollback() {
+  local release_id="$1" expected_current="$2" expected_db_revision="$3" acknowledgement="$4"
+  local actual_current actual_db target target_head final_db switched=0 writers_stopped=0
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  valid_revision "$expected_db_revision" || fail "expected DB revision 格式非法"
+  [[ "$acknowledgement" == "ACK_DB_SCHEMA_COMPATIBLE" ]] || fail "缺少数据库兼容确认"
+  target="$RELEASES_ROOT/$release_id/backend"
+  [[ -d "$target" ]] || fail "回滚版本不存在"
+  acquire_lock
+  validate_server_contract
+  actual_current="$(current_target)"
+  actual_db="$(current_db_revision)"
+  [[ "$actual_current" == "$expected_current" ]] || fail "backend-current 已变化"
+  [[ "$actual_db" == "$expected_db_revision" ]] || fail "数据库 revision 已变化"
+  target_head="$(json_field "$target/release.json" artifact_db_head)"
+  valid_revision "$target_head" || fail "目标版本 DB head 非法"
+  verify_source_checksums "$target" false
+  assert_installed_release_safety "$target"
+  assert_revision_path "$actual_current" "$target_head" "$actual_db"
+
+  rollback_failure() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+    [[ "$exit_code" -ne 0 ]] || exit_code=1
+    if [[ "$writers_stopped" == "1" ]]; then
+      stop_all_units
+      if [[ "$switched" == "1" ]]; then switch_current "$actual_current"; fi
+      start_services || true
+      start_timers || true
+      printf 'ERROR: 应用回滚失败，已尝试恢复原应用指向。数据库从未被回滚。\n' >&2
+    fi
+    exit "$exit_code"
+  }
+  rollback_signal() {
+    trap - INT TERM HUP
+    exit 130
+  }
+  trap rollback_failure EXIT
+  trap rollback_signal INT TERM HUP
+  writers_stopped=1
+  stop_writers
+  switch_current "$target"
+  switched=1
+  start_services
+  wait_for_health || fail "回滚版本健康检查失败"
+  verify_service_release "$target"
+  start_timers
+  final_db="$(db_revision_for_release "$target")"
+  writers_stopped=0
+  trap - EXIT INT TERM HUP
+  printf 'ROLLED_BACK=%s\nDB_REVISION=%s\n' "$target" "$final_db"
+}
+
+case "${1:-}" in
+  version)
+    printf '%s\n' "$HELPER_VERSION"
+    ;;
+  preflight)
+    [[ "$#" -eq 1 ]] || fail "preflight 参数数量错误"
+    action_preflight
+    ;;
+  prepare)
+    [[ "$#" -eq 2 ]] || fail "prepare 参数数量错误"
+    action_prepare "$2"
+    ;;
+  abort)
+    [[ "$#" -eq 2 ]] || fail "abort 参数数量错误"
+    action_abort "$2"
+    ;;
+  status)
+    [[ "$#" -eq 1 ]] || fail "status 参数数量错误"
+    action_status
+    ;;
+  activate)
+    [[ "$#" -eq 8 ]] || fail "activate 参数数量错误"
+    action_activate "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    ;;
+  rollback)
+    [[ "$#" -eq 5 ]] || fail "rollback 参数数量错误"
+    action_rollback "$2" "$3" "$4" "$5"
+    ;;
+  *)
+    fail "用法：loumai-backend-release version|preflight|prepare|abort|status|activate|rollback"
+    ;;
+esac

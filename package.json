@@ -1,0 +1,20 @@
+{
+  "name": "deploy--loumai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "frontend:build:test": "node frontend/h5-release.mjs build --env test",
+    "frontend:deploy:test": "node frontend/h5-release.mjs deploy --env test",
+    "frontend:status": "node frontend/h5-release.mjs status",
+    "frontend:rollback": "node frontend/h5-release.mjs rollback",
+    "backend:build:test": "node backend/backend-release.mjs build",
+    "backend:deploy:test": "node backend/backend-release.mjs deploy",
+    "backend:status": "node backend/backend-release.mjs status",
+    "backend:rollback": "node backend/backend-release.mjs rollback"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
