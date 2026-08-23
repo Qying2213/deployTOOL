@@ -3,6 +3,9 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
+	chmodSync,
+	constants as fsConstants,
+	copyFileSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -18,18 +21,22 @@ import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-export const H5_RELEASE_TOOL_VERSION = '2'
+export const H5_RELEASE_TOOL_VERSION = '4'
 
 export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_FRONTEND_REPO_ROOT = resolve(TOOL_ROOT, '../qiye-qianduan')
-export const DEFAULT_CONFIG_PATH = join(TOOL_ROOT, 'config/frontend.test.local.env')
+export function defaultConfigPath(environment = 'test') {
+	return join(TOOL_ROOT, `config/frontend.${environment}.local.env`)
+}
+
+export const DEFAULT_CONFIG_PATH = defaultConfigPath('test')
 const DEFAULT_HBUILDERX_ROOT = '/Applications/HBuilderX.app/Contents/HBuilderX'
 const DEFAULT_EXPECTED_HBUILDERX_VERSION = '5.14.2026070214'
 const DEFAULT_EXPECTED_UNI_VERSION = '5.14.2026062517.4248'
 const DEFAULT_EXPECTED_NODE_VERSION = 'v22.22.2'
 const DEFAULT_EXPECTED_SASS_VERSION = '1.43.4'
 const DEFAULT_EXPECTED_SASS_PLUGIN_VERSION = '0.0.3'
-const DEFAULT_EXPECTED_TITLE = 'WorkWay'
+const DEFAULT_EXPECTED_TITLE = '工位有方'
 const DEFAULT_EXPECTED_BRANCH = 'feat/test-api-import'
 const DEFAULT_REMOTE_HELPER = '/usr/local/sbin/loumai-h5-release'
 const BUILD_ERROR_PATTERN = /编译失败|预编译器错误|Preprocessor dependency|error during build|Build failed|Cannot find module|RollupError|SyntaxError|\[uni-app\]\s*Error:/i
@@ -40,6 +47,96 @@ const SAFE_REMOTE_TARGET = /^[A-Za-z0-9._-]+(?:@[A-Za-z0-9.-]+)?$/
 const SAFE_RELEASE_ID = /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}$/
 const SAFE_ARTIFACT_PATH = /^[A-Za-z0-9._/-]+$/
 const SECRET_KEY_PATTERN = /SECRET|PASSWORD|TOKEN|PRIVATE_KEY|ACCESS_KEY/i
+const PACKAGE_MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+const PACKAGE_MAX_EXTRACTED_BYTES = 512 * 1024 * 1024
+const PACKAGE_MAX_FILE_BYTES = 128 * 1024 * 1024
+const PACKAGE_MAX_ENTRIES = 20_000
+const RESERVED_RELEASE_FILES = new Set(['release.json', 'SHA256SUMS'])
+const FORBIDDEN_PACKAGE_FILE_PATTERN = /(?:^|\/)(?:\.env(?:\.|$)|\.git(?:\/|$)|\.ssh(?:\/|$)|[^/]*\.(?:pem|key|p12|pfx|jks|keystore))$/i
+
+const SAFE_ZIP_EXTRACTOR = String.raw`
+import pathlib
+import stat
+import sys
+import zipfile
+
+archive = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+max_entries = int(sys.argv[3])
+max_total = int(sys.argv[4])
+max_file = int(sys.argv[5])
+
+def fail(message):
+    raise RuntimeError(message)
+
+with zipfile.ZipFile(archive, "r") as package:
+    infos = package.infolist()
+    if not infos:
+        fail("ZIP 为空")
+    if len(infos) > max_entries:
+        fail("ZIP 文件数量超过限制")
+
+    total_size = 0
+    seen = set()
+    selected = []
+    for info in infos:
+        original = getattr(info, "orig_filename", info.filename)
+        if not original or "\x00" in original:
+            fail("ZIP 包含空文件名或 NUL")
+        name = original.replace("\\", "/")
+        if name.startswith("/") or name.startswith("//"):
+            fail("ZIP 包含绝对路径")
+        if len(name) >= 2 and name[1] == ":":
+            fail("ZIP 包含 Windows 绝对路径")
+        parts = [part for part in name.split("/") if part]
+        if not parts or any(part in (".", "..") for part in parts):
+            fail("ZIP 包含路径穿越")
+        if parts[0] == "__MACOSX" or parts[-1] == ".DS_Store":
+            continue
+        normalized = "/".join(parts)
+        collision_key = normalized.casefold()
+        if collision_key in seen:
+            fail("ZIP 包含重复或大小写冲突路径")
+        seen.add(collision_key)
+        if info.flag_bits & 0x1:
+            fail("ZIP 包含加密文件")
+        unix_mode = (info.external_attr >> 16) & 0xFFFF
+        file_type = stat.S_IFMT(unix_mode)
+        if file_type and not (stat.S_ISREG(unix_mode) or stat.S_ISDIR(unix_mode)):
+            fail("ZIP 包含软链接或特殊文件")
+        if info.file_size < 0 or info.file_size > max_file:
+            fail("ZIP 单文件大小超过限制")
+        total_size += info.file_size
+        if total_size > max_total:
+            fail("ZIP 解压总大小超过限制")
+        selected.append((info, parts, info.is_dir() or name.endswith("/")))
+
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    destination_real = destination.resolve()
+    for info, parts, is_directory in selected:
+        target = destination.joinpath(*parts)
+        parent = target if is_directory else target.parent
+        parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        parent_real = parent.resolve()
+        if parent_real != destination_real and destination_real not in parent_real.parents:
+            fail("ZIP 解压路径越界")
+        if is_directory:
+            target.chmod(0o755)
+            continue
+        written = 0
+        with package.open(info, "r") as source, open(target, "xb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > info.file_size or written > max_file:
+                    fail("ZIP 实际文件大小异常")
+                output.write(chunk)
+        if written != info.file_size:
+            fail("ZIP 文件大小与目录记录不一致")
+        target.chmod(0o644)
+`
 
 class ReleaseError extends Error {
 	constructor(message) {
@@ -150,10 +247,11 @@ function loadDotEnvFile(path, { required = true } = {}) {
 export function parseArgs(argv = []) {
 	const args = {
 		command: 'help',
-		configPath: DEFAULT_CONFIG_PATH,
+		configPath: '',
 		dryRun: false,
 		environment: 'test',
 		help: false,
+		packagePath: '',
 		releaseId: '',
 		skipTests: false,
 		yes: false
@@ -182,6 +280,12 @@ export function parseArgs(argv = []) {
 			case '-h':
 				args.help = true
 				break
+			case '--file': {
+				const packagePath = values.shift()
+				if (!packagePath || packagePath.startsWith('-')) fail('--file 缺少 ZIP 文件路径')
+				args.packagePath = resolve(packagePath)
+				break
+			}
 			case '--release': {
 				const releaseId = values.shift()
 				if (!releaseId || releaseId.startsWith('-')) fail('--release 缺少 release_id')
@@ -201,6 +305,7 @@ export function parseArgs(argv = []) {
 	if (!['test', 'production'].includes(args.environment)) {
 		fail(`不支持的构建环境：${args.environment}`)
 	}
+	if (!args.configPath) args.configPath = defaultConfigPath(args.environment)
 	return args
 }
 
@@ -209,15 +314,19 @@ function usage() {
 楼脉 H5 可验证自动发布工具
 
 用法：
-  node frontend/h5-release.mjs build [--env test] [--config FILE] [--skip-tests]
-  node frontend/h5-release.mjs deploy --yes [--env test] [--config FILE]
-  node frontend/h5-release.mjs deploy --dry-run [--config FILE]
-  node frontend/h5-release.mjs status [--config FILE]
-  node frontend/h5-release.mjs rollback --release RELEASE_ID --yes [--config FILE]
+  node frontend/h5-release.mjs build [--env test|production] [--config FILE] [--skip-tests]
+  node frontend/h5-release.mjs deploy --yes [--env test|production] [--config FILE]
+  node frontend/h5-release.mjs deploy --dry-run [--env test|production] [--config FILE]
+  node frontend/h5-release.mjs deploy-package --file /absolute/path/web.zip --yes [--env test|production]
+  node frontend/h5-release.mjs deploy-package --file /absolute/path/web.zip --dry-run [--env test|production]
+  node frontend/h5-release.mjs status [--env test|production] [--config FILE]
+  node frontend/h5-release.mjs rollback --release RELEASE_ID --dry-run [--env test|production] [--config FILE]
+  node frontend/h5-release.mjs rollback --release RELEASE_ID --yes [--env test|production] [--config FILE]
 
 说明：
   - deploy 每次都从当前 Git 提交全新构建，不接受旧 unpackage 产物。
-  - deploy/rollback 是外部状态变更，必须显式传入 --yes。
+	- deploy-package 只接受经过本机安全解包与完整产物门禁的 ZIP。
+	- deploy/deploy-package/rollback 正式执行是外部状态变更，必须显式传入 --yes。
   - --dry-run 只做本地和服务器只读预检，不构建、不上传、不切换。
 `.trim()
 }
@@ -277,6 +386,9 @@ function loadConfiguration(args, { requireRemote = false } = {}) {
 
 	const hbuilderRoot = expandHome(config.H5_HBUILDERX_ROOT || DEFAULT_HBUILDERX_ROOT)
 	const frontendRepoRoot = resolveFrontendRepoRoot(config.H5_FRONTEND_REPO)
+	const configuredEnvironment = String(
+		config.H5_DEPLOY_ENV || (args.environment === 'test' ? 'test' : '')
+	).trim()
 	const remoteStagingRoot = config.H5_REMOTE_STAGING_ROOT || ''
 	const publicUrl = String(config.H5_PUBLIC_URL || '').replace(/\/+$/, '')
 	const deployment = {
@@ -290,6 +402,7 @@ function loadConfiguration(args, { requireRemote = false } = {}) {
 		expectedTitle: config.H5_EXPECTED_TITLE || DEFAULT_EXPECTED_TITLE,
 		expectedUniVersion: config.H5_EXPECTED_UNI_VERSION || DEFAULT_EXPECTED_UNI_VERSION,
 		frontendRepoRoot,
+		environment: configuredEnvironment,
 		hbuilderRoot,
 		identityFile: expandHome(config.H5_SSH_IDENTITY_FILE || ''),
 		publicUrl,
@@ -303,6 +416,12 @@ function loadConfiguration(args, { requireRemote = false } = {}) {
 
 	if (!deployment.expectedBranch || /\s/.test(deployment.expectedBranch)) {
 		fail('H5_EXPECTED_BRANCH 配置非法')
+	}
+	if (!['test', 'production'].includes(deployment.environment)) {
+		fail('H5_DEPLOY_ENV 必须为 test 或 production（production 配置必须显式声明）')
+	}
+	if (deployment.environment !== args.environment) {
+		fail(`H5_DEPLOY_ENV 与 --env 不一致：${deployment.environment} !== ${args.environment}`)
 	}
 	if (requireRemote) {
 		if (!SAFE_REMOTE_TARGET.test(deployment.target)) fail('H5_DEPLOY_TARGET 格式非法')
@@ -411,7 +530,7 @@ export function inspectBuildTool(config) {
 	}
 }
 
-function readBuildEnvironment(frontendRepoRoot, environment) {
+export function readBuildEnvironment(frontendRepoRoot, environment) {
 	const environmentPath = join(frontendRepoRoot, `.env.${environment}`)
 	for (const overridePath of [
 		join(frontendRepoRoot, '.env'),
@@ -445,6 +564,28 @@ function readBuildEnvironment(frontendRepoRoot, environment) {
 	normalizeBoolean(values.VITE_ENABLE_TEST_ACCOUNTS, false)
 	if (environment === 'production' && values.VITE_ENABLE_TEST_ACCOUNTS !== 'false') {
 		fail('生产构建必须关闭 VITE_ENABLE_TEST_ACCOUNTS')
+	}
+	if (environment === 'production') {
+		for (const key of ['VITE_CHANNEL_BINDING_H5_BASE_URL', 'VITE_TIANDITU_WEB_MAP_BASE_URL']) {
+			const rawUrl = values[key] || ''
+			let parsedUrl
+			try {
+				parsedUrl = new URL(rawUrl)
+			} catch {
+				fail(`生产构建的 ${key} 必须是合法 HTTPS 根地址`)
+			}
+			if (
+				parsedUrl.protocol !== 'https:'
+				|| parsedUrl.pathname !== '/'
+				|| parsedUrl.username
+				|| parsedUrl.password
+				|| parsedUrl.search
+				|| parsedUrl.hash
+				|| FORBIDDEN_BUNDLE_PATTERN.test(rawUrl)
+				|| parsedUrl.hostname.startsWith('test.')
+			) fail(`生产构建的 ${key} 不能指向测试服、本机或私网`)
+		}
+		if (parsedApiUrl.hostname.startsWith('test.')) fail('生产构建 API 不能指向测试服')
 	}
 	return { apiBaseUrl, appEnvironment, values }
 }
@@ -495,6 +636,7 @@ export function validateArtifact(outputDir, options) {
 	const {
 		apiBaseUrl,
 		builtAfter = 0,
+		environment = '',
 		expectedTitle = '',
 		frontendRepoRoot = '',
 		requireChannelStorageFix = true
@@ -532,6 +674,9 @@ export function validateArtifact(outputDir, options) {
 	const discoveredApiUrls = new Set()
 	for (const { absolute, relative: path } of files) {
 		const content = readFileSync(absolute, 'utf8')
+		if (environment === 'production' && /https:\/\/test\.yinlizhangyu\.com\b/i.test(content)) {
+			fail(`生产产物仍包含测试服地址（${path}）`)
+		}
 		for (const match of content.matchAll(API_V1_URL_PATTERN)) discoveredApiUrls.add(match[0])
 		const match = content.match(FORBIDDEN_BUNDLE_PATTERN)
 		if (match) fail(`产物包含本地或局域网地址（${path}）：${match[0]}`)
@@ -552,10 +697,24 @@ export function validateArtifact(outputDir, options) {
 		)
 		if (!channelBundle) fail('产物缺少渠道邀请码工具 bundle')
 		const channelContent = readFileSync(channelBundle.absolute, 'utf8')
-		for (const marker of ['removeStorageSync', 'removeStorage', 'setStorageSync', 'setStorage']) {
-			const markerPattern = new RegExp(`["']${marker}["']`)
-			if (!markerPattern.test(channelContent)) {
-				fail(`渠道邀请码 bundle 缺少 H5 存储兼容标记：${marker}`)
+		const capabilityGuards = channelContent.match(
+			/(?:["']function["']\s*[!=]==?\s*typeof|typeof\s+[^;,?(){}]{1,80}\s*[!=]==?\s*["']function["'])/g
+		) || []
+		if (capabilityGuards.length < 2) {
+			fail('渠道邀请码 bundle 缺少存储能力检测，拒绝发布')
+		}
+		if (frontendRepoRoot) {
+			const sourcePath = join(frontendRepoRoot, 'utils/channel-binding-entry.mjs')
+			if (!existsSync(sourcePath)) fail('无法核验渠道邀请码存储兼容源码')
+			const sourceContent = readFileSync(sourcePath, 'utf8')
+			for (const requiredSourcePattern of [
+				/typeof\s+uni\.removeStorageSync\s*===\s*["']function["']/,
+				/typeof\s+uni\.setStorageSync\s*!==\s*["']function["']/,
+				/setPendingChannelInvitationStorage\(["']{2}\)/
+			]) {
+				if (!requiredSourcePattern.test(sourceContent)) {
+					fail('渠道邀请码源码缺少 removeStorageSync 降级保护，拒绝发布')
+				}
 			}
 		}
 	}
@@ -631,6 +790,12 @@ function runTests(config, { dryRun = false } = {}) {
 	run('npm', ['test'], { cwd: config.frontendRepoRoot, dryRun })
 }
 
+function runPackageImportTests() {
+	run('node', ['--test', join(TOOL_ROOT, 'tests/frontend-h5-release.test.mjs')], {
+		cwd: TOOL_ROOT
+	})
+}
+
 function lstatIfPresent(path) {
 	try {
 		return lstatSync(path)
@@ -682,6 +847,169 @@ function safeRemovePartial(buildRoot, partialRoot) {
 		fail(`拒绝清理非普通构建目录：${partialRoot}`)
 	}
 	rmSync(partialRoot, { force: true, recursive: true })
+}
+
+export function inspectExternalPackage(packagePath) {
+	if (!packagePath || !isAbsolute(packagePath)) fail('压缩包路径必须是绝对路径')
+	const requestedPath = resolve(packagePath)
+	const entry = lstatIfPresent(requestedPath)
+	if (!entry?.isFile() || entry.isSymbolicLink()) {
+		fail(`压缩包不是普通文件或不存在：${requestedPath}`)
+	}
+	const normalizedPath = realpathSync(requestedPath)
+	if (!normalizedPath.toLowerCase().endsWith('.zip')) {
+		fail('deploy-package 当前只接受 .zip 文件')
+	}
+	if (entry.size <= 0 || entry.size > PACKAGE_MAX_ARCHIVE_BYTES) {
+		fail(`ZIP 大小必须在 1 字节到 ${PACKAGE_MAX_ARCHIVE_BYTES} 字节之间`)
+	}
+	return {
+		basename: basename(normalizedPath),
+		packagePath: normalizedPath,
+		sha256: sha256File(normalizedPath),
+		size: entry.size
+	}
+}
+
+export function extractExternalPackage(packagePath, destination) {
+	if (lstatIfPresent(destination)) fail(`ZIP 解压目录已存在：${destination}`)
+	const parent = dirname(destination)
+	if (!lstatIfPresent(parent)?.isDirectory()) fail(`ZIP 解压父目录不存在：${parent}`)
+	run('python3', [
+		'-c', SAFE_ZIP_EXTRACTOR,
+		packagePath,
+		destination,
+		String(PACKAGE_MAX_ENTRIES),
+		String(PACKAGE_MAX_EXTRACTED_BYTES),
+		String(PACKAGE_MAX_FILE_BYTES)
+	], { capture: true, cwd: TOOL_ROOT, quiet: true })
+}
+
+export function resolveExternalPackageFrontendRoot(extractRoot) {
+	if (existsSync(join(extractRoot, 'index.html'))) return extractRoot
+	const entries = readdirSync(extractRoot, { withFileTypes: true })
+	if (entries.length !== 1 || !entries[0].isDirectory() || entries[0].isSymbolicLink()) {
+		fail('ZIP 必须在根目录包含 index.html，或只包含一个带 index.html 的 web 目录')
+	}
+	const nestedRoot = join(extractRoot, entries[0].name)
+	if (!existsSync(join(nestedRoot, 'index.html'))) {
+		fail('ZIP 唯一顶层目录中缺少 index.html')
+	}
+	return nestedRoot
+}
+
+export function validateExternalPackageArtifact(outputDir) {
+	const files = listFiles(outputDir)
+	for (const { relative: path } of files) {
+		if (RESERVED_RELEASE_FILES.has(path)) {
+			fail(`外部 ZIP 不能自带发布器保留文件：${path}`)
+		}
+		if (path.split('/').some((part) => part.startsWith('.'))) {
+			fail(`外部 ZIP 包含隐藏文件或目录：${path}`)
+		}
+		if (FORBIDDEN_PACKAGE_FILE_PATTERN.test(path)) {
+			fail(`外部 ZIP 包含敏感文件：${path}`)
+		}
+	}
+	return files
+}
+
+function importPackageRelease(args, config, { finalize = true } = {}) {
+	const environment = readBuildEnvironment(config.frontendRepoRoot, args.environment)
+	const packageInfo = inspectExternalPackage(args.packagePath)
+	const artifactIdentity = packageInfo.sha256.slice(0, 40)
+	const releaseId = createReleaseId(packageInfo.sha256.slice(0, 10))
+	const buildRoot = join(TOOL_ROOT, 'dist/h5-releases')
+	const partialRoot = join(buildRoot, `.${releaseId}.partial`)
+	const finalRoot = join(buildRoot, releaseId)
+	const extractRoot = join(partialRoot, 'unpack')
+	const outputDir = join(partialRoot, 'frontend')
+	const pinnedPackagePath = join(partialRoot, 'source-package.zip')
+	if (existsSync(partialRoot) || existsSync(finalRoot)) fail(`release_id 已存在：${releaseId}`)
+
+	ensureLocalBuildRoot(buildRoot)
+	mkdirSync(partialRoot, { mode: 0o700 })
+	try {
+		copyFileSync(packageInfo.packagePath, pinnedPackagePath, fsConstants.COPYFILE_EXCL)
+		chmodSync(pinnedPackagePath, 0o600)
+		if (sha256File(pinnedPackagePath) !== packageInfo.sha256) {
+			fail('ZIP 在校验与固定副本之间发生变化，请重新获取文件后再发布')
+		}
+		extractExternalPackage(pinnedPackagePath, extractRoot)
+		rmSync(pinnedPackagePath, { force: true })
+		const packageFrontendRoot = resolveExternalPackageFrontendRoot(extractRoot)
+		if (packageFrontendRoot === extractRoot) {
+			renameSync(extractRoot, outputDir)
+		} else {
+			renameSync(packageFrontendRoot, outputDir)
+			rmSync(extractRoot, { force: true, recursive: true })
+		}
+		validateExternalPackageArtifact(outputDir)
+		const artifact = validateArtifact(outputDir, {
+			apiBaseUrl: environment.apiBaseUrl,
+			environment: args.environment,
+			expectedTitle: config.expectedTitle,
+			frontendRepoRoot: ''
+		})
+		const metadata = {
+			schema_version: 1,
+			release_id: releaseId,
+			commit: artifactIdentity,
+			branch: 'external-package',
+			environment: args.environment,
+			api_base_url: environment.apiBaseUrl,
+			built_at: new Date().toISOString(),
+			index_sha256: artifact.indexSha256,
+			source: {
+				kind: 'external_zip',
+				package_name: packageInfo.basename,
+				package_sha256: packageInfo.sha256,
+				package_size: packageInfo.size,
+				source_commit: null
+			},
+			tool: {
+				h5_release_tool: H5_RELEASE_TOOL_VERSION,
+				package_importer: 1
+			}
+		}
+		writeReleaseFiles(outputDir, metadata)
+		const checksumsSha256 = sha256File(join(outputDir, 'SHA256SUMS'))
+		validateArtifact(outputDir, {
+			apiBaseUrl: environment.apiBaseUrl,
+			environment: args.environment,
+			expectedTitle: config.expectedTitle,
+			frontendRepoRoot: ''
+		})
+
+		if (!finalize) {
+			return {
+				artifact,
+				checksumsSha256,
+				environment,
+				metadata,
+				outputDir,
+				packageInfo,
+				partialRoot,
+				releaseId
+			}
+		}
+		renameSync(partialRoot, finalRoot)
+		const finalOutput = join(finalRoot, 'frontend')
+		info(`外部 ZIP 校验完成：${finalOutput}`)
+		info(`外部 ZIP SHA256：${packageInfo.sha256}`)
+		return {
+			artifact,
+			checksumsSha256,
+			environment,
+			metadata,
+			outputDir: finalOutput,
+			packageInfo,
+			releaseId
+		}
+	} catch (error) {
+		safeRemovePartial(buildRoot, partialRoot)
+		throw error
+	}
 }
 
 function buildRelease(args, config, gitState, tool) {
@@ -736,6 +1064,7 @@ function buildRelease(args, config, gitState, tool) {
 		const artifact = validateArtifact(outputDir, {
 			apiBaseUrl: environment.apiBaseUrl,
 			builtAfter,
+			environment: args.environment,
 			expectedTitle: config.expectedTitle,
 			frontendRepoRoot: config.frontendRepoRoot
 		})
@@ -762,6 +1091,7 @@ function buildRelease(args, config, gitState, tool) {
 		validateArtifact(outputDir, {
 			apiBaseUrl: environment.apiBaseUrl,
 			builtAfter,
+			environment: args.environment,
 			expectedTitle: config.expectedTitle,
 			frontendRepoRoot: config.frontendRepoRoot
 		})
@@ -787,6 +1117,9 @@ function sshOptions(config) {
 		'-o', 'BatchMode=yes',
 		'-o', 'StrictHostKeyChecking=yes',
 		'-o', 'ConnectTimeout=10',
+		'-o', 'ServerAliveInterval=15',
+		'-o', 'ServerAliveCountMax=12',
+		'-o', 'TCPKeepAlive=yes',
 		'-p', String(config.sshPort)
 	]
 	if (config.identityFile) options.push('-i', config.identityFile)
@@ -815,9 +1148,34 @@ function parseKeyValueOutput(text = '') {
 	return result
 }
 
+function assertRemoteHelperExact(config) {
+	const version = remoteHelper(config, ['version'], { capture: true }).stdout.trim()
+	if (version !== H5_RELEASE_TOOL_VERSION) {
+		fail(`服务器激活器版本不匹配：${version || '(空)'}`)
+	}
+	const expectedFingerprint = sha256File(join(TOOL_ROOT, 'frontend/remote/loumai-h5-release'))
+	let actualFingerprint = ''
+	try {
+		actualFingerprint = remoteHelper(config, ['fingerprint'], { capture: true }).stdout.trim()
+	} catch {
+		fail('服务器 H5 激活器不支持源码指纹校验，请先安装当前版本')
+	}
+	if (actualFingerprint !== expectedFingerprint) {
+		fail('服务器 H5 激活器与本地源码不一致，请先更新 root-owned helper')
+	}
+}
+
 function remotePreflight(config, { dryRun = false } = {}) {
-	const result = remoteHelper(config, ['preflight'], { capture: true, dryRun })
-	if (dryRun) return { CURRENT: 'UNKNOWN', STAGING_ROOT: config.remoteStagingRoot }
+	const expectedRemoteRoot = dirname(config.remoteStagingRoot)
+	if (dryRun) return {
+		CURRENT: 'UNKNOWN',
+		ENVIRONMENT: config.environment,
+		PUBLIC_URL: config.publicUrl,
+		REMOTE_ROOT: expectedRemoteRoot,
+		STAGING_ROOT: config.remoteStagingRoot
+	}
+	assertRemoteHelperExact(config)
+	const result = remoteHelper(config, ['preflight', config.environment], { capture: true })
 	const values = parseKeyValueOutput(result.stdout)
 	if (values.HELPER_VERSION !== H5_RELEASE_TOOL_VERSION) {
 		fail(`服务器激活器版本不匹配：${values.HELPER_VERSION || '(空)'}`)
@@ -825,12 +1183,21 @@ function remotePreflight(config, { dryRun = false } = {}) {
 	if (values.STAGING_ROOT !== config.remoteStagingRoot) {
 		fail('本地与服务器的 staging 配置不一致')
 	}
+	if (values.REMOTE_ROOT !== expectedRemoteRoot) {
+		fail('本地与服务器的发布根目录不一致')
+	}
+	if (values.PUBLIC_URL !== config.publicUrl) {
+		fail('本地与服务器的公网 URL 不一致')
+	}
+	if (values.ENVIRONMENT !== config.environment) {
+		fail(`本地与服务器的部署环境不一致：${values.ENVIRONMENT || '(空)'}`)
+	}
 	return values
 }
 
 function prepareRemoteStaging(config, releaseId, { dryRun = false } = {}) {
 	const expectedStageDir = `${config.remoteStagingRoot}/${releaseId}.partial`
-	const result = remoteHelper(config, ['prepare', releaseId], { capture: true, dryRun })
+	const result = remoteHelper(config, ['prepare', config.environment, releaseId], { capture: true, dryRun })
 	if (dryRun) return expectedStageDir
 	const values = parseKeyValueOutput(result.stdout)
 	if (values.STAGE_DIR !== expectedStageDir) {
@@ -903,7 +1270,11 @@ function postDeployVerify(config, release) {
 	} catch {
 		fail('线上 release.json 不是合法 JSON')
 	}
-	if (manifest.release_id !== release.releaseId || manifest.commit !== release.metadata.commit) {
+	if (
+		manifest.release_id !== release.releaseId
+		|| manifest.commit !== release.metadata.commit
+		|| manifest.environment !== config.environment
+	) {
 		fail('线上 release.json 与本次发布不一致')
 	}
 	const indexBytes = curlBytes(`${config.publicUrl}/?release_check=${cacheBuster}`)
@@ -923,6 +1294,7 @@ function deployRelease(args, config, release) {
 		uploadArtifact(config, upload.archivePath, stageDir)
 		remoteHelper(config, [
 			'activate',
+			config.environment,
 			release.releaseId,
 			release.metadata.commit,
 			release.metadata.index_sha256,
@@ -934,7 +1306,7 @@ function deployRelease(args, config, release) {
 	} catch (error) {
 		if (stagePrepared) {
 			try {
-				remoteHelper(config, ['abort', release.releaseId], { capture: true })
+				remoteHelper(config, ['abort', config.environment, release.releaseId], { capture: true })
 			} catch (cleanupError) {
 				const cleanupDetail = cleanupError instanceof Error
 					? cleanupError.message
@@ -975,6 +1347,7 @@ function dryRunDeploy(args, config, gitState, tool) {
 	uploadArtifact(config, archivePath, stageDir, { dryRun: true })
 	remoteHelper(config, [
 		'activate',
+		config.environment,
 		releaseId,
 		gitState.commit,
 		'INDEX_SHA256',
@@ -987,8 +1360,41 @@ function dryRunDeploy(args, config, gitState, tool) {
 	info('[dry-run] 未构建、未上传、未切换线上版本')
 }
 
+function dryRunPackageDeploy(args, config) {
+	const release = importPackageRelease(args, config, { finalize: false })
+	const buildRoot = join(TOOL_ROOT, 'dist/h5-releases')
+	try {
+		const preflight = remotePreflight(config)
+		const stageDir = prepareRemoteStaging(config, release.releaseId, { dryRun: true })
+		const upload = createUploadArchive(release.outputDir)
+		uploadArtifact(config, upload.archivePath, stageDir, { dryRun: true })
+		remoteHelper(config, [
+			'activate',
+			config.environment,
+			release.releaseId,
+			release.metadata.commit,
+			release.metadata.index_sha256,
+			release.checksumsSha256,
+			upload.archiveSha256,
+			preflight.CURRENT || 'NONE'
+		], { dryRun: true })
+		info(`[dry-run] ZIP=${release.packageInfo.packagePath}`)
+		info(`[dry-run] ZIP_SHA256=${release.packageInfo.sha256}`)
+		info(`[dry-run] API=${release.environment.apiBaseUrl}`)
+		info(`[dry-run] 当前线上版本=${preflight.CURRENT || 'NONE'}`)
+		info('[dry-run] 压缩包已在本机安全解压并通过产物门禁；未上传、未切换线上版本')
+	} finally {
+		safeRemovePartial(buildRoot, release.partialRoot)
+	}
+}
+
 function status(config) {
-	const result = remoteHelper(config, ['status'], { capture: true })
+	const preflight = remotePreflight(config)
+	const result = remoteHelper(config, ['status', config.environment], { capture: true })
+	const values = parseKeyValueOutput(result.stdout)
+	if (values.ENVIRONMENT !== config.environment || values.CURRENT !== (preflight.CURRENT || '')) {
+		fail('服务器 status 与 preflight 的环境或当前版本不一致')
+	}
 	process.stdout.write(result.stdout)
 }
 
@@ -996,11 +1402,19 @@ function rollback(args, config) {
 	if (!args.releaseId || !SAFE_RELEASE_ID.test(args.releaseId)) {
 		fail('rollback 必须通过 --release 指定合法 release_id')
 	}
-	if (!args.yes) fail('rollback 会切换线上版本，必须显式传入 --yes')
 	const preflight = remotePreflight(config)
 	const expectedCurrent = preflight.CURRENT || 'NONE'
-	remoteHelper(config, ['rollback', args.releaseId, expectedCurrent])
-	const result = remoteHelper(config, ['status'], { capture: true })
+	if (args.dryRun) {
+		const checked = remoteHelper(config, ['check-release', config.environment, args.releaseId, expectedCurrent], {
+			capture: true
+		})
+		process.stdout.write(checked.stdout)
+		info('[dry-run] 目标版本、哈希和当前版本条件有效，未切换线上版本')
+		return
+	}
+	if (!args.yes) fail('rollback 会切换线上版本，必须显式传入 --yes')
+	remoteHelper(config, ['rollback', config.environment, args.releaseId, expectedCurrent])
+	const result = remoteHelper(config, ['status', config.environment], { capture: true })
 	process.stdout.write(result.stdout)
 }
 
@@ -1014,11 +1428,11 @@ function main() {
 		process.stdout.write(`${usage()}\n`)
 		return
 	}
-	if (!['build', 'deploy', 'status', 'rollback'].includes(args.command)) {
+	if (!['build', 'deploy', 'deploy-package', 'status', 'rollback'].includes(args.command)) {
 		fail(`未知命令：${args.command}`)
 	}
 
-	const requireRemote = ['deploy', 'status', 'rollback'].includes(args.command)
+	const requireRemote = ['deploy', 'deploy-package', 'status', 'rollback'].includes(args.command)
 	const config = loadConfiguration(args, { requireRemote })
 	if (args.command === 'status') {
 		status(config)
@@ -1028,6 +1442,22 @@ function main() {
 		rollback(args, config)
 		return
 	}
+	if (args.command === 'deploy-package') {
+		if (!args.packagePath) fail('deploy-package 必须通过 --file 指定 ZIP 文件')
+		if (args.skipTests) fail('deploy-package 不接受 --skip-tests')
+		runPackageImportTests()
+		if (args.dryRun) {
+			dryRunPackageDeploy(args, config)
+			return
+		}
+		if (!args.yes) {
+			fail('deploy-package 会上传并切换线上版本，必须显式传入 --yes')
+		}
+		const release = importPackageRelease(args, config)
+		deployRelease(args, config, release)
+		return
+	}
+	if (args.packagePath) fail('--file 只能与 deploy-package 一起使用')
 
 	const gitState = inspectGitState(config)
 	const tool = inspectBuildTool(config)

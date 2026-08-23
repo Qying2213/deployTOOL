@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Loumai push and appointment jobs every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=loumai-app-push-dispatcher.service
+
+[Install]
+WantedBy=timers.target

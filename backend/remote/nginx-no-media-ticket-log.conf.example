@@ -1,0 +1,8 @@
+# Put this log_format in nginx.conf's http {} block. It deliberately logs $uri,
+# never the raw request target, so query credentials such as media_ticket are absent.
+log_format loumai_no_query '$remote_addr - $remote_user [$time_local] '
+                           '"$request_method $uri $server_protocol" $status $body_bytes_sent '
+                           '"$http_user_agent"';
+
+# Put this access_log in the test.yinlizhangyu.com server {} block.
+access_log /var/log/nginx/loumai-test.access.log loumai_no_query;

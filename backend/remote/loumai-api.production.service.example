@@ -1,0 +1,44 @@
+[Unit]
+Description=Loumai Production FastAPI
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loumai-api
+Group=loumai-api
+SupplementaryGroups=loumai-db-ca
+WorkingDirectory=/srv/loumai-backend/backend-current
+EnvironmentFile=/etc/loumai/backend.env
+EnvironmentFile=/etc/loumai/sms.env
+EnvironmentFile=/etc/loumai/database-active.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryHigh=3G
+MemoryMax=4G
+TasksMax=384
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

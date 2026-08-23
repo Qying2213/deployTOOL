@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+umask 022
+
+readonly HELPER_VERSION="1"
+readonly CONFIG_FILE="/etc/loumai/company-management-release.env"
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "服务器缺少命令：$1"; }
+valid_release() { [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$ ]]; }
+valid_sha() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+
+[[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || fail "缺少配置：$CONFIG_FILE"
+[[ "$(stat -c '%u' "$CONFIG_FILE")" == 0 ]] || fail "配置必须归 root 所有"
+[[ -z "$(find "$CONFIG_FILE" -maxdepth 0 -perm /022 -print -quit)" ]] || fail "配置权限过宽"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${LOUMAI_COMPANY_REMOTE_ROOT:?缺少 LOUMAI_COMPANY_REMOTE_ROOT}"
+: "${LOUMAI_COMPANY_DEPLOY_USER:?缺少 LOUMAI_COMPANY_DEPLOY_USER}"
+: "${LOUMAI_COMPANY_SERVICE:?缺少 LOUMAI_COMPANY_SERVICE}"
+: "${LOUMAI_COMPANY_PUBLIC_URL:?缺少 LOUMAI_COMPANY_PUBLIC_URL}"
+: "${LOUMAI_COMPANY_BASE_PYTHON:?缺少 LOUMAI_COMPANY_BASE_PYTHON}"
+: "${LOUMAI_COMPANY_UV:?缺少 LOUMAI_COMPANY_UV}"
+
+readonly ROOT="$LOUMAI_COMPANY_REMOTE_ROOT"
+readonly RELEASES="$ROOT/releases"
+readonly INCOMING="$ROOT/incoming"
+readonly CURRENT="$ROOT/current"
+readonly SERVICE="$LOUMAI_COMPANY_SERVICE"
+readonly PUBLIC="${LOUMAI_COMPANY_PUBLIC_URL%/}"
+readonly OWN_LOCK="$ROOT/.company-release.lock"
+readonly GLOBAL_LOCK="${LOUMAI_BACKEND_GLOBAL_LOCK:-/srv/loumai-backend/.backend-release.lock}"
+readonly UV_CACHE="$ROOT/uv-cache"
+
+[[ "$ROOT" == /* && "$ROOT" != / && "$ROOT" != *..* ]] || fail "发布根目录非法"
+[[ "$PUBLIC" == https://* ]] || fail "公网地址必须是 HTTPS"
+for bin in flock stat find install readlink tar sha256sum runuser systemctl curl awk sed grep mv ln rm cp; do need "$bin"; done
+[[ -x "$LOUMAI_COMPANY_BASE_PYTHON" ]] || fail "基础 Python 不存在"
+[[ -x "$LOUMAI_COMPANY_UV" ]] || fail "uv 不存在"
+id "$LOUMAI_COMPANY_DEPLOY_USER" >/dev/null 2>&1 || fail "发布用户不存在"
+
+ensure_dirs() {
+  install -d -m 0755 -o root -g root "$ROOT" "$RELEASES" "$INCOMING"
+  install -d -m 0750 -o loumai-admin -g loumai-admin "$UV_CACHE"
+  [[ ! -L "$ROOT" && "$(readlink -f "$ROOT")" == "$ROOT" ]] || fail "发布目录不安全"
+  [[ ! -L "$UV_CACHE" && "$(readlink -f "$UV_CACHE")" == "$UV_CACHE" ]] || fail "uv 缓存目录不安全"
+}
+
+lock_all() {
+  ensure_dirs
+  exec 8>"$GLOBAL_LOCK"
+  flock -w 180 8 || fail "主后端或数据库切换正在执行"
+  exec 9>"$OWN_LOCK"
+  flock -w 180 9 || fail "管理后台发布正在执行"
+}
+
+current_target() {
+  if [[ ! -e "$CURRENT" && ! -L "$CURRENT" ]]; then printf '\n'; return; fi
+  [[ -L "$CURRENT" ]] || fail "current 不是软链接"
+  local target
+  target="$(readlink -f "$CURRENT")"
+  [[ "$target" == "$RELEASES"/*/backend ]] || fail "current 越界"
+  printf '%s\n' "$target"
+}
+
+switch_current() {
+  local target="$1" next="$ROOT/.current.next.$$"
+  ln -s "$target" "$next"
+  mv -Tf "$next" "$CURRENT"
+}
+
+health() {
+  local i
+  for i in $(seq 1 45); do
+    if curl -fsS --max-time 5 http://127.0.0.1:8100/health >/dev/null \
+      && curl -fsS --max-time 8 "$PUBLIC/health" >/dev/null \
+      && curl -fsS --max-time 8 "$PUBLIC/ready" >/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+verify_tree() {
+  local root="$1" bad
+  [[ -d "$root" && ! -L "$root" ]] || fail "产物目录非法"
+  for f in app/main.py pyproject.toml runtime-constraints.txt release.json SHA256SUMS; do
+    [[ -f "$root/$f" && ! -L "$root/$f" ]] || fail "产物缺少 $f"
+  done
+  # .runtime 是发布后由 uv 创建的受控虚拟环境，内部合法包含解释器软链接；
+  # 源码、清单与配置仍必须完全拒绝软链接和特殊文件。
+  bad="$(find "$root" -path "$root/.runtime" -prune -o \( -type l -o ! -type d ! -type f \) -print | head -n 1)"
+  [[ -z "$bad" ]] || fail "产物包含链接或特殊文件：$bad"
+  bad="$(find "$root" -path "$root/.runtime" -prune -o -type f \( -name '._*' -o -name '.DS_Store' -o -name '.env' -o -name '*.pem' -o -name '*.key' -o -name '*.sql' -o -name '*.db' \) -print | head -n 1)"
+  [[ -z "$bad" ]] || fail "产物包含敏感文件：$bad"
+  (cd "$root" && sha256sum -c SHA256SUMS >/dev/null) || fail "文件哈希校验失败"
+}
+
+preflight() {
+  ensure_dirs
+  systemctl cat "$SERVICE" >/dev/null || fail "systemd 服务不存在"
+  [[ -x /usr/local/sbin/loumai-company-management-run ]] || fail "启动包装器不存在"
+  [[ -f /etc/loumai/database-active.env ]] || fail "数据库 active profile 不存在"
+  nginx -t >/dev/null
+  printf 'HELPER_VERSION=%s\nCURRENT=%s\n' "$HELPER_VERSION" "$(current_target)"
+}
+
+prepare_release() {
+  local id="$1" expected="$2" partial
+  partial="$INCOMING/$id.partial"
+  valid_release "$id" || fail "release_id 非法"
+  [[ "$(current_target)" == "$expected" ]] || fail "current 已变化，请重新发布"
+  [[ ! -e "$partial" ]] || fail "incoming 已存在"
+  install -d -m 0755 -o "$LOUMAI_COMPANY_DEPLOY_USER" -g "$LOUMAI_COMPANY_DEPLOY_USER" "$partial"
+  printf 'PREPARED=%s\n' "$partial"
+}
+
+activate_release() {
+  local id="$1" archive_sha="$2" expected="$3"
+  local incoming archive partial target previous
+  incoming="$INCOMING/$id.partial"
+  archive="$incoming/backend.tar"
+  partial="$RELEASES/.$id.partial"
+  target="$RELEASES/$id/backend"
+  valid_release "$id" || fail "release_id 非法"
+  valid_sha "$archive_sha" || fail "archive sha 非法"
+  lock_all
+  trap 'rc=$?; rm -rf -- "$partial" "$incoming"; exit "$rc"' ERR
+  previous="$(current_target)"
+  [[ "$previous" == "$expected" ]] || fail "current 已变化，请重新发布"
+  [[ -f "$archive" && ! -L "$archive" ]] || fail "上传包不存在"
+  [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$archive_sha" ]] || fail "上传包哈希错误"
+  if tar -tf "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then fail "压缩包包含越界路径"; fi
+  [[ ! -e "$partial" && ! -e "${target%/backend}" ]] || fail "release 已存在"
+  install -d -m 0755 -o root -g root "$partial"
+  tar -xf "$archive" -C "$partial" --no-same-owner --no-same-permissions
+  [[ -d "$partial/backend" ]] || fail "压缩包根目录错误"
+  verify_tree "$partial/backend"
+  install -d -m 0755 -o root -g root "$partial/backend/.runtime"
+  install -d -m 0700 -o loumai-admin -g loumai-admin \
+    "$partial/backend/.runtime/home" \
+    "$partial/backend/.runtime/pycache"
+  chown -R loumai-admin:loumai-admin "$partial/backend/.runtime"
+  (
+    cd "$partial/backend"
+    runuser -u loumai-admin -- env \
+      HOME="$partial/backend/.runtime/home" \
+      UV_CACHE_DIR="$UV_CACHE" \
+      "$LOUMAI_COMPANY_UV" --no-config venv \
+      --python "$LOUMAI_COMPANY_BASE_PYTHON" .runtime/venv >/dev/null
+    runuser -u loumai-admin -- env \
+      HOME="$partial/backend/.runtime/home" \
+      UV_CACHE_DIR="$UV_CACHE" \
+      "$LOUMAI_COMPANY_UV" --no-config pip sync \
+      --python .runtime/venv/bin/python runtime-constraints.txt >/dev/null
+    # 发布器不解析或复制 systemd 的敏感环境文件。这里仅做离线语法检查；
+    # 切换后由真实 systemd 环境启动应用，并由 health/ready 门禁决定保留或回滚。
+    runuser -u loumai-admin -- env \
+      PYTHONPYCACHEPREFIX="$partial/backend/.runtime/pycache" \
+      .runtime/venv/bin/python -m compileall -q app
+  )
+  chown -R root:root "$partial/backend"
+  find "$partial/backend" -type d -exec chmod 0755 {} +
+  find "$partial/backend" -type f -exec chmod 0644 {} +
+  find "$partial/backend/.runtime/venv/bin" -type f -exec chmod 0755 {} +
+  mv "$partial" "${target%/backend}"
+  switch_current "$target"
+  if ! systemctl restart "$SERVICE" || ! health; then
+    if [[ -n "$previous" ]]; then switch_current "$previous"; else rm -f "$CURRENT"; fi
+    systemctl restart "$SERVICE" || true
+    health || true
+    rm -rf -- "${target%/backend}" "$incoming"
+    fail "新版本健康检查失败，已恢复旧版本"
+  fi
+  rm -rf "$incoming"
+  trap - ERR
+  printf 'ACTIVATED=%s\nPREVIOUS=%s\n' "$target" "$previous"
+}
+
+rollback_release() {
+  local id="$1" target previous
+  target="$RELEASES/$id/backend"
+  valid_release "$id" || fail "release_id 非法"
+  lock_all
+  verify_tree "$target"
+  previous="$(current_target)"
+  switch_current "$target"
+  if ! systemctl restart "$SERVICE" || ! health; then
+    switch_current "$previous"
+    systemctl restart "$SERVICE" || true
+    fail "回滚目标不可用，已恢复原版本"
+  fi
+  printf 'ROLLED_BACK=%s\nPREVIOUS=%s\n' "$target" "$previous"
+}
+
+status_cmd() {
+  local profile target pid db_target="unknown"
+  target="$(current_target)"
+  profile="$(sed -n 's/^LOUMAI_DATABASE_PROFILE=//p' /etc/loumai/database-active.env | tail -n1)"
+  pid="$(systemctl show "$SERVICE" -p MainPID --value)"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]]; then
+    db_target="$(tr '\0' '\n' < "/proc/$pid/environ" | sed -n 's#^DATABASE_URL=.*@\([^/?]*\).*#\1#p' | head -n1)"
+  fi
+  printf 'HELPER_VERSION=%s\nCURRENT=%s\nDATABASE_PROFILE=%s\nDATABASE_TARGET=%s\nUNIT=%s\n' \
+    "$HELPER_VERSION" "$target" "${profile:-unknown}" "${db_target:-unknown}" "$(systemctl is-active "$SERVICE" || true)"
+  [[ -z "$target" || ! -f "$target/release.json" ]] || cat "$target/release.json"
+}
+
+case "${1:-}" in
+  version) [[ $# == 1 ]] || fail "version 参数错误"; printf '%s\n' "$HELPER_VERSION" ;;
+  preflight) [[ $# == 1 ]] || fail "preflight 参数错误"; preflight ;;
+  prepare) [[ $# == 3 ]] || fail "prepare 参数错误"; lock_all; prepare_release "$2" "$3" ;;
+  activate) [[ $# == 4 ]] || fail "activate 参数错误"; activate_release "$2" "$3" "$4" ;;
+  rollback) [[ $# == 2 ]] || fail "rollback 参数错误"; rollback_release "$2" ;;
+  status) [[ $# == 1 ]] || fail "status 参数错误"; status_cmd ;;
+  *) fail "用法：$0 version|preflight|prepare|activate|rollback|status" ;;
+esac

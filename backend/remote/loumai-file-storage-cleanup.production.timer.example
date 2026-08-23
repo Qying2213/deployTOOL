@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Loumai file and direct upload cleanup every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=loumai-file-storage-cleanup.service
+
+[Install]
+WantedBy=timers.target

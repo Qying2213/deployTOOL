@@ -19,19 +19,40 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-export const BACKEND_RELEASE_TOOL_VERSION = '1'
+import {
+	buildEnvironmentAudit,
+	ENV_RUNNER_KEYS,
+	inspectEnvironmentText,
+	parseRemoteEnvironmentAudit,
+	renderEnvironmentAudit
+} from './env-audit.mjs'
+
+export const BACKEND_RELEASE_TOOL_VERSION = '5'
 export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.test.local.env')
+export const PRODUCTION_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.production.local.env')
 export const DEFAULT_CONSTRAINTS_PATH = join(TOOL_ROOT, 'backend/runtime-constraints.test.txt')
+export const PRODUCTION_CONSTRAINTS_PATH = join(
+	TOOL_ROOT,
+	'backend/runtime-constraints.production.txt'
+)
 
 const DEFAULT_EXPECTED_BRANCH = 'master'
 const DEFAULT_REMOTE_HELPER = '/usr/local/sbin/loumai-backend-release'
+const SUPPORTED_ENVIRONMENTS = new Set(['test', 'production'])
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9._/-]+$/
 const SAFE_REMOTE_TARGET = /^[A-Za-z0-9._-]+(?:@[A-Za-z0-9.-]+)?$/
 const SAFE_RELEASE_ID = /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}$/
 const SAFE_REVISION = /^[A-Za-z0-9_]+$/
 const SAFE_ARTIFACT_PATH = /^[A-Za-z0-9._/-]+$/
 const SECRET_KEY_PATTERN = /SECRET|PASSWORD|TOKEN|PRIVATE_KEY|ACCESS_KEY/i
+const NON_INTERACTIVE_CHILD_ENV = Object.freeze({
+	GIT_PAGER: 'cat',
+	GIT_TERMINAL_PROMPT: '0',
+	PAGER: 'cat',
+	SYSTEMD_COLORS: '0',
+	SYSTEMD_PAGER: 'cat'
+})
 const REQUIRED_SOURCE_FILES = [
 	'app/main.py',
 	'alembic/env.py',
@@ -89,7 +110,7 @@ function run(command, args = [], options = {}) {
 	if (dryRun) return { status: 0, stdout: '', stderr: '' }
 	const result = spawnSync(command, args, {
 		cwd,
-		env,
+		env: { ...env, ...NON_INTERACTIVE_CHILD_ENV },
 		encoding: 'utf8',
 		maxBuffer,
 		stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit']
@@ -107,7 +128,11 @@ function runText(command, args = [], options = {}) {
 }
 
 function git(repoRoot, args, options = {}) {
-	return runText('git', args, { ...options, cwd: repoRoot, quiet: options.quiet ?? true })
+	return runText('git', ['--no-pager', ...args], {
+		...options,
+		cwd: repoRoot,
+		quiet: options.quiet ?? true
+	})
 }
 
 export function parseDotEnv(text = '') {
@@ -136,11 +161,15 @@ function loadDotEnvFile(path, { required = true } = {}) {
 }
 
 export function parseArgs(argv = []) {
+	let configPathExplicit = false
 	const args = {
 		ackDbSchemaCompatible: false,
+		all: false,
 		command: 'help',
 		configPath: DEFAULT_CONFIG_PATH,
+		databaseProfile: '',
 		dryRun: false,
+		environment: 'test',
 		help: false,
 		releaseId: '',
 		skipTests: false,
@@ -154,15 +183,36 @@ export function parseArgs(argv = []) {
 			case '--ack-db-schema-compatible':
 				args.ackDbSchemaCompatible = true
 				break
+			case '--all':
+				args.all = true
+				break
 			case '--config': {
 				const configPath = values.shift()
 				if (!configPath || configPath.startsWith('-')) fail('--config 缺少文件路径')
 				args.configPath = resolve(TOOL_ROOT, configPath)
+				configPathExplicit = true
 				break
 			}
 			case '--dry-run':
 				args.dryRun = true
 				break
+			case '--database-profile': {
+				const databaseProfile = values.shift()
+				if (!databaseProfile || databaseProfile.startsWith('-')) {
+					fail('--database-profile 缺少 local、cloud 或 active')
+				}
+				if (!['local', 'cloud', 'active'].includes(databaseProfile)) {
+					fail(`数据库 profile 非法：${databaseProfile}`)
+				}
+				args.databaseProfile = databaseProfile
+				break
+			}
+			case '--env': {
+				const environment = values.shift()
+				if (!environment || environment.startsWith('-')) fail('--env 缺少环境名称')
+				args.environment = environment
+				break
+			}
 			case '--help':
 			case '-h':
 				args.help = true
@@ -183,6 +233,14 @@ export function parseArgs(argv = []) {
 				fail(`未知参数：${value}`)
 		}
 	}
+	if (!SUPPORTED_ENVIRONMENTS.has(args.environment)) {
+		fail(`不支持的部署环境：${args.environment}`)
+	}
+	if (!configPathExplicit) {
+		args.configPath = args.environment === 'production'
+			? PRODUCTION_CONFIG_PATH
+			: DEFAULT_CONFIG_PATH
+	}
 	return args
 }
 
@@ -191,14 +249,26 @@ function usage() {
 楼脉后端可验证发布工具
 
 用法：
-  node backend/backend-release.mjs build [--config FILE] [--skip-tests]
-  node backend/backend-release.mjs deploy --dry-run [--config FILE]
-  node backend/backend-release.mjs deploy --yes [--config FILE]
-  node backend/backend-release.mjs status [--config FILE]
-  node backend/backend-release.mjs rollback --release RELEASE_ID --ack-db-schema-compatible --yes [--config FILE]
+  node backend/backend-release.mjs build [--env test|production] [--config FILE] [--skip-tests]
+  node backend/backend-release.mjs env-audit --env test|production [--all] [--config FILE]
+  node backend/backend-release.mjs deploy --env test|production --dry-run [--config FILE]
+  node backend/backend-release.mjs deploy --env test|production --yes [--config FILE]
+  node backend/backend-release.mjs bootstrap --env production --dry-run [--config FILE]
+  node backend/backend-release.mjs bootstrap --env production --yes [--config FILE]
+  node backend/backend-release.mjs recover --env production --dry-run [--config FILE]
+  node backend/backend-release.mjs recover --env production --yes [--config FILE]
+  node backend/backend-release.mjs deploy-cloud --env test --dry-run [--config FILE]
+  node backend/backend-release.mjs deploy-cloud --env test --yes [--config FILE]
+  node backend/backend-release.mjs status --env test|production [--database-profile local|cloud|active] [--config FILE]
+  node backend/backend-release.mjs rollback --env test|production --release RELEASE_ID --ack-db-schema-compatible --yes [--config FILE]
 
 安全约束：
-  - deploy 不允许 --skip-tests；每次从 clean、已同步 upstream 的精确 Git commit 打包。
+	- env-audit 只读比较本地与目标服配置；敏感值不显示、不传输、不写入服务器。
+  - 测试服 deploy 选择本地 PostgreSQL，deploy-cloud 选择腾讯云 PostgreSQL。
+  - 正式服 deploy 强制选择腾讯云 PostgreSQL；远端 helper 会拒绝正式服 local profile。
+	- 全新正式服只允许一次 bootstrap；后续必须使用 deploy，两个命令都强制腾讯云数据库。
+	- 迁移或切换失败后，普通发布会被恢复标记锁定；只能用 recover 携带新的前向修复产物继续。
+	- bootstrap/deploy/deploy-cloud/recover 不允许 --skip-tests；每次从 clean、已同步 upstream 的精确 Git commit 打包。
   - rollback 只切换应用，不执行 Alembic downgrade，也不恢复数据库。
   - 数据库迁移一旦尝试，远端失败路径保持服务停止，等待人工前向修复或恢复决策。
 `.trim()
@@ -240,7 +310,12 @@ export function loadConfiguration(args, { requireRemote = false } = {}) {
 		if (!existsSync(join(repoRoot, required))) fail(`BACKEND_REPO 缺少：${required}`)
 	}
 	const constraintsPath = resolve(
-		expandHome(values.BACKEND_RUNTIME_CONSTRAINTS || DEFAULT_CONSTRAINTS_PATH)
+		expandHome(
+			values.BACKEND_RUNTIME_CONSTRAINTS
+			|| (args.environment === 'production'
+				? PRODUCTION_CONSTRAINTS_PATH
+				: DEFAULT_CONSTRAINTS_PATH)
+		)
 	)
 	const pythonBin = resolve(
 		expandHome(values.BACKEND_PYTHON_BIN || join(repoRoot, '.venv311/bin/python'))
@@ -248,8 +323,17 @@ export function loadConfiguration(args, { requireRemote = false } = {}) {
 	if (!existsSync(pythonBin)) fail(`后端 Python 不存在：${pythonBin}`)
 	if (!existsSync(constraintsPath)) fail(`runtime constraints 不存在：${constraintsPath}`)
 
+	const configuredEnvironment = values.BACKEND_ENVIRONMENT || args.environment
+	if (!SUPPORTED_ENVIRONMENTS.has(configuredEnvironment)) {
+		fail(`BACKEND_ENVIRONMENT 配置非法：${configuredEnvironment}`)
+	}
+	if (configuredEnvironment !== args.environment) {
+		fail(`配置环境 ${configuredEnvironment} 与命令 --env ${args.environment} 不一致`)
+	}
+
 	const config = {
 		constraintsPath,
+		environment: configuredEnvironment,
 		expectedBranch: values.BACKEND_EXPECTED_BRANCH || DEFAULT_EXPECTED_BRANCH,
 		identityFile: expandHome(values.BACKEND_SSH_IDENTITY_FILE || ''),
 		publicUrl: String(values.BACKEND_PUBLIC_URL || '').replace(/\/+$/, ''),
@@ -342,7 +426,7 @@ export function inspectMigrationHead(config) {
 }
 
 function runQualityGates(config, { skipTests = false } = {}) {
-	run('git', ['diff', '--check'], { cwd: config.repoRoot })
+	run('git', ['--no-pager', 'diff', '--check'], { cwd: config.repoRoot })
 	if (skipTests) {
 		warn('仅 build 跳过 Ruff、迁移影子库和 pytest；该产物不能由 deploy 默认发布')
 		return
@@ -411,7 +495,10 @@ export function validateRuntimeConstraints(path) {
 	return lines
 }
 
-export function validateSourceArtifact(backendDir, { expectedCommit = '', expectedHead = '' } = {}) {
+export function validateSourceArtifact(
+	backendDir,
+	{ expectedCommit = '', expectedEnvironment = '', expectedHead = '' } = {}
+) {
 	if (!existsSync(backendDir) || !statSync(backendDir).isDirectory()) fail('后端产物目录不存在')
 	const files = listFiles(backendDir)
 	if (files.length < 30) fail(`后端产物文件过少：${files.length}`)
@@ -432,6 +519,9 @@ export function validateSourceArtifact(backendDir, { expectedCommit = '', expect
 	if (existsSync(manifestPath)) {
 		const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
 		if (expectedCommit && manifest.commit !== expectedCommit) fail('release.json commit 不匹配')
+		if (expectedEnvironment && manifest.environment !== expectedEnvironment) {
+			fail('release.json environment 不匹配')
+		}
 		if (expectedHead && manifest.artifact_db_head !== expectedHead) {
 			fail('release.json artifact_db_head 不匹配')
 		}
@@ -497,6 +587,7 @@ function buildRelease(config, gitState, artifactDbHead) {
 			release_id: releaseId,
 			commit: gitState.commit,
 			branch: gitState.branch,
+			environment: config.environment,
 			built_at: new Date().toISOString(),
 			artifact_db_head: artifactDbHead,
 			constraints_sha256: sha256File(join(backendDir, 'runtime-constraints.txt')),
@@ -508,6 +599,7 @@ function buildRelease(config, gitState, artifactDbHead) {
 		const checksumsSha256 = writeChecksums(backendDir)
 		validateSourceArtifact(backendDir, {
 			expectedCommit: gitState.commit,
+			expectedEnvironment: config.environment,
 			expectedHead: artifactDbHead
 		})
 		const archivePath = join(partialRoot, 'backend.tar')
@@ -537,6 +629,9 @@ function sshOptions(config) {
 		'-o', 'BatchMode=yes',
 		'-o', 'StrictHostKeyChecking=yes',
 		'-o', 'ConnectTimeout=10',
+		'-o', 'ServerAliveInterval=15',
+		'-o', 'ServerAliveCountMax=12',
+		'-o', 'TCPKeepAlive=yes',
 		'-p', String(config.sshPort)
 	]
 	if (config.identityFile) options.push('-i', config.identityFile)
@@ -572,19 +667,112 @@ function parseKeyValueOutput(text = '') {
 	return result
 }
 
-function remotePreflight(config) {
+function assertRemoteHelperExact(config) {
 	const version = remoteHelper(config, ['version'], { capture: true }).stdout.trim()
 	if (version !== BACKEND_RELEASE_TOOL_VERSION) {
 		fail(`远端 helper 版本不一致：实际 ${version || '(empty)'}，要求 ${BACKEND_RELEASE_TOOL_VERSION}`)
 	}
-	const output = remoteHelper(config, ['preflight'], { capture: true }).stdout
+	const expectedFingerprint = sha256File(join(TOOL_ROOT, 'backend/remote/loumai-backend-release'))
+	let actualFingerprint = ''
+	try {
+		actualFingerprint = remoteHelper(config, ['fingerprint'], { capture: true }).stdout.trim()
+	} catch {
+		fail('远端 helper 不支持源码指纹校验，请先安装当前部署仓库中的 helper')
+	}
+	if (actualFingerprint !== expectedFingerprint) {
+		fail('远端 helper 与本地源码不一致，请先更新服务器 helper 后再发布')
+	}
+}
+
+function remotePreflight(config, databaseProfile = 'active', { mode = 'deploy' } = {}) {
+	if (!['bootstrap', 'deploy', 'recover'].includes(mode)) fail(`远端 preflight 模式非法：${mode}`)
+	assertRemoteHelperExact(config)
+	const output = remoteHelper(config, ['preflight', databaseProfile, mode], { capture: true }).stdout
 	process.stdout.write(output)
 	const values = parseKeyValueOutput(output)
+	const expectedRemoteRoot = dirname(config.remoteStagingRoot)
 	if (values.HELPER_VERSION !== BACKEND_RELEASE_TOOL_VERSION) fail('远端 preflight 协议版本不一致')
+	if (values.ENVIRONMENT !== config.environment) {
+		fail(`远端环境不匹配：实际 ${values.ENVIRONMENT || '(empty)'}，要求 ${config.environment}`)
+	}
 	if (values.STAGING_ROOT !== config.remoteStagingRoot) fail('本地与远端 staging 配置不一致')
-	if (!SAFE_REVISION.test(values.DB_REVISION || '')) fail('远端未返回合法 DB_REVISION')
-	if (!values.CURRENT) fail('远端未返回 CURRENT')
+	if (values.REMOTE_ROOT !== expectedRemoteRoot) fail('本地与远端发布根目录不一致')
+	if (values.PUBLIC_HEALTH_URL !== `${config.publicUrl}/health`) {
+		fail('本地与远端公网健康检查 URL 不一致')
+	}
+	if (!['true', 'false'].includes(values.INITIALIZED || '')) fail('远端未返回合法 INITIALIZED')
+	if (values.OPERATION_MODE !== mode) fail('远端 preflight 操作模式不一致')
+	if (mode === 'recover') {
+		if (config.environment !== 'production') fail('recover 只允许用于正式服')
+		if (values.DEPLOYMENT_STATE !== 'RECOVERY_REQUIRED' || values.RECOVERY_REQUIRED !== 'true') {
+			fail('目标服不处于受控恢复状态，不能执行 recover')
+		}
+		if (!/^[0-9a-f]{64}$/.test(values.RECOVERY_TOKEN || '')) {
+			fail('远端未返回合法 RECOVERY_TOKEN')
+		}
+		if (!['prepared', 'stopped', 'migrating'].includes(values.RECOVERY_PHASE || '')) {
+			fail('远端未返回合法 RECOVERY_PHASE')
+		}
+		if (!SAFE_REVISION.test(values.DB_REVISION || '') || values.DB_REVISION === 'bootstrap') {
+			fail('recover 未返回真实数据库 revision')
+		}
+	} else if (values.INITIALIZED === 'false') {
+		if (mode !== 'bootstrap') fail('目标服尚未初始化；首次正式发布必须使用 backend bootstrap --env production')
+		if (values.CURRENT !== 'NONE' || values.DB_REVISION !== 'bootstrap') {
+			fail('目标服首次发布状态协议异常')
+		}
+	} else {
+		if (mode === 'bootstrap') fail('目标服已经初始化，不能再次执行 bootstrap')
+		if (!SAFE_REVISION.test(values.DB_REVISION || '') || values.DB_REVISION === 'bootstrap') {
+			fail('远端未返回合法 DB_REVISION')
+		}
+		if (!values.CURRENT || values.CURRENT === 'NONE') fail('远端未返回当前后端版本')
+	}
+	if (mode !== 'recover') {
+		if (values.RECOVERY_REQUIRED !== 'false' || values.RECOVERY_TOKEN !== 'NONE') {
+			fail('普通发布遇到恢复状态，必须改用 backend recover')
+		}
+		const expectedState = mode === 'bootstrap' ? 'UNINITIALIZED' : 'HEALTHY'
+		if (values.DEPLOYMENT_STATE !== expectedState) fail('远端部署状态与操作模式不一致')
+	}
+	if (values.DATABASE_PROFILE !== databaseProfile && databaseProfile !== 'active') {
+		fail(`远端数据库 profile 不匹配：实际 ${values.DATABASE_PROFILE || '(empty)'}，要求 ${databaseProfile}`)
+	}
+	if (!['local', 'cloud'].includes(values.DATABASE_PROFILE || '')) {
+		fail('远端未返回合法 DATABASE_PROFILE')
+	}
+	if (!['local', 'cloud'].includes(values.ACTIVE_DATABASE_PROFILE || '')) {
+		fail('远端未返回合法 ACTIVE_DATABASE_PROFILE')
+	}
+	if (!['ready', 'repairable'].includes(values.BACKUP_ROOT_STATUS || '')) {
+		fail('远端 helper 尚未包含数据库备份目录自动修复能力，请先更新 helper')
+	}
+	if (values.BACKUP_ROOT_STATUS === 'repairable') {
+		warn('数据库备份目录当前权限不满足 pg_dump；正式发布会在上传前自动修复为备份专用用户私有目录')
+	}
 	return values
+}
+
+function showRemoteStatus(config, databaseProfile = 'active') {
+	const version = remoteHelper(config, ['version'], { capture: true }).stdout.trim()
+	if (version === BACKEND_RELEASE_TOOL_VERSION) {
+		const output = remoteHelper(config, ['status', databaseProfile], { capture: true }).stdout
+		const values = parseKeyValueOutput(output)
+		if (values.ENVIRONMENT !== config.environment) {
+			fail(`远端环境不匹配：实际 ${values.ENVIRONMENT || '(empty)'}，要求 ${config.environment}`)
+		}
+		process.stdout.write(output)
+		return
+	}
+	if (config.environment === 'test' && version === '1' && databaseProfile === 'active') {
+		warn('测试服 helper 仍是版本 1：本次按旧协议查询状态，无法显示双数据库 profile；正式切库前必须升级 helper')
+		remoteHelper(config, ['status'])
+		return
+	}
+	if (version === '1') {
+		fail(`测试服 helper 版本 1 不支持查询 ${databaseProfile} 数据库 profile；请先升级服务器 helper`)
+	}
+	fail(`远端 helper 版本不一致：实际 ${version || '(empty)'}，要求 ${BACKEND_RELEASE_TOOL_VERSION}`)
 }
 
 function uploadArchive(config, releaseId, archivePath, stageDir) {
@@ -594,6 +782,9 @@ function uploadArchive(config, releaseId, archivePath, stageDir) {
 		'-o', 'BatchMode=yes',
 		'-o', 'StrictHostKeyChecking=yes',
 		'-o', 'ConnectTimeout=10',
+		'-o', 'ServerAliveInterval=15',
+		'-o', 'ServerAliveCountMax=12',
+		'-o', 'TCPKeepAlive=yes',
 		'-P', String(config.sshPort)
 	]
 	if (config.identityFile) args.push('-i', config.identityFile)
@@ -601,12 +792,16 @@ function uploadArchive(config, releaseId, archivePath, stageDir) {
 	run('scp', args)
 }
 
-function deploy(config, gitState, artifactDbHead) {
-	const preflight = remotePreflight(config)
+function deploy(config, gitState, artifactDbHead, databaseProfile, { mode = 'deploy' } = {}) {
+	const preflight = remotePreflight(config, databaseProfile, { mode })
 	const artifact = buildRelease(config, gitState, artifactDbHead)
 	let prepared = false
 	try {
-		const prepareOutput = remoteHelper(config, ['prepare', artifact.releaseId], { capture: true }).stdout
+		const prepareOutput = remoteHelper(config, [
+			'prepare', artifact.releaseId, databaseProfile, mode, preflight.RECOVERY_TOKEN
+		], {
+			capture: true
+		}).stdout
 		process.stdout.write(prepareOutput)
 		const stageDir = parseKeyValueOutput(prepareOutput).STAGE_DIR
 		prepared = true
@@ -619,7 +814,10 @@ function deploy(config, gitState, artifactDbHead) {
 			artifact.checksumsSha256,
 			artifact.archiveSha256,
 			preflight.CURRENT,
-			preflight.DB_REVISION
+			preflight.DB_REVISION,
+			databaseProfile,
+			mode,
+			preflight.RECOVERY_TOKEN
 		])
 		prepared = false
 		info(`发布完成：${artifact.releaseId}`)
@@ -630,7 +828,7 @@ function deploy(config, gitState, artifactDbHead) {
 
 function rollback(config, args) {
 	if (!SAFE_RELEASE_ID.test(args.releaseId)) fail('rollback release_id 格式非法')
-	const preflight = remotePreflight(config)
+	const preflight = remotePreflight(config, 'active', { mode: 'deploy' })
 	remoteHelper(config, [
 		'rollback',
 		args.releaseId,
@@ -638,6 +836,108 @@ function rollback(config, args) {
 		preflight.DB_REVISION,
 		'ACK_DB_SCHEMA_COMPATIBLE'
 	])
+}
+
+function inspectLocalSettings(config) {
+	const source = `
+import json
+
+from app.core.config import Settings
+
+
+def normalized_location(error):
+    location = error.get("loc") or ("__SETTINGS__",)
+    return "_".join(str(item) for item in location).upper()
+
+
+fields = sorted(str(name).upper() for name in Settings.model_fields)
+errors = []
+try:
+    Settings()
+except Exception as exc:
+    if hasattr(exc, "errors"):
+        for error in exc.errors(include_input=False, include_url=False):
+            errors.append({
+                "field": normalized_location(error),
+                "type": str(error.get("type") or type(exc).__name__),
+            })
+    else:
+        errors.append({"field": "__SETTINGS__", "type": type(exc).__name__})
+
+print(json.dumps({"errors": errors, "fields": fields, "valid": not errors}))
+`.trim()
+	const minimalEnvironment = {
+		LANG: process.env.LANG || 'C.UTF-8',
+		PATH: process.env.PATH || '/usr/bin:/bin',
+		PYTHONDONTWRITEBYTECODE: '1',
+		PYTHONUNBUFFERED: '1'
+	}
+	let parsed
+	try {
+		parsed = JSON.parse(runText(config.pythonBin, ['-c', source], {
+			cwd: config.repoRoot,
+			env: minimalEnvironment,
+			quiet: true
+		}))
+	} catch {
+		fail('无法安全读取本地 Settings 元数据；为避免泄露配置内容，原始异常未输出')
+	}
+	if (
+		!parsed
+		|| !Array.isArray(parsed.fields)
+		|| !Array.isArray(parsed.errors)
+		|| typeof parsed.valid !== 'boolean'
+	) fail('本地 Settings 审计输出格式错误')
+	return parsed
+}
+
+export function auditEnvironment(config, args) {
+	assertRemoteHelperExact(config)
+	const localPath = join(config.repoRoot, '.env')
+	const examplePath = join(config.repoRoot, '.env.example')
+	if (!existsSync(localPath)) fail(`本地后端环境文件不存在：${localPath}`)
+	if (!existsSync(examplePath)) fail(`本地后端环境模板不存在：${examplePath}`)
+
+	let local
+	let example
+	try {
+		local = inspectEnvironmentText(readFileSync(localPath, 'utf8'), '.env')
+		example = inspectEnvironmentText(readFileSync(examplePath, 'utf8'), '.env.example')
+	} catch (error) {
+		fail(`本地环境文件解析失败：${error.message}`)
+	}
+	if (example.duplicates.length) {
+		fail(`.env.example 存在重复变量：${example.duplicates.map(({ key }) => key).join('、')}`)
+	}
+	const localSettings = inspectLocalSettings(config)
+	const catalogKeys = [...new Set([
+		...example.entries.keys(),
+		...localSettings.fields,
+		...ENV_RUNNER_KEYS
+	])].sort()
+
+	let remote
+	try {
+		const output = remoteHelper(config, ['env-audit', args.environment], { capture: true }).stdout
+		remote = parseRemoteEnvironmentAudit(output)
+	} catch (error) {
+		if (/用法：loumai-backend-release/.test(error.message) || /env-audit/.test(error.message)) {
+			fail('目标服 helper 尚未安装 env-audit 能力，请先更新 /usr/local/sbin/loumai-backend-release')
+		}
+		throw error
+	}
+
+	const audit = buildEnvironmentAudit({
+		all: args.all,
+		catalogKeys,
+		local,
+		localSettings,
+		remote,
+		targetEnvironment: args.environment
+	})
+	process.stdout.write(renderEnvironmentAudit(audit, { targetEnvironment: args.environment }))
+	if (audit.blockers) fail(`环境审计发现 ${audit.blockers} 个阻断项；未修改本地或目标服配置`)
+	return audit
 }
 
 export function remoteHelperContractSource() {
@@ -650,21 +950,48 @@ export function main(argv = process.argv.slice(2)) {
 		process.stdout.write(`${usage()}\n`)
 		return
 	}
-	if (!['build', 'deploy', 'status', 'rollback'].includes(args.command)) {
+	if (!['build', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit', 'status', 'rollback'].includes(args.command)) {
 		fail(`未知命令：${args.command}`)
 	}
-	if (args.command === 'deploy' && args.skipTests) fail('deploy 禁止 --skip-tests')
+	if (args.command !== 'env-audit' && args.all) fail('--all 只能用于 env-audit')
+	if (args.command === 'env-audit') {
+		if (
+			args.yes
+			|| args.dryRun
+			|| args.skipTests
+			|| args.releaseId
+			|| args.ackDbSchemaCompatible
+			|| args.databaseProfile
+		) {
+			fail('env-audit 是只读命令，不能使用发布、跳过测试或回滚参数')
+		}
+		const config = loadConfiguration(args, { requireRemote: true })
+		auditEnvironment(config, args)
+		return
+	}
+	if (['bootstrap', 'deploy', 'deploy-cloud', 'recover'].includes(args.command) && args.skipTests) {
+		fail(`${args.command} 禁止 --skip-tests`)
+	}
+	if (args.command === 'bootstrap' && args.environment !== 'production') {
+		fail('bootstrap 只用于全新正式服，必须提供 --env production')
+	}
+	if (args.command === 'recover' && args.environment !== 'production') {
+		fail('recover 只用于正式服故障前向修复，必须提供 --env production')
+	}
+	if (args.databaseProfile && !['status'].includes(args.command)) {
+		fail('--database-profile 只能用于 status；发布请使用 deploy 或 deploy-cloud')
+	}
 	if (args.command === 'rollback') {
 		if (!args.releaseId) fail('rollback 必须提供 --release')
 		if (!args.ackDbSchemaCompatible) fail('rollback 必须提供 --ack-db-schema-compatible')
 		if (!args.yes) fail('rollback 必须显式提供 --yes')
 	}
-	if (args.command === 'deploy' && !args.dryRun && !args.yes) {
-		fail('正式 deploy 必须显式提供 --yes')
+	if (['bootstrap', 'deploy', 'deploy-cloud', 'recover'].includes(args.command) && !args.dryRun && !args.yes) {
+		fail(`正式 ${args.command} 必须显式提供 --yes`)
 	}
 	const config = loadConfiguration(args, { requireRemote: args.command !== 'build' })
 	if (args.command === 'status') {
-		remoteHelper(config, ['status'])
+		showRemoteStatus(config, args.databaseProfile || 'active')
 		return
 	}
 	if (args.command === 'rollback') {
@@ -674,10 +1001,16 @@ export function main(argv = process.argv.slice(2)) {
 	const gitState = inspectGitState(config)
 	const artifactDbHead = inspectMigrationHead(config)
 	info(`锁定后端 commit=${gitState.commit}，alembic_head=${artifactDbHead}`)
-	if (args.command === 'deploy' && args.dryRun) {
-		remotePreflight(config)
-		run('git', ['diff', '--check'], { cwd: config.repoRoot })
-		info('[dry-run] 只读预检通过；未测试、未打包、未上传、未迁移、未切换')
+	const databaseProfile = args.environment === 'production' || args.command === 'deploy-cloud'
+		? 'cloud'
+		: 'local'
+	const operationMode = args.command === 'bootstrap'
+		? 'bootstrap'
+		: args.command === 'recover' ? 'recover' : 'deploy'
+	if (['bootstrap', 'deploy', 'deploy-cloud', 'recover'].includes(args.command) && args.dryRun) {
+		remotePreflight(config, databaseProfile, { mode: operationMode })
+		run('git', ['--no-pager', 'diff', '--check'], { cwd: config.repoRoot })
+		info(`[dry-run] ${databaseProfile} 数据库只读预检通过；未测试、未打包、未上传、未迁移、未切换`)
 		return
 	}
 	runQualityGates(config, { skipTests: args.skipTests })
@@ -690,7 +1023,7 @@ export function main(argv = process.argv.slice(2)) {
 		buildRelease(config, gitState, artifactDbHead)
 		return
 	}
-	deploy(config, gitState, artifactDbHead)
+	deploy(config, gitState, artifactDbHead, databaseProfile, { mode: operationMode })
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {

@@ -14,6 +14,14 @@ case "${TARGET}" in
     shift
     exec node "${TOOL_ROOT}/backend/backend-release.mjs" "$@"
     ;;
+  admin-backend)
+    shift
+    exec node "${TOOL_ROOT}/admin-backend/admin-backend-release.mjs" "$@"
+    ;;
+  website)
+    shift
+    exec node "${TOOL_ROOT}/website/site-release.mjs" "$@"
+    ;;
   help|-h|--help|"")
     cat <<'EOF'
 楼脉统一部署工具
@@ -22,18 +30,51 @@ case "${TARGET}" in
   ./loumai-deploy frontend build --env test
   ./loumai-deploy frontend deploy --env test --dry-run
   ./loumai-deploy frontend deploy --env test --yes
+  ./loumai-deploy frontend deploy --env production --dry-run
+  ./loumai-deploy frontend deploy --env production --yes
+  ./loumai-deploy frontend deploy-package --file /absolute/path/web.zip --env test --dry-run
+  ./loumai-deploy frontend deploy-package --file /absolute/path/web.zip --env test --yes
   ./loumai-deploy frontend status
+  ./loumai-deploy frontend status --env production
+  ./loumai-deploy frontend rollback --release RELEASE_ID --dry-run
   ./loumai-deploy frontend rollback --release RELEASE_ID --yes
 
   ./loumai-deploy backend build
+  ./loumai-deploy backend env-audit --env test
+  ./loumai-deploy backend env-audit --env test --all
   ./loumai-deploy backend deploy --dry-run
   ./loumai-deploy backend deploy --yes
+  ./loumai-deploy backend deploy-cloud --dry-run
+  ./loumai-deploy backend deploy-cloud --yes
+  ./loumai-deploy backend env-audit --env production
+  ./loumai-deploy backend bootstrap --env production --dry-run
+  ./loumai-deploy backend bootstrap --env production --yes
+  ./loumai-deploy backend deploy --env production --dry-run
+  ./loumai-deploy backend deploy --env production --yes
   ./loumai-deploy backend status
+  ./loumai-deploy backend status --env production
+  ./loumai-deploy backend status --database-profile cloud
   ./loumai-deploy backend rollback --release RELEASE_ID --yes --ack-db-schema-compatible
+  ./loumai-deploy backend rollback --env production --release RELEASE_ID --yes --ack-db-schema-compatible
+
+  ./loumai-deploy admin-backend build
+  ./loumai-deploy admin-backend prepare --yes
+  ./loumai-deploy admin-backend deploy --dry-run
+  ./loumai-deploy admin-backend deploy --yes
+  ./loumai-deploy admin-backend status
+  ./loumai-deploy admin-backend rollback --release RELEASE_ID --yes
+
+  ./loumai-deploy website build
+  ./loumai-deploy website prepare --yes
+  ./loumai-deploy website enable-https --yes
+  ./loumai-deploy website deploy --yes
+  ./loumai-deploy website status
+  ./loumai-deploy website rollback --release RELEASE_ID --dry-run
+  ./loumai-deploy website rollback --release RELEASE_ID --yes
 EOF
     ;;
   *)
-    printf '未知目标：%s（只能是 frontend 或 backend）\n' "${TARGET}" >&2
+    printf '未知目标：%s（只能是 frontend、backend、admin-backend 或 website）\n' "${TARGET}" >&2
     exit 2
     ;;
 esac

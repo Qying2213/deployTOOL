@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -9,12 +10,18 @@ import {
 	createReleaseId,
 	DEFAULT_CONFIG_PATH,
 	DEFAULT_FRONTEND_REPO_ROOT,
+	defaultConfigPath,
+	extractExternalPackage,
+	inspectExternalPackage,
 	parseArgs,
 	parseDotEnv,
+	readBuildEnvironment,
 	remoteHelperContractSource,
+	resolveExternalPackageFrontendRoot,
 	shellQuote,
 	TOOL_ROOT,
-	validateArtifact
+	validateArtifact,
+	validateExternalPackageArtifact
 } from '../frontend/h5-release.mjs'
 
 const EXPECTED_API = 'https://test.yinlizhangyu.com/api/v1'
@@ -29,7 +36,7 @@ function createArtifact({ channelMarkers = true, localAddress = false, localPath
 	writeFileSync(
 		join(root, 'index.html'),
 		[
-			'<!doctype html><html><head><title>WorkWay</title>',
+			'<!doctype html><html><head><title>工位有方</title>',
 			'<link rel="modulepreload" href="/assets/channel-binding-entry.NewHash.js">',
 			'</head><body><script type="module" src="/assets/index-NewHash.js"></script></body></html>'
 		].join(''),
@@ -43,7 +50,7 @@ function createArtifact({ channelMarkers = true, localAddress = false, localPath
 	writeFileSync(
 		join(assets, 'channel-binding-entry.NewHash.js'),
 		channelMarkers
-			? 'const key="loumai_pending_channel_invitation_code";const methods=["removeStorageSync","removeStorage","setStorageSync","setStorage"];'
+			? 'import{a as getStorage,b as removeStorage,c as setStorage}from"./index-NewHash.js";const key="loumai_pending_channel_invitation_code";if("function"!=typeof getStorage)return false;if("function"==typeof removeStorage){removeStorage(key)}else if("function"==typeof setStorage){setStorage(key,"")}'
 			: 'const key="loumai_pending_channel_invitation_code";storage.removeStorageSync(key);',
 		'utf8'
 	)
@@ -51,6 +58,33 @@ function createArtifact({ channelMarkers = true, localAddress = false, localPath
 		writeFileSync(join(assets, `chunk-${index}-Hash.js`), `export default ${index}`, 'utf8')
 	}
 	return root
+}
+
+function runPython(source, args = []) {
+	const result = spawnSync('python3', ['-c', source, ...args], {
+		encoding: 'utf8'
+	})
+	assert.equal(result.status, 0, [result.stdout, result.stderr].filter(Boolean).join('\n'))
+}
+
+function zipDirectory(sourceRoot, archivePath, packageRoot = 'web') {
+	runPython(String.raw`
+import os
+import pathlib
+import sys
+import zipfile
+
+source = pathlib.Path(sys.argv[1])
+archive = pathlib.Path(sys.argv[2])
+prefix = sys.argv[3]
+with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+    for path in sorted(source.rglob("*")):
+        if path.is_file():
+            relative = path.relative_to(source).as_posix()
+            output.write(path, f"{prefix}/{relative}" if prefix else relative)
+    output.writestr("__MACOSX/._ignored", "ignored")
+    output.writestr(f"{prefix}/.DS_Store" if prefix else ".DS_Store", "ignored")
+`, [sourceRoot, archivePath, packageRoot])
 }
 
 test('部署配置解析不执行 shell 且保留明确值', () => {
@@ -79,16 +113,93 @@ test('发布参数默认安全并要求显式 release', () => {
 			dryRun: true,
 			environment: 'test',
 			help: false,
+			packagePath: '',
 			releaseId: '',
 			skipTests: false,
 			yes: false
 		}
 	)
 	assert.equal(parseArgs(['rollback', '--release', '20260810T120000Z-261cb03']).releaseId, '20260810T120000Z-261cb03')
+	assert.equal(
+		parseArgs(['status', '--env', 'production']).configPath,
+		defaultConfigPath('production')
+	)
+	assert.equal(
+		parseArgs(['status', '--env', 'production', '--config', 'config/custom.env']).configPath,
+		resolve(TOOL_ROOT, 'config/custom.env')
+	)
 	assert.throws(() => parseArgs(['deploy', '--env', 'staging']), /不支持的构建环境/)
 	assert.throws(() => parseArgs(['deploy', '--config']), /缺少文件路径/)
 	assert.throws(() => parseArgs(['deploy', '--env', '--yes']), /缺少环境名称/)
 	assert.throws(() => parseArgs(['rollback', '--release', '--yes']), /缺少 release_id/)
+	assert.equal(
+		parseArgs(['deploy-package', '--file', '/tmp/web.zip', '--yes']).packagePath,
+		'/tmp/web.zip'
+	)
+	assert.throws(() => parseArgs(['deploy-package', '--file', '--yes']), /缺少 ZIP 文件路径/)
+})
+
+test('外部 ZIP 可安全导入单一 web 目录并忽略 macOS 元数据', () => {
+	const artifact = createArtifact()
+	const workingRoot = mkdtempSync(join(tmpdir(), 'loumai-h5-package-test-'))
+	const archivePath = join(workingRoot, 'web.zip')
+	const extractRoot = join(workingRoot, 'unpack')
+	try {
+		zipDirectory(artifact, archivePath)
+		const packageInfo = inspectExternalPackage(archivePath)
+		assert.match(packageInfo.sha256, /^[0-9a-f]{64}$/)
+		assert.equal(packageInfo.basename, 'web.zip')
+		extractExternalPackage(archivePath, extractRoot)
+		const frontendRoot = resolveExternalPackageFrontendRoot(extractRoot)
+		assert.equal(frontendRoot, join(extractRoot, 'web'))
+		assert.equal(validateExternalPackageArtifact(frontendRoot).length, 11)
+		assert.equal(validateArtifact(frontendRoot, {
+			apiBaseUrl: EXPECTED_API,
+			expectedTitle: '工位有方'
+		}).fileCount, 11)
+	} finally {
+		rmSync(artifact, { force: true, recursive: true })
+		rmSync(workingRoot, { force: true, recursive: true })
+	}
+})
+
+test('外部 ZIP 拒绝路径穿越、软链接和敏感隐藏文件', () => {
+	const workingRoot = mkdtempSync(join(tmpdir(), 'loumai-h5-package-bad-test-'))
+	const traversalArchive = join(workingRoot, 'traversal.zip')
+	const symlinkArchive = join(workingRoot, 'symlink.zip')
+	const hiddenArchive = join(workingRoot, 'hidden.zip')
+	try {
+		runPython(String.raw`
+import stat
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1], "w") as output:
+    output.writestr("../escape.txt", "bad")
+with zipfile.ZipFile(sys.argv[2], "w") as output:
+    link = zipfile.ZipInfo("web/assets/link")
+    link.create_system = 3
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    output.writestr(link, "../../outside")
+with zipfile.ZipFile(sys.argv[3], "w") as output:
+    output.writestr("web/index.html", "<title>工位有方</title>")
+    output.writestr("web/.env", "SECRET=value")
+`, [traversalArchive, symlinkArchive, hiddenArchive])
+
+		assert.throws(
+			() => extractExternalPackage(traversalArchive, join(workingRoot, 'traversal')),
+			/路径穿越/
+		)
+		assert.throws(
+			() => extractExternalPackage(symlinkArchive, join(workingRoot, 'symlink')),
+			/软链接或特殊文件/
+		)
+		extractExternalPackage(hiddenArchive, join(workingRoot, 'hidden'))
+		const hiddenRoot = resolveExternalPackageFrontendRoot(join(workingRoot, 'hidden'))
+		assert.throws(() => validateExternalPackageArtifact(hiddenRoot), /隐藏文件或目录/)
+	} finally {
+		rmSync(workingRoot, { force: true, recursive: true })
+	}
 })
 
 test('release id 和远端 shell 参数保持确定且可引用', () => {
@@ -127,13 +238,41 @@ test('构建子进程丢弃外部 VITE 覆盖并显式使用已验证环境', ()
 	}
 })
 
+test('正式构建拒绝测试域名，并要求关闭测试账号和提供两个正式 HTTPS 根地址', () => {
+	const root = mkdtempSync(join(tmpdir(), 'loumai-h5-production-env-'))
+	const writeProduction = (overrides = {}) => writeFileSync(
+		join(root, '.env.production'),
+		Object.entries({
+			VITE_APP_ENV: 'production',
+			VITE_API_BASE_URL: 'https://api.yinlizhangyu.com/api/v1',
+			VITE_CHANNEL_BINDING_H5_BASE_URL: 'https://h5.example.com',
+			VITE_TIANDITU_WEB_MAP_BASE_URL: 'https://h5.example.com/',
+			VITE_ENABLE_TEST_ACCOUNTS: 'false',
+			...overrides
+		}).map(([key, value]) => `${key}=${value}`).join('\n'),
+		'utf8'
+	)
+	try {
+		writeProduction()
+		assert.equal(readBuildEnvironment(root, 'production').appEnvironment, 'production')
+		writeProduction({ VITE_API_BASE_URL: 'https://test.yinlizhangyu.com/api/v1' })
+		assert.throws(() => readBuildEnvironment(root, 'production'), /API 不能指向测试服/)
+		writeProduction({ VITE_CHANNEL_BINDING_H5_BASE_URL: 'https://test.yinlizhangyu.com' })
+		assert.throws(() => readBuildEnvironment(root, 'production'), /不能指向测试服/)
+		writeProduction({ VITE_ENABLE_TEST_ACCOUNTS: 'true' })
+		assert.throws(() => readBuildEnvironment(root, 'production'), /必须关闭/)
+	} finally {
+		rmSync(root, { force: true, recursive: true })
+	}
+})
+
 test('全新 H5 产物必须包含目标 API、哈希入口和存储兼容链', () => {
 	const artifact = createArtifact()
 	try {
 		const result = validateArtifact(artifact, {
 			apiBaseUrl: EXPECTED_API,
 			builtAfter: Date.now() - 5000,
-			expectedTitle: 'WorkWay'
+			expectedTitle: '工位有方'
 		})
 		assert.equal(result.fileCount, 11)
 		assert.match(result.indexSha256, /^[0-9a-f]{64}$/)
@@ -148,9 +287,9 @@ test('旧 removeStorageSync 单点实现不能进入发布产物', () => {
 		assert.throws(
 			() => validateArtifact(artifact, {
 				apiBaseUrl: EXPECTED_API,
-				expectedTitle: 'WorkWay'
+				expectedTitle: '工位有方'
 			}),
-			/缺少 H5 存储兼容标记/
+			/缺少存储能力检测/
 		)
 	} finally {
 		rmSync(artifact, { force: true, recursive: true })
@@ -166,21 +305,21 @@ test('局域网地址和构建前旧 index 均被发布门禁拒绝', () => {
 		assert.throws(
 			() => validateArtifact(localArtifact, {
 				apiBaseUrl: EXPECTED_API,
-				expectedTitle: 'WorkWay'
+				expectedTitle: '工位有方'
 			}),
 			/包含本地或局域网地址/
 		)
 		assert.throws(
 			() => validateArtifact(localPathArtifact, {
 				apiBaseUrl: EXPECTED_API,
-				expectedTitle: 'WorkWay'
+				expectedTitle: '工位有方'
 			}),
 			/泄露本机构建路径/
 		)
 		assert.throws(
 			() => validateArtifact(wrongApiArtifact, {
 				apiBaseUrl: EXPECTED_API,
-				expectedTitle: 'WorkWay'
+				expectedTitle: '工位有方'
 			}),
 			/包含非目标 API/
 		)
@@ -190,7 +329,7 @@ test('局域网地址和构建前旧 index 均被发布门禁拒绝', () => {
 			() => validateArtifact(staleArtifact, {
 				apiBaseUrl: EXPECTED_API,
 				builtAfter: Date.now(),
-				expectedTitle: 'WorkWay'
+				expectedTitle: '工位有方'
 			}),
 			/拒绝复用旧产物/
 		)
@@ -199,6 +338,22 @@ test('局域网地址和构建前旧 index 均被发布门禁拒绝', () => {
 		rmSync(wrongApiArtifact, { force: true, recursive: true })
 		rmSync(localPathArtifact, { force: true, recursive: true })
 		rmSync(staleArtifact, { force: true, recursive: true })
+	}
+})
+
+test('正式产物门禁拒绝任何残留测试服地址', () => {
+	const artifact = createArtifact()
+	try {
+		assert.throws(
+			() => validateArtifact(artifact, {
+				apiBaseUrl: EXPECTED_API,
+				environment: 'production',
+				expectedTitle: '工位有方'
+			}),
+			/生产产物仍包含测试服地址/
+		)
+	} finally {
+		rmSync(artifact, { force: true, recursive: true })
 	}
 })
 
@@ -226,6 +381,17 @@ test('服务器激活器具备锁、哈希、原子切换、CAS 回滚和旧 chu
 	assert.match(helper, /线上校验失败，将按当前指向执行安全回滚/)
 	assert.match(helper, /action_prepare/)
 	assert.match(helper, /action_abort/)
+	assert.match(helper, /action_check_release/)
+	assert.match(helper, /fingerprint\)/)
+	assert.match(helper, /sha256sum "\$0"/)
+	assert.match(helper, /LOUMAI_H5_ENVIRONMENT/)
+	assert.match(helper, /DEPLOY_ENVIRONMENT=.*LOUMAI_H5_ENVIRONMENT/)
+	assert.match(helper, /release\.json 的 environment 与服务器部署环境不匹配/)
+	assert.match(helper, /\[\[ "\$2" == "\$DEPLOY_ENVIRONMENT" \]\]/)
+	assert.match(helper, /printf 'ENVIRONMENT=%s\\n'/)
+	assert.match(helper, /printf 'REMOTE_ROOT=%s\\n'/)
+	assert.match(helper, /printf 'PUBLIC_URL=%s\\n'/)
+	assert.match(helper, /RELEASE_VALID=/)
 	assert.match(helper, /暂存产物包含硬链接文件/)
 	assert.match(helper, /install -d -m 0700 -o root -g root -- "\$partial_root"/)
 	assert.match(helper, /frontend-releases/)
@@ -234,13 +400,64 @@ test('服务器激活器具备锁、哈希、原子切换、CAS 回滚和旧 chu
 	assert.doesNotMatch(helper, /chown -hR -- root:root "\$stage_dir"/)
 	assert.doesNotMatch(helper, /ln -sfn/)
 	assert.doesNotMatch(helper, /rsync[^\n]*--delete/)
+	const localSource = readFileSync(join(TOOL_ROOT, 'frontend/h5-release.mjs'), 'utf8')
+	const rollbackStart = localSource.indexOf('function rollback(args, config)')
+	const rollbackEnd = localSource.indexOf('export function remoteHelperContractSource', rollbackStart)
+	const rollbackSource = localSource.slice(rollbackStart, rollbackEnd)
+	assert.match(rollbackSource, /if \(args\.dryRun\)/)
+	assert.match(rollbackSource, /\['check-release', config\.environment, args\.releaseId, expectedCurrent\]/)
+	assert.ok(rollbackSource.indexOf('if (args.dryRun)') < rollbackSource.indexOf('if (!args.yes)'))
+	assert.match(localSource, /ServerAliveInterval=15/)
+	assert.match(localSource, /remoteHelper\(config, \['fingerprint'\]/)
+	assert.match(localSource, /激活器与本地源码不一致/)
 })
 
 test('独立配置模板声明前端仓库且不保存密码和私钥内容', () => {
 	const template = readFileSync(join(TOOL_ROOT, 'config/frontend.test.example.env'), 'utf8')
+	const productionTemplate = readFileSync(join(TOOL_ROOT, 'config/frontend.production.example.env'), 'utf8')
+	const remoteTestTemplate = readFileSync(join(TOOL_ROOT, 'frontend/remote/loumai-h5-release.env.example'), 'utf8')
+	const remoteProductionTemplate = readFileSync(
+		join(TOOL_ROOT, 'frontend/remote/loumai-h5-release.production.env.example'),
+		'utf8'
+	)
 	assert.doesNotMatch(template, /PASSWORD=|TOKEN=|PRIVATE_KEY=/)
+	assert.doesNotMatch(productionTemplate, /PASSWORD=|TOKEN=|PRIVATE_KEY=/)
 	assert.match(template, /^H5_FRONTEND_REPO=/m)
+	assert.match(productionTemplate, /^H5_DEPLOY_ENV=production$/m)
+	assert.match(remoteTestTemplate, /^LOUMAI_H5_ENVIRONMENT=test$/m)
+	assert.match(remoteProductionTemplate, /^LOUMAI_H5_ENVIRONMENT=production$/m)
+	assert.match(remoteProductionTemplate, /^LOUMAI_H5_DEPLOY_USER=loumai-deploy$/m)
+	assert.match(remoteHelperContractSource(), /正式服发布用户不能属于通用提权组/)
+	const nginxProductionTemplate = readFileSync(
+		join(TOOL_ROOT, 'frontend/remote/nginx-production-h5.conf.example'),
+		'utf8'
+	)
+	const productionPublicUrl = productionTemplate.match(/^H5_PUBLIC_URL=https:\/\/(.+)$/m)?.[1]
+	const remoteProductionPublicUrl = remoteProductionTemplate.match(
+		/^LOUMAI_H5_PUBLIC_URL=https:\/\/(.+)$/m
+	)?.[1]
+	const nginxProductionHost = nginxProductionTemplate.match(/^\s*server_name\s+([^;]+);/m)?.[1]
+	assert.equal(productionPublicUrl, 'h5.example.com')
+	assert.equal(remoteProductionPublicUrl, productionPublicUrl)
+	assert.equal(nginxProductionHost, productionPublicUrl)
 	assert.equal(DEFAULT_CONFIG_PATH, join(TOOL_ROOT, 'config/frontend.test.local.env'))
+})
+
+test('H5 预检同时绑定环境、发布根目录与公网 URL，防止误投同类服务器', () => {
+	const localSource = readFileSync(join(TOOL_ROOT, 'frontend/h5-release.mjs'), 'utf8')
+	const preflightStart = localSource.indexOf('function remotePreflight')
+	const preflightEnd = localSource.indexOf('function prepareRemoteStaging', preflightStart)
+	const preflightSource = localSource.slice(preflightStart, preflightEnd)
+	assert.match(preflightSource, /values\.ENVIRONMENT !== config\.environment/)
+	assert.match(preflightSource, /values\.REMOTE_ROOT !== expectedRemoteRoot/)
+	assert.match(preflightSource, /values\.PUBLIC_URL !== config\.publicUrl/)
+})
+
+test('远端激活器脚本通过 Bash 语法检查', () => {
+	const result = spawnSync('bash', ['-n', join(TOOL_ROOT, 'frontend/remote/loumai-h5-release')], {
+		encoding: 'utf8'
+	})
+	assert.equal(result.status, 0, [result.stdout, result.stderr].filter(Boolean).join('\n'))
 })
 
 test('构建环境只暴露白名单字段且源码不再注入完整 import.meta.env', () => {

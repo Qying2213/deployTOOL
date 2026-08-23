@@ -2,11 +2,28 @@
 
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export GIT_PAGER=cat PAGER=cat SYSTEMD_PAGER=cat SYSTEMD_COLORS=0
 unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
 umask 022
 
-readonly HELPER_VERSION="1"
+readonly HELPER_VERSION="5"
 readonly CONFIG_FILE="/etc/loumai/backend-release.env"
+
+# These two installation checks must work before the server configuration exists.
+case "${1:-}" in
+  version)
+    [[ "$#" -eq 1 ]] || { printf 'ERROR: version 参数数量错误\n' >&2; exit 1; }
+    printf '%s\n' "$HELPER_VERSION"
+    exit 0
+    ;;
+  fingerprint)
+    [[ "$#" -eq 1 ]] || { printf 'ERROR: fingerprint 参数数量错误\n' >&2; exit 1; }
+    command -v sha256sum >/dev/null 2>&1 \
+      || { printf 'ERROR: 服务器缺少命令：sha256sum\n' >&2; exit 1; }
+    sha256sum "$0" | awk '{print $1}'
+    exit 0
+    ;;
+esac
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -15,6 +32,13 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "服务器缺少命令：$1"
+}
+
+run_as_clean() {
+  local user="$1"
+  shift
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    /usr/sbin/runuser -u "$user" -- "$@"
 }
 
 valid_absolute_path() {
@@ -45,6 +69,14 @@ assert_root_owned_file() {
     || fail "文件不能被组或其他用户写入：$path"
 }
 
+assert_root_secret_file() {
+  local path="$1"
+  assert_root_owned_file "$path"
+  [[ "$(stat -c '%g' "$path")" == "0" && "$(stat -c '%a' "$path")" == "600" ]] \
+    || fail "秘密文件必须是 root:root 0600：$path"
+  [[ "$(stat -c '%h' "$path")" == "1" ]] || fail "秘密文件不能包含硬链接：$path"
+}
+
 assert_root_owned_directory() {
   local path="$1"
   [[ -d "$path" && ! -L "$path" ]] || fail "目录不存在或是软链接：$path"
@@ -60,9 +92,11 @@ assert_root_owned_file "$CONFIG_FILE"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export GIT_PAGER=cat PAGER=cat SYSTEMD_PAGER=cat SYSTEMD_COLORS=0
 unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
 
 : "${LOUMAI_BACKEND_REMOTE_ROOT:?缺少 LOUMAI_BACKEND_REMOTE_ROOT}"
+: "${LOUMAI_BACKEND_ENVIRONMENT:?缺少 LOUMAI_BACKEND_ENVIRONMENT}"
 : "${LOUMAI_BACKEND_STAGING_ROOT:?缺少 LOUMAI_BACKEND_STAGING_ROOT}"
 : "${LOUMAI_BACKEND_DEPLOY_USER:?缺少 LOUMAI_BACKEND_DEPLOY_USER}"
 : "${LOUMAI_BACKEND_SERVICE_USER:?缺少 LOUMAI_BACKEND_SERVICE_USER}"
@@ -79,26 +113,62 @@ unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
 : "${LOUMAI_BACKEND_PUBLIC_HEALTH_URL:?缺少 LOUMAI_BACKEND_PUBLIC_HEALTH_URL}"
 
 readonly REMOTE_ROOT="$LOUMAI_BACKEND_REMOTE_ROOT"
+readonly ENVIRONMENT="$LOUMAI_BACKEND_ENVIRONMENT"
 readonly STAGING_ROOT="$LOUMAI_BACKEND_STAGING_ROOT"
 readonly DEPLOY_USER="$LOUMAI_BACKEND_DEPLOY_USER"
 readonly SERVICE_USER="$LOUMAI_BACKEND_SERVICE_USER"
+readonly VIDEO_SERVICE_USER="${LOUMAI_BACKEND_VIDEO_SERVICE_USER:-$SERVICE_USER}"
+readonly IM_SERVICE_USER="${LOUMAI_BACKEND_IM_SERVICE_USER:-$SERVICE_USER}"
+readonly JOB_SERVICE_USER="${LOUMAI_BACKEND_JOB_SERVICE_USER:-$SERVICE_USER}"
+readonly MIGRATION_USER="${LOUMAI_BACKEND_MIGRATION_USER:-$SERVICE_USER}"
 readonly BUILD_USER="$LOUMAI_BACKEND_BUILD_USER"
 readonly CURRENT_LINK="$LOUMAI_BACKEND_CURRENT_LINK"
 readonly UV_BIN="$LOUMAI_BACKEND_UV_BIN"
 readonly BASE_PYTHON="$LOUMAI_BACKEND_BASE_PYTHON"
 readonly RUNTIME_ROOT="$LOUMAI_BACKEND_RUNTIME_ROOT"
 readonly DATABASE_NAME="$LOUMAI_BACKEND_DATABASE_NAME"
+readonly DATABASE_PROFILE_DIR="${LOUMAI_BACKEND_DATABASE_PROFILE_DIR:-/etc/loumai/database-profiles}"
+readonly ACTIVE_DATABASE_ENV="${LOUMAI_BACKEND_ACTIVE_DATABASE_ENV:-/etc/loumai/database-active.env}"
+readonly CLOUD_DATABASE_HOST="${LOUMAI_BACKEND_CLOUD_DATABASE_HOST:-172.27.0.3}"
+readonly DATABASE_CA_FILE="${LOUMAI_BACKEND_DATABASE_CA_FILE:-}"
+readonly DATABASE_CA_GROUP="${LOUMAI_BACKEND_DATABASE_CA_GROUP:-}"
 readonly BACKUP_ROOT="$LOUMAI_BACKEND_BACKUP_ROOT"
+readonly BACKUP_USER="${LOUMAI_BACKEND_BACKUP_USER:-postgres}"
+readonly BACKUP_MIN_FREE_BYTES="${LOUMAI_BACKEND_BACKUP_MIN_FREE_BYTES:-10737418240}"
 readonly LOCAL_HEALTH_URL="$LOUMAI_BACKEND_LOCAL_HEALTH_URL"
 readonly PUBLIC_HEALTH_URL="$LOUMAI_BACKEND_PUBLIC_HEALTH_URL"
+readonly VIDEO_SERVICE="${LOUMAI_BACKEND_VIDEO_SERVICE:-loumai-video-worker.service}"
+readonly FFMPEG_BIN="${LOUMAI_BACKEND_FFMPEG_BIN:-$RUNTIME_ROOT/ffmpeg/bin/ffmpeg}"
+readonly FFPROBE_BIN="${LOUMAI_BACKEND_FFPROBE_BIN:-$RUNTIME_ROOT/ffmpeg/bin/ffprobe}"
+readonly VIDEO_TEMP_ROOT="${LOUMAI_BACKEND_VIDEO_TEMP_ROOT:-/var/lib/loumai-video/tmp}"
+readonly DIRECT_UPLOAD_APPROVED="${LOUMAI_BACKEND_PROPERTY_VIDEO_DIRECT_UPLOAD_APPROVED:-false}"
+readonly MONOLITHIC_SECRET_SCOPE_APPROVED="${LOUMAI_BACKEND_MONOLITHIC_SETTINGS_SECRET_SCOPE_APPROVED:-false}"
+readonly OFFSITE_BACKUP_EVIDENCE_FILE="${LOUMAI_BACKEND_OFFSITE_BACKUP_EVIDENCE_FILE:-}"
 readonly RELEASES_ROOT="$REMOTE_ROOT/backend-releases"
 readonly LOCK_FILE="$REMOTE_ROOT/.backend-release.lock"
+readonly RECOVERY_FILE="$REMOTE_ROOT/.migration-recovery-required"
 
-read -r -a ENV_FILES <<< "$LOUMAI_BACKEND_ENV_FILES"
+read -r -a BASE_ENV_FILES <<< "$LOUMAI_BACKEND_ENV_FILES"
+ENV_FILES=("${BASE_ENV_FILES[@]}")
+SELECTED_DATABASE_PROFILE="local"
+SELECTED_DATABASE_NAME="$DATABASE_NAME"
+SELECTED_DATABASE_ENV=""
 read -r -a SERVICES <<< "$LOUMAI_BACKEND_SERVICES"
+read -r -a AUXILIARY_DATABASE_SERVICES <<< "${LOUMAI_BACKEND_AUXILIARY_DATABASE_SERVICES:-}"
 read -r -a TIMERS <<< "${LOUMAI_BACKEND_TIMERS:-}"
+read -r -a ONESHOT_SERVICES <<< "${LOUMAI_BACKEND_ONESHOT_SERVICES:-}"
 
-for path in "$REMOTE_ROOT" "$STAGING_ROOT" "$CURRENT_LINK" "$BACKUP_ROOT" "$RUNTIME_ROOT"; do
+[[ "$ENVIRONMENT" == "test" || "$ENVIRONMENT" == "production" ]] \
+  || fail "LOUMAI_BACKEND_ENVIRONMENT 只能是 test 或 production"
+if [[ "$ENVIRONMENT" == "production" ]]; then
+  : "${LOUMAI_BACKEND_CLOUD_DATABASE_HOST:?正式服必须显式配置云数据库 DNS endpoint}"
+  : "${LOUMAI_BACKEND_DATABASE_CA_FILE:?正式服必须配置数据库 CA 文件}"
+  : "${LOUMAI_BACKEND_DATABASE_CA_GROUP:?正式服必须配置数据库 CA 专用组}"
+  : "${LOUMAI_BACKEND_OFFSITE_BACKUP_EVIDENCE_FILE:?正式服必须配置异地备份与恢复演练证据文件}"
+fi
+
+for path in "$REMOTE_ROOT" "$STAGING_ROOT" "$CURRENT_LINK" "$BACKUP_ROOT" "$RUNTIME_ROOT" \
+  "$FFMPEG_BIN" "$FFPROBE_BIN" "$VIDEO_TEMP_ROOT" "$DATABASE_PROFILE_DIR" "$ACTIVE_DATABASE_ENV"; do
   valid_absolute_path "$path" || fail "配置包含不安全绝对路径：$path"
 done
 [[ "$LOCAL_HEALTH_URL" =~ ^http://127\.0\.0\.1:[0-9]+/[A-Za-z0-9._/-]+$ ]] \
@@ -106,19 +176,102 @@ done
 [[ "$PUBLIC_HEALTH_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+$ ]] \
   || fail "PUBLIC_HEALTH_URL 必须是 HTTPS 地址"
 [[ "$DATABASE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "数据库名格式非法"
+[[ "$CLOUD_DATABASE_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || fail "云数据库 Host 格式非法"
+[[ "$BACKUP_MIN_FREE_BYTES" =~ ^[1-9][0-9]*$ ]] || fail "备份最小剩余空间配置非法"
+[[ "$DIRECT_UPLOAD_APPROVED" == "true" || "$DIRECT_UPLOAD_APPROVED" == "false" ]] \
+  || fail "PROPERTY_VIDEO 直传发布确认只能是 true 或 false"
+[[ "$MONOLITHIC_SECRET_SCOPE_APPROVED" == "true" || "$MONOLITHIC_SECRET_SCOPE_APPROVED" == "false" ]] \
+  || fail "统一 Settings 密钥范围确认只能是 true 或 false"
+if [[ -n "$DATABASE_CA_FILE" ]]; then
+  valid_absolute_path "$DATABASE_CA_FILE" || fail "数据库 CA 文件路径非法"
+fi
+if [[ -n "$DATABASE_CA_GROUP" ]]; then
+  [[ "$DATABASE_CA_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]] || fail "数据库 CA 组名格式非法"
+fi
+if [[ -n "$OFFSITE_BACKUP_EVIDENCE_FILE" ]]; then
+  valid_absolute_path "$OFFSITE_BACKUP_EVIDENCE_FILE" || fail "异地备份证据文件路径非法"
+fi
 
-for command_name in awk basename cat chmod chown cp curl env find flock getent grep id install ln mktemp mv pg_dump pg_restore readlink rm runuser seq sha256sum sleep sort stat systemctl tar tr wc; do
+for command_name in awk basename cat chmod chown cp curl df env find flock getent grep id install ln mktemp mv pg_dump pg_restore readlink rm runuser seq sha256sum sleep sort stat systemctl tar tr wc; do
   require_command "$command_name"
 done
 [[ -x /usr/bin/python3 ]] || fail "缺少 /usr/bin/python3"
+[[ -x /usr/sbin/runuser ]] || fail "缺少 /usr/sbin/runuser"
 
 validate_units() {
-  local unit
-  [[ "${#SERVICES[@]}" -gt 0 ]] || fail "至少配置一个后端 service"
-  for unit in "${SERVICES[@]}" "${TIMERS[@]}"; do
+  local unit primary auxiliary
+  local -A seen=()
+	[[ "${#SERVICES[@]}" -gt 0 ]] || fail "至少配置一个后端 service"
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-app-push-dispatcher.service "* ]] \
+      || fail "正式服必须纳管 loumai-app-push-dispatcher.service"
+    [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-rent-billing.service "* ]] \
+      || fail "正式服必须纳管 loumai-rent-billing.service"
+    [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-file-storage-cleanup.service "* ]] \
+      || fail "正式服必须纳管 loumai-file-storage-cleanup.service"
+    [[ " ${TIMERS[*]} " == *" loumai-app-push-dispatcher.timer "* ]] \
+      || fail "正式服必须纳管 loumai-app-push-dispatcher.timer"
+    [[ " ${TIMERS[*]} " == *" loumai-rent-billing.timer "* ]] \
+      || fail "正式服必须纳管 loumai-rent-billing.timer"
+    [[ " ${TIMERS[*]} " == *" loumai-file-storage-cleanup.timer "* ]] \
+      || fail "正式服必须纳管 loumai-file-storage-cleanup.timer"
+  fi
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${ONESHOT_SERVICES[@]}"; do
+		[[ -n "$unit" ]] || continue
+		[[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.service$ ]] || fail "systemd service 格式非法：$unit"
+		[[ -z "${seen[$unit]:-}" ]] || fail "systemd unit 重复配置：$unit"
+		seen[$unit]=1
+		systemctl cat "$unit" >/dev/null || fail "systemd unit 不存在：$unit"
+	done
+	for unit in "${TIMERS[@]}"; do
+		[[ -n "$unit" ]] || continue
+		[[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.timer$ ]] || fail "systemd timer 格式非法：$unit"
+		[[ -z "${seen[$unit]:-}" ]] || fail "systemd unit 重复配置：$unit"
+		seen[$unit]=1
+		systemctl cat "$unit" >/dev/null || fail "systemd unit 不存在：$unit"
+	done
+  for primary in "${SERVICES[@]}"; do
+    for auxiliary in "${AUXILIARY_DATABASE_SERVICES[@]}"; do
+      [[ "$primary" != "$auxiliary" ]] || fail "service 不能同时属于业务发布和独立数据库服务：$primary"
+    done
+  done
+}
+
+validate_service_user_contract() {
+  local unit expected_user actual_user
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  for unit in "${SERVICES[@]}"; do
+    case "$unit" in
+      loumai-api.service)
+        expected_user="$SERVICE_USER"
+        ;;
+      loumai-im-worker.service)
+        expected_user="$IM_SERVICE_USER"
+        ;;
+      "$VIDEO_SERVICE")
+        expected_user="$VIDEO_SERVICE_USER"
+        ;;
+      *)
+        fail "正式服包含未识别的长驻服务：$unit"
+        ;;
+    esac
+    actual_user="$(systemctl show "$unit" -p User --value)"
+    [[ "$actual_user" == "$expected_user" ]] \
+      || fail "$unit 运行用户必须是 $expected_user"
+  done
+  for unit in loumai-api.service loumai-im-worker.service "$VIDEO_SERVICE"; do
+    [[ " ${SERVICES[*]} " == *" $unit "* ]] || fail "正式服缺少长驻服务：$unit"
+  done
+}
+
+validate_database_ca_service_contract() {
+  local unit supplementary_groups
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${ONESHOT_SERVICES[@]}"; do
     [[ -n "$unit" ]] || continue
-    [[ "$unit" =~ ^[A-Za-z0-9_.@-]+\.(service|timer)$ ]] || fail "systemd unit 格式非法：$unit"
-    systemctl cat "$unit" >/dev/null || fail "systemd unit 不存在：$unit"
+    supplementary_groups="$(systemctl show "$unit" -p SupplementaryGroups --value)"
+    tr ' ' '\n' <<<"$supplementary_groups" | grep -Fxq "$DATABASE_CA_GROUP" \
+      || fail "$unit 必须显式声明 SupplementaryGroups=$DATABASE_CA_GROUP"
   done
 }
 
@@ -128,8 +281,304 @@ validate_environment_files() {
   for path in "${ENV_FILES[@]}"; do
     valid_absolute_path "$path" || fail "环境文件路径非法：$path"
     assert_root_owned_directory "${path%/*}"
-    assert_root_owned_file "$path"
+    if [[ "$ENVIRONMENT" == "production" ]]; then
+      assert_root_secret_file "$path"
+    else
+      assert_root_owned_file "$path"
+    fi
   done
+}
+
+valid_database_profile() {
+  [[ "$1" == "local" || "$1" == "cloud" || "$1" == "active" ]]
+}
+
+database_profile_file() {
+  local profile="$1"
+  valid_database_profile "$profile" || fail "数据库 profile 非法：$profile"
+  [[ "$profile" != "active" ]] || fail "active 不是 profile 文件名"
+  printf '%s/%s.env\n' "$DATABASE_PROFILE_DIR" "$profile"
+}
+
+database_profile_marker() {
+  local path="$1"
+  /usr/bin/python3 - "$path" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+marker = ""
+with open(path, encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "LOUMAI_DATABASE_PROFILE":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        marker = value
+print(marker)
+PY
+}
+
+active_database_profile() {
+  local marker
+  if [[ ! -e "$ACTIVE_DATABASE_ENV" && ! -L "$ACTIVE_DATABASE_ENV" ]]; then
+    printf 'local\n'
+    return
+  fi
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    assert_root_secret_file "$ACTIVE_DATABASE_ENV"
+  else
+    assert_root_owned_file "$ACTIVE_DATABASE_ENV"
+  fi
+  validate_active_database_env
+  marker="$(database_profile_marker "$ACTIVE_DATABASE_ENV")"
+  [[ "$marker" == "local" || "$marker" == "cloud" ]] \
+    || fail "活动数据库 profile 标记缺失或非法"
+  printf '%s\n' "$marker"
+}
+
+validate_active_database_env() {
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  /usr/bin/python3 - "$ACTIVE_DATABASE_ENV" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+allowed = {"LOUMAI_DATABASE_PROFILE", "LOUMAI_DATABASE_NAME", "DATABASE_URL"}
+seen = set()
+with open(path, encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if "=" not in line:
+            raise SystemExit("production active database env contains an invalid line")
+        key = line.split("=", 1)[0].strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise SystemExit("production active database env contains an invalid key")
+        if key not in allowed:
+            raise SystemExit("production active database env contains a forbidden key: " + key)
+        if key in seen:
+            raise SystemExit("production active database env contains a duplicate key: " + key)
+        seen.add(key)
+if seen != allowed:
+    raise SystemExit("production active database env must contain only runtime database fields")
+PY
+}
+
+validate_base_database_isolation() {
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  /usr/bin/python3 - "${BASE_ENV_FILES[@]}" <<'PY'
+import re
+import sys
+
+locations = {}
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key in {"DATABASE_URL", "MIGRATION_DATABASE_URL", "BACKUP_DATABASE_URL", "LOUMAI_DATABASE_PROFILE", "LOUMAI_DATABASE_NAME"}:
+                raise SystemExit(
+                    "production database credentials must exist only in the root-owned database profile: "
+                    + key
+                )
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise SystemExit("production base environment contains an invalid key")
+            if key in locations:
+                raise SystemExit(
+                    "production base environment contains a cross-file duplicate key: "
+                    + key
+                )
+            locations[key] = path
+PY
+}
+
+validate_database_service_contract() {
+  local unit environment_files direct_environment forbidden_key
+  [[ -f "$ACTIVE_DATABASE_ENV" && ! -L "$ACTIVE_DATABASE_ENV" ]] \
+    || fail "双数据库发布要求活动环境文件：$ACTIVE_DATABASE_ENV"
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${ONESHOT_SERVICES[@]}"; do
+    environment_files="$(systemctl show "$unit" -p EnvironmentFiles --value)"
+    if [[ "$ENVIRONMENT" == "production" ]]; then
+      direct_environment="$(systemctl show "$unit" -p Environment --value)"
+      for forbidden_key in DATABASE_URL MIGRATION_DATABASE_URL BACKUP_DATABASE_URL LOUMAI_DATABASE_PROFILE LOUMAI_DATABASE_NAME; do
+        [[ "$direct_environment" != *"$forbidden_key="* ]] \
+          || fail "$unit 禁止通过 Environment 直接注入数据库字段：$forbidden_key"
+      done
+      /usr/bin/python3 - "$unit" "$environment_files" \
+        "${BASE_ENV_FILES[@]}" "$ACTIVE_DATABASE_ENV" <<'PY'
+import re
+import sys
+
+unit, raw, *expected_paths = sys.argv[1:]
+actual_paths = re.findall(r"/[A-Za-z0-9._/-]+", raw)
+if len(actual_paths) != len(set(actual_paths)):
+    raise SystemExit(f"{unit} contains duplicate EnvironmentFile entries")
+if actual_paths != expected_paths:
+    raise SystemExit(
+        f"{unit} EnvironmentFiles must exactly match the approved runtime-only files in order"
+    )
+PY
+    else
+      [[ "$environment_files" == *"$ACTIVE_DATABASE_ENV"* ]] \
+        || fail "$unit 尚未加载活动数据库环境文件：$ACTIVE_DATABASE_ENV"
+    fi
+  done
+}
+
+validate_oneshot_contract() {
+  local unit expected script configured_user configured_type configured_working_directory configured_exec configured_timer_unit enabled_state
+  for unit in "${ONESHOT_SERVICES[@]}"; do
+    [[ -n "$unit" ]] || continue
+    case "$unit" in
+      loumai-app-push-dispatcher.service)
+        script="scripts/run_app_push_dispatcher.py"
+        ;;
+      loumai-rent-billing.service)
+        script="scripts/run_rent_billing_jobs.py"
+        ;;
+      loumai-file-storage-cleanup.service)
+        script="scripts/run_file_storage_cleanup.py"
+        ;;
+      *)
+        fail "未识别的定时写入 service：$unit"
+        ;;
+    esac
+    configured_user="$(systemctl show "$unit" -p User --value)"
+    configured_type="$(systemctl show "$unit" -p Type --value)"
+    configured_working_directory="$(systemctl show "$unit" -p WorkingDirectory --value)"
+    configured_exec="$(systemctl show "$unit" -p ExecStart --value)"
+    [[ "$configured_user" == "$JOB_SERVICE_USER" ]] || fail "$unit 运行用户必须是 $JOB_SERVICE_USER"
+    [[ "$configured_type" == "oneshot" ]] || fail "$unit 必须是 oneshot service"
+    [[ "$configured_working_directory" == "$CURRENT_LINK" ]] \
+      || fail "$unit 工作目录必须是 $CURRENT_LINK"
+    [[ "$configured_exec" == *"$CURRENT_LINK/.venv/bin/python"* \
+      && "$configured_exec" == *"$script"* ]] \
+      || fail "$unit 启动命令未指向受控脚本 $script"
+    if [[ "$ENVIRONMENT" == "production" ]]; then
+      enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+      [[ "$enabled_state" == "static" ]] \
+        || fail "$unit 必须保持 static，只能由受控 timer 触发（当前 $enabled_state）"
+    fi
+  done
+  for unit in "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    expected="${unit%.timer}.service"
+    [[ " ${ONESHOT_SERVICES[*]} " == *" $expected "* ]] \
+      || fail "$unit 缺少配对的 $expected"
+    configured_timer_unit="$(systemctl show "$unit" -p Unit --value)"
+    [[ "$configured_timer_unit" == "$expected" ]] \
+      || fail "$unit 实际触发单元不是 $expected"
+  done
+}
+
+select_database_profile() {
+  local requested="$1" profile profile_file marker
+  valid_database_profile "$requested" || fail "数据库 profile 非法：$requested"
+  if [[ "$requested" == "active" ]]; then
+    profile="$(active_database_profile)"
+  else
+    profile="$requested"
+  fi
+  if [[ "$ENVIRONMENT" == "production" && "$profile" != "cloud" ]]; then
+    fail "正式服只允许 cloud 数据库 profile"
+  fi
+  profile_file="$(database_profile_file "$profile")"
+  ENV_FILES=("${BASE_ENV_FILES[@]}")
+  SELECTED_DATABASE_ENV=""
+
+  if [[ -e "$profile_file" || -L "$profile_file" ]]; then
+    assert_root_owned_directory "$DATABASE_PROFILE_DIR"
+    assert_root_owned_file "$profile_file"
+    ENV_FILES+=("$profile_file")
+    SELECTED_DATABASE_ENV="$profile_file"
+  elif [[ "$profile" != "local" ]]; then
+    fail "云数据库 profile 尚未配置：$profile_file"
+  elif [[ -e "$ACTIVE_DATABASE_ENV" || -L "$ACTIVE_DATABASE_ENV" ]]; then
+    fail "已启用双数据库配置，但缺少本地数据库 profile：$profile_file"
+  fi
+
+  validate_environment_files
+  load_app_environment
+  marker="${LOUMAI_DATABASE_PROFILE:-}"
+  if [[ -n "$SELECTED_DATABASE_ENV" ]]; then
+    [[ "$marker" == "$profile" ]] || fail "数据库 profile 文件标记不匹配：$profile_file"
+    SELECTED_DATABASE_NAME="${LOUMAI_DATABASE_NAME:-}"
+    [[ "$SELECTED_DATABASE_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || fail "数据库 profile 缺少合法 LOUMAI_DATABASE_NAME：$profile_file"
+    validate_database_service_contract
+  else
+    SELECTED_DATABASE_NAME="$DATABASE_NAME"
+  fi
+  SELECTED_DATABASE_PROFILE="$profile"
+}
+
+switch_active_database_profile() {
+  local source="$SELECTED_DATABASE_ENV" partial
+  [[ -n "$source" ]] || return 0
+  partial="${ACTIVE_DATABASE_ENV}.next.$$"
+  rm -f -- "$partial"
+  /usr/bin/python3 - "$source" "$partial" <<'PY'
+import os
+import re
+import sys
+
+source, destination = sys.argv[1:]
+values = {}
+with open(source, encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if "=" not in line:
+            raise SystemExit("invalid database profile line")
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in values:
+            raise SystemExit("invalid or duplicate database profile key")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if any(character in value for character in ("\x00", "\r", "\n")):
+            raise SystemExit("invalid control byte in database profile")
+        values[key] = value
+
+required = ("LOUMAI_DATABASE_PROFILE", "LOUMAI_DATABASE_NAME", "DATABASE_URL")
+if any(not values.get(key) for key in required):
+    raise SystemExit("database profile is missing a runtime field")
+
+def quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+os.umask(0o077)
+with open(destination, "x", encoding="utf-8") as output:
+    output.write("# Generated by loumai-backend-release; migration credentials are intentionally excluded.\n")
+    for key in required:
+        output.write(f"{key}={quote(values[key])}\n")
+    output.flush()
+    os.fsync(output.fileno())
+PY
+  chown root:root "$partial"
+  chmod 0600 "$partial"
+  mv -Tf -- "$partial" "$ACTIVE_DATABASE_ENV"
+  [[ "$(active_database_profile)" == "$SELECTED_DATABASE_PROFILE" ]] \
+    || fail "活动数据库 profile 切换后校验失败"
+}
+
+unit_is_configured() {
+  local target="$1" unit
+  for unit in "${SERVICES[@]}"; do
+    [[ "$unit" == "$target" ]] && return 0
+  done
+  return 1
 }
 
 validate_runtime_tools() {
@@ -152,28 +601,286 @@ validate_runtime_tools() {
 }
 
 validate_backup_root() {
-  local postgres_uid owner_uid
+  local backup_uid owner_uid
   assert_root_owned_directory "${BACKUP_ROOT%/*}"
   [[ -d "$BACKUP_ROOT" && ! -L "$BACKUP_ROOT" ]] || fail "数据库备份目录不存在"
   [[ "$(readlink -f "$BACKUP_ROOT")" == "$BACKUP_ROOT" ]] || fail "备份目录路径包含软链接"
-  postgres_uid="$(id -u postgres)"
+  backup_uid="$(id -u "$BACKUP_USER")"
   owner_uid="$(stat -c '%u' "$BACKUP_ROOT")"
-  [[ "$owner_uid" == "0" || "$owner_uid" == "$postgres_uid" ]] \
-		|| fail "备份目录必须归 root 或 postgres 所有"
+  [[ "$owner_uid" == "0" || "$owner_uid" == "$backup_uid" ]] \
+		|| fail "备份目录必须归 root 或 $BACKUP_USER 所有"
   [[ -z "$(find "$BACKUP_ROOT" -maxdepth 0 -perm /022 -print -quit)" ]] \
 		|| fail "备份目录不能被组或其他用户写入"
 }
 
+backup_root_status() {
+  local backup_uid owner_uid mode
+  backup_uid="$(id -u "$BACKUP_USER")"
+  owner_uid="$(stat -c '%u' "$BACKUP_ROOT")"
+  mode="$(stat -c '%a' "$BACKUP_ROOT")"
+  if [[ "$owner_uid" == "$backup_uid" && "$mode" == "700" ]] \
+    && run_as_clean "$BACKUP_USER" /usr/bin/test -w "$BACKUP_ROOT" \
+    && run_as_clean "$BACKUP_USER" /usr/bin/test -x "$BACKUP_ROOT"; then
+    printf 'ready\n'
+  else
+    printf 'repairable\n'
+  fi
+}
+
+backup_root_available_bytes() {
+  df -PB1 "$BACKUP_ROOT" | awk 'NR==2 {print $4}'
+}
+
+prepare_backup_root() {
+  local backup_group probe
+  validate_backup_root
+  backup_group="$(id -gn "$BACKUP_USER")"
+  chown "$BACKUP_USER:$backup_group" "$BACKUP_ROOT"
+  chmod 0700 "$BACKUP_ROOT"
+  probe="$(run_as_clean "$BACKUP_USER" /usr/bin/mktemp "$BACKUP_ROOT/.write-check.XXXXXX")" \
+    || fail "$BACKUP_USER 无法在数据库备份目录创建文件：$BACKUP_ROOT"
+  [[ -f "$probe" && ! -L "$probe" ]] || fail "数据库备份目录写入探针异常"
+  rm -f -- "$probe"
+  [[ "$(backup_root_status)" == "ready" ]] \
+    || fail "数据库备份目录自动修复后仍不可用：$BACKUP_ROOT"
+  [[ "$(backup_root_available_bytes)" -ge "$BACKUP_MIN_FREE_BYTES" ]] \
+    || fail "数据库备份目录剩余空间低于发布门禁：$BACKUP_MIN_FREE_BYTES bytes"
+}
+
+validate_video_runtime() (
+  local binary resolved service_uid configured_user configured_working_directory configured_exec current_release
+  local memory_max cpu_quota tasks_max read_write_paths ffmpeg_encoders
+
+  load_app_environment
+  case "${VIDEO_TRANSCODE_ENABLED:-false}" in
+    true)
+      ;;
+    false)
+      unit_is_configured "$VIDEO_SERVICE" \
+        && fail "VIDEO_TRANSCODE_ENABLED=false 时不能启用 $VIDEO_SERVICE"
+      systemctl is-active --quiet "$VIDEO_SERVICE" \
+        && fail "VIDEO_TRANSCODE_ENABLED=false 时 $VIDEO_SERVICE 仍在运行，必须先停止"
+      systemctl is-enabled --quiet "$VIDEO_SERVICE" \
+        && fail "VIDEO_TRANSCODE_ENABLED=false 时 $VIDEO_SERVICE 仍为开机启用，必须先 disable"
+      return
+      ;;
+    *)
+      fail "VIDEO_TRANSCODE_ENABLED 必须明确配置为 true 或 false"
+      ;;
+  esac
+
+  unit_is_configured "$VIDEO_SERVICE" \
+    || fail "VIDEO_TRANSCODE_ENABLED=true 时必须把 $VIDEO_SERVICE 加入 LOUMAI_BACKEND_SERVICES"
+  current_release="$(current_target)"
+  if [[ "$current_release" != "NONE" ]]; then
+    [[ -f "$current_release/scripts/run_video_transcode_worker.py" \
+      && ! -L "$current_release/scripts/run_video_transcode_worker.py" ]] \
+      || fail "当前后端版本缺少受控视频 Worker 脚本"
+  fi
+  [[ "${VIDEO_TRANSCODE_FFMPEG_PATH:-}" == "$FFMPEG_BIN" ]] \
+    || fail "应用 VIDEO_TRANSCODE_FFMPEG_PATH 与发布器固定路径不一致"
+  [[ "${VIDEO_TRANSCODE_FFPROBE_PATH:-}" == "$FFPROBE_BIN" ]] \
+    || fail "应用 VIDEO_TRANSCODE_FFPROBE_PATH 与发布器固定路径不一致"
+  [[ "${VIDEO_TRANSCODE_TEMP_ROOT:-}" == "$VIDEO_TEMP_ROOT" ]] \
+    || fail "应用 VIDEO_TRANSCODE_TEMP_ROOT 与发布器临时目录不一致"
+  [[ "${VIDEO_TRANSCODE_MAX_CONCURRENCY:-}" == "1" \
+    && "${VIDEO_TRANSCODE_THREADS:-}" == "1" ]] \
+    || fail "测试服视频 Worker 必须保持单并发、FFmpeg 单线程"
+  [[ "$FFMPEG_BIN" == "$RUNTIME_ROOT/"* && "$FFPROBE_BIN" == "$RUNTIME_ROOT/"* ]] \
+    || fail "FFmpeg/ffprobe 必须位于受控 runtime 根目录"
+  for binary in "$FFMPEG_BIN" "$FFPROBE_BIN"; do
+    [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] \
+      || fail "视频运行时不存在、不可执行或是软链接：$binary"
+    resolved="$(readlink -f "$binary")"
+    [[ "$resolved" == "$RUNTIME_ROOT/"* ]] || fail "视频运行时越过受控目录：$binary"
+    [[ "$(stat -c '%u' "$binary")" == "0" ]] || fail "视频运行时必须归 root 所有：$binary"
+    [[ -z "$(find "$binary" -maxdepth 0 -perm /022 -print -quit)" ]] \
+      || fail "视频运行时不能被非 root 写入：$binary"
+  done
+  "$FFPROBE_BIN" -version >/dev/null 2>&1 || fail "ffprobe 运行失败"
+  ffmpeg_encoders="$("$FFMPEG_BIN" -hide_banner -encoders 2>&1)" \
+    || fail "FFmpeg 编码器列表读取失败"
+  grep -Eq '(^|[[:space:]])libx264([[:space:]]|$)' <<<"$ffmpeg_encoders" \
+    || fail "FFmpeg 缺少 libx264 编码器"
+
+  [[ -d "$VIDEO_TEMP_ROOT" && ! -L "$VIDEO_TEMP_ROOT" ]] \
+    || fail "视频临时目录不存在或是软链接：$VIDEO_TEMP_ROOT"
+  [[ "$(readlink -f "$VIDEO_TEMP_ROOT")" == "$VIDEO_TEMP_ROOT" ]] \
+    || fail "视频临时目录路径包含软链接"
+  service_uid="$(id -u "$VIDEO_SERVICE_USER")"
+  [[ "$(stat -c '%u' "$VIDEO_TEMP_ROOT")" == "$service_uid" ]] \
+    || fail "视频临时目录必须归服务用户所有"
+  [[ -z "$(find "$VIDEO_TEMP_ROOT" -maxdepth 0 -perm /077 -print -quit)" ]] \
+    || fail "视频临时目录必须是服务用户私有目录（0700）"
+
+  configured_user="$(systemctl show "$VIDEO_SERVICE" -p User --value)"
+  configured_working_directory="$(systemctl show "$VIDEO_SERVICE" -p WorkingDirectory --value)"
+  configured_exec="$(systemctl show "$VIDEO_SERVICE" -p ExecStart --value)"
+  memory_max="$(systemctl show "$VIDEO_SERVICE" -p MemoryMax --value)"
+  cpu_quota="$(systemctl show "$VIDEO_SERVICE" -p CPUQuotaPerSecUSec --value)"
+  tasks_max="$(systemctl show "$VIDEO_SERVICE" -p TasksMax --value)"
+  read_write_paths="$(systemctl show "$VIDEO_SERVICE" -p ReadWritePaths --value)"
+  [[ "$configured_user" == "$VIDEO_SERVICE_USER" ]] \
+    || fail "$VIDEO_SERVICE 运行用户必须是 $VIDEO_SERVICE_USER"
+  [[ "$configured_working_directory" == "$CURRENT_LINK" ]] \
+    || fail "$VIDEO_SERVICE 工作目录必须是 $CURRENT_LINK"
+  [[ "$configured_exec" == *"$CURRENT_LINK/.venv/bin/python"* \
+    && "$configured_exec" == *"scripts/run_video_transcode_worker.py"* ]] \
+    || fail "$VIDEO_SERVICE 启动命令未指向受控视频 Worker"
+  [[ -n "$memory_max" && "$memory_max" != "infinity" && "$memory_max" != "0" ]] \
+    || fail "$VIDEO_SERVICE 必须设置 MemoryMax"
+  [[ -n "$cpu_quota" && "$cpu_quota" != "infinity" ]] \
+    || fail "$VIDEO_SERVICE 必须设置 CPUQuota"
+  [[ -n "$tasks_max" && "$tasks_max" != "infinity" ]] \
+    || fail "$VIDEO_SERVICE 必须设置 TasksMax"
+  [[ " $read_write_paths " == *" $VIDEO_TEMP_ROOT "* ]] \
+    || fail "$VIDEO_SERVICE 必须只读系统并显式放行视频临时目录"
+)
+
+assert_release_environment() {
+  local release="$1" actual
+  [[ -f "$release/release.json" ]] || fail "版本缺少 release.json：$release"
+  actual="$(json_field "$release/release.json" environment 2>/dev/null || true)"
+  if [[ -z "$actual" && "$ENVIRONMENT" == "test" ]]; then
+    return
+  fi
+  [[ "$actual" == "$ENVIRONMENT" ]] \
+    || fail "版本环境与服务器不匹配：${actual:-missing} != $ENVIRONMENT"
+}
+
+validate_production_environment() (
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  [[ "$MONOLITHIC_SECRET_SCOPE_APPROVED" == "true" ]] \
+    || fail "正式服统一 Settings 密钥范围尚未获得安全负责人显式确认"
+  load_app_environment
+  [[ "${APP_ENVIRONMENT:-}" == "production" ]] || fail "正式服 APP_ENVIRONMENT 必须是 production"
+  [[ "${ALLOW_INSECURE_TEST_SETTINGS:-}" == "false" ]] \
+    || fail "正式服必须关闭 ALLOW_INSECURE_TEST_SETTINGS"
+  [[ "${API_DOCS_ENABLED:-}" == "false" ]] || fail "正式服必须关闭 API_DOCS_ENABLED"
+  [[ "${ALLOW_MOCK_WECHAT:-}" == "false" ]] || fail "正式服必须关闭 ALLOW_MOCK_WECHAT"
+  [[ "${REGISTRATION_SMS_VERIFICATION_ENABLED:-}" == "true" ]] \
+    || fail "正式服必须开启注册短信校验"
+  [[ "${GEO_WEBVIEW_COOKIE_SECURE:-}" == "true" ]] \
+    || fail "正式服 GEO WebView Cookie 必须启用 Secure"
+  [[ "${SMS_PROVIDER:-}" != "mock" && -n "${SMS_PROVIDER:-}" ]] \
+    || fail "正式服短信服务不能使用 mock"
+  [[ "${FILE_STORAGE_PROVIDER:-}" == "tencent_cos" ]] \
+    || fail "正式服文件存储必须使用 tencent_cos"
+  [[ "${VIDEO_TRANSCODE_ENABLED:-}" == "true" ]] \
+    || fail "正式服必须启用独立视频转码 Worker"
+  [[ -n "${TENCENT_COS_REGION:-}" && -n "${TENCENT_COS_BUCKET:-}" \
+    && -n "${TENCENT_COS_SECRET_ID:-}" && -n "${TENCENT_COS_SECRET_KEY:-}" ]] \
+    || fail "正式服腾讯云 COS 配置不完整"
+  [[ "${BACKEND_CORS_ORIGIN_REGEX:-}" == "" ]] \
+    || fail "正式服禁止使用 BACKEND_CORS_ORIGIN_REGEX"
+  /usr/bin/python3 - "$PUBLIC_HEALTH_URL" <<'PY'
+import os
+import sys
+from ipaddress import ip_address
+from urllib.parse import urlsplit
+
+
+def unsafe_host(host: str) -> bool:
+    normalized = host.strip().lower().rstrip(".")
+    if not normalized or normalized in {"localhost", "*"}:
+        return True
+    try:
+        return not ip_address(normalized).is_global
+    except ValueError:
+        return normalized.endswith((".local", ".localhost", ".internal"))
+
+
+public_host = urlsplit(sys.argv[1]).hostname or ""
+allowed_hosts = [value.strip() for value in os.getenv("BACKEND_ALLOWED_HOSTS", "").split(",") if value.strip()]
+if not allowed_hosts or public_host not in allowed_hosts or any(unsafe_host(host) for host in allowed_hosts):
+    raise SystemExit("production BACKEND_ALLOWED_HOSTS is unsafe")
+
+origins = [value.strip() for value in os.getenv("BACKEND_CORS_ORIGINS", "").split(",") if value.strip()]
+if not origins:
+    raise SystemExit("production BACKEND_CORS_ORIGINS is empty")
+for origin in origins:
+    parsed = urlsplit(origin)
+    if parsed.scheme != "https" or not parsed.hostname or unsafe_host(parsed.hostname):
+        raise SystemExit("production BACKEND_CORS_ORIGINS must contain public HTTPS origins only")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise SystemExit("production BACKEND_CORS_ORIGINS contains an invalid origin")
+
+redis = urlsplit(os.getenv("REDIS_URL", ""))
+if redis.scheme != "rediss" or not redis.hostname or unsafe_host(redis.hostname):
+    raise SystemExit("production REDIS_URL must use a non-local rediss endpoint")
+
+application = urlsplit(os.environ["DATABASE_URL"])
+migration = urlsplit(os.environ.get("MIGRATION_DATABASE_URL") or os.environ["DATABASE_URL"])
+backup = urlsplit(os.environ.get("BACKUP_DATABASE_URL", ""))
+users = (application.username, migration.username, backup.username)
+if not all(users) or len(set(users)) != 3:
+    raise SystemExit("production runtime, migration and backup database users must all be different")
+PY
+)
+
+validate_offsite_backup_evidence() {
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  assert_root_owned_directory "${OFFSITE_BACKUP_EVIDENCE_FILE%/*}"
+  assert_root_owned_file "$OFFSITE_BACKUP_EVIDENCE_FILE"
+  /usr/bin/python3 - "$OFFSITE_BACKUP_EVIDENCE_FILE" <<'PY'
+from datetime import datetime, timedelta, timezone
+import re
+import sys
+
+values = {}
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if "=" not in line:
+            raise SystemExit("invalid offsite backup evidence line")
+        key, value = (item.strip() for item in line.split("=", 1))
+        if key in values:
+            raise SystemExit("duplicate offsite backup evidence key")
+        values[key] = value
+
+if values.get("PROVIDER") != "tencentdb-postgresql":
+    raise SystemExit("production backup provider evidence is missing")
+if values.get("AUTOMATIC_BACKUP_ENABLED") != "true":
+    raise SystemExit("production automatic backup evidence is missing")
+if values.get("OFFSITE_OR_IMMUTABLE_COPY_ENABLED") != "true":
+    raise SystemExit("production offsite or immutable backup evidence is missing")
+policy = values.get("BACKUP_POLICY_REFERENCE", "")
+if not re.fullmatch(
+    r"tencentdb-postgresql/[a-z0-9-]{3,32}/postgres-[a-z0-9]{6,64}/[A-Za-z0-9._-]{6,128}",
+    policy,
+):
+    raise SystemExit("production backup policy reference is invalid")
+raw_drill = values.get("LAST_RESTORE_DRILL_UTC", "")
+try:
+    drill = datetime.fromisoformat(raw_drill.replace("Z", "+00:00"))
+except ValueError as exc:
+    raise SystemExit("production restore drill timestamp is invalid") from exc
+if drill.tzinfo is None:
+    raise SystemExit("production restore drill timestamp must include UTC offset")
+now = datetime.now(timezone.utc)
+drill = drill.astimezone(timezone.utc)
+if drill > now + timedelta(minutes=5) or drill < now - timedelta(days=90):
+    raise SystemExit("production restore drill must be successful within the last 90 days")
+PY
+}
+
 validate_server_contract() {
-  local deploy_uid service_uid build_uid build_home build_shell
+  local deploy_uid service_uid build_uid build_home build_shell role user uid user_shell
+  local -A production_uids=()
   [[ "$STAGING_ROOT" == "$REMOTE_ROOT/incoming" ]] || fail "staging 必须位于受控后端根目录"
   [[ "$CURRENT_LINK" == "$REMOTE_ROOT/backend-current" ]] || fail "current link 必须位于受控后端根目录"
   assert_root_owned_directory "$REMOTE_ROOT"
   assert_root_owned_directory "$RELEASES_ROOT"
   assert_root_owned_directory "$STAGING_ROOT"
   validate_environment_files
+  validate_base_database_isolation
   validate_runtime_tools
   validate_units
+	validate_service_user_contract
+	validate_database_ca_service_contract
+	validate_oneshot_contract
   id "$DEPLOY_USER" >/dev/null 2>&1 || fail "部署用户不存在"
   id "$SERVICE_USER" >/dev/null 2>&1 || fail "服务用户不存在"
   id "$BUILD_USER" >/dev/null 2>&1 || fail "构建用户不存在"
@@ -181,7 +888,38 @@ validate_server_contract() {
   service_uid="$(id -u "$SERVICE_USER")"
   build_uid="$(id -u "$BUILD_USER")"
   [[ "$build_uid" != "0" && "$build_uid" != "$deploy_uid" && "$build_uid" != "$service_uid" ]] \
-    || fail "构建用户 UID 必须非 root 且与部署用户、服务用户分离"
+		|| fail "构建用户 UID 必须非 root 且与部署用户、服务用户分离"
+  if [[ "$ENVIRONMENT" == "production" && "$deploy_uid" == "$service_uid" ]]; then
+    fail "正式服部署用户与服务用户必须使用不同 UID"
+  fi
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    if id -nG "$DEPLOY_USER" | tr ' ' '\n' | grep -Eq '^(root|sudo|admin|wheel)$'; then
+      fail "正式服发布用户不能属于通用提权组"
+    fi
+    for role in deploy api video im jobs migrate build backup; do
+      case "$role" in
+        deploy) user="$DEPLOY_USER" ;;
+        api) user="$SERVICE_USER" ;;
+        video) user="$VIDEO_SERVICE_USER" ;;
+        im) user="$IM_SERVICE_USER" ;;
+        jobs) user="$JOB_SERVICE_USER" ;;
+        migrate) user="$MIGRATION_USER" ;;
+        build) user="$BUILD_USER" ;;
+        backup) user="$BACKUP_USER" ;;
+      esac
+      id "$user" >/dev/null 2>&1 || fail "正式服缺少 $role 系统用户：$user"
+      uid="$(id -u "$user")"
+      [[ "$uid" != "0" ]] || fail "正式服 $role 系统用户不能是 root"
+      if [[ "$role" != "deploy" ]]; then
+        user_shell="$(getent passwd "$user" | awk -F: '{print $7}')"
+        [[ "$user_shell" == "/usr/sbin/nologin" || "$user_shell" == "/sbin/nologin" ]] \
+          || fail "正式服 $role 系统用户必须禁止交互登录"
+      fi
+      [[ -z "${production_uids[$uid]:-}" ]] \
+        || fail "正式服进程 UID 必须隔离：$role 与 ${production_uids[$uid]} 共用 $uid"
+      production_uids[$uid]="$role"
+    done
+  fi
   build_home="$(getent passwd "$BUILD_USER" | awk -F: '{print $6}')"
   build_shell="$(getent passwd "$BUILD_USER" | awk -F: '{print $7}')"
   [[ -n "$build_home" && -d "$build_home" && ! -L "$build_home" ]] \
@@ -193,6 +931,34 @@ validate_server_contract() {
   [[ "$build_shell" == "/usr/sbin/nologin" || "$build_shell" == "/sbin/nologin" ]] \
     || fail "构建用户必须禁止交互登录"
   validate_backup_root
+	[[ "$(backup_root_available_bytes)" -ge "$BACKUP_MIN_FREE_BYTES" ]] \
+		|| fail "数据库备份目录剩余空间低于发布门禁：$BACKUP_MIN_FREE_BYTES bytes"
+	if [[ "$ENVIRONMENT" == "production" ]]; then
+		assert_root_owned_directory "${DATABASE_CA_FILE%/*}"
+		assert_root_owned_file "$DATABASE_CA_FILE"
+		getent group "$DATABASE_CA_GROUP" >/dev/null || fail "数据库 CA 专用组不存在：$DATABASE_CA_GROUP"
+		[[ "$(stat -c '%G' "${DATABASE_CA_FILE%/*}")" == "$DATABASE_CA_GROUP" \
+		  && "$(stat -c '%a' "${DATABASE_CA_FILE%/*}")" == "750" ]] \
+			|| fail "数据库 CA 目录必须是 root:$DATABASE_CA_GROUP 0750"
+		[[ "$(stat -c '%G' "$DATABASE_CA_FILE")" == "$DATABASE_CA_GROUP" \
+		  && "$(stat -c '%a' "$DATABASE_CA_FILE")" == "640" ]] \
+			|| fail "数据库 CA 文件必须是 root:$DATABASE_CA_GROUP 0640"
+		for user in "$SERVICE_USER" "$VIDEO_SERVICE_USER" "$IM_SERVICE_USER" \
+		  "$JOB_SERVICE_USER" "$MIGRATION_USER" "$BACKUP_USER"; do
+			id -nG "$user" | tr ' ' '\n' | grep -Fxq "$DATABASE_CA_GROUP" \
+				|| fail "$user 未加入数据库 CA 专用组 $DATABASE_CA_GROUP"
+			run_as_clean "$user" /usr/bin/test -r "$DATABASE_CA_FILE" \
+				|| fail "$user 无法读取数据库 CA 文件"
+		done
+		validate_offsite_backup_evidence
+	fi
+	validate_production_environment
+	local current_release
+	current_release="$(current_target)"
+	if [[ "$current_release" != "NONE" ]]; then
+		assert_release_environment "$current_release"
+	fi
+  validate_video_runtime
 }
 
 acquire_lock() {
@@ -213,6 +979,216 @@ current_target() {
 	[[ "$target" == "$RELEASES_ROOT/"*/backend ]] || fail "backend-current 目标不在受控版本目录"
 	assert_installed_release_safety "$target"
   printf '%s\n' "$target"
+}
+
+recovery_marker_exists() {
+  [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]
+}
+
+load_recovery_marker() {
+  local marker_output
+  local -a fields
+  recovery_marker_exists || fail "不存在数据库迁移恢复标记"
+  assert_root_secret_file "$RECOVERY_FILE"
+  [[ "$(stat -c '%s' "$RECOVERY_FILE")" -le 8192 ]] || fail "数据库迁移恢复标记过大"
+  if ! marker_output="$(/usr/bin/python3 - "$RECOVERY_FILE" "$RELEASES_ROOT" \
+    "$ENVIRONMENT" "$DATABASE_NAME" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+marker_path = Path(sys.argv[1])
+releases_root = sys.argv[2]
+expected_environment = sys.argv[3]
+expected_database = sys.argv[4]
+allowed = {
+    "SCHEMA_VERSION",
+    "RELEASE_ID",
+    "RELEASE_PATH",
+    "PREVIOUS_CURRENT",
+    "DATABASE_PROFILE",
+    "INITIAL",
+    "PHASE",
+    "START_DB_REVISION",
+    "ENVIRONMENT",
+    "DATABASE_NAME",
+    "TARGET_REVISION",
+    "COMMIT",
+    "CHECKSUMS_SHA256",
+}
+values = {}
+with marker_path.open(encoding="utf-8") as handle:
+    for line_number, raw in enumerate(handle, 1):
+        line = raw.rstrip("\r\n")
+        if not line or "=" not in line:
+            raise SystemExit(f"invalid recovery marker line {line_number}")
+        key, value = line.split("=", 1)
+        if key not in allowed or key in values:
+            raise SystemExit(f"invalid recovery marker key {key}")
+        if not value or any(character.isspace() for character in value):
+            raise SystemExit(f"invalid recovery marker value for {key}")
+        values[key] = value
+if set(values) != allowed or values["SCHEMA_VERSION"] != "1":
+    raise SystemExit("invalid recovery marker schema")
+if values["ENVIRONMENT"] != expected_environment or values["DATABASE_NAME"] != expected_database:
+    raise SystemExit("recovery marker environment/database mismatch")
+release_id = values["RELEASE_ID"]
+if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}", release_id):
+    raise SystemExit("invalid recovery release id")
+release_path = values["RELEASE_PATH"]
+if release_path != f"{releases_root}/{release_id}/backend":
+    raise SystemExit("recovery release path is outside the controlled release root")
+previous = values["PREVIOUS_CURRENT"]
+if previous != "NONE" and not re.fullmatch(
+    re.escape(releases_root) + r"/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}/backend",
+    previous,
+):
+    raise SystemExit("recovery previous release path is invalid")
+if values["DATABASE_PROFILE"] not in {"local", "cloud"}:
+    raise SystemExit("invalid recovery database profile")
+if values["INITIAL"] not in {"true", "false"}:
+    raise SystemExit("invalid recovery initial flag")
+if values["PHASE"] not in {"prepared", "stopped", "migrating"}:
+    raise SystemExit("invalid recovery phase")
+if not re.fullmatch(r"[A-Za-z0-9_]+", values["START_DB_REVISION"]):
+    raise SystemExit("invalid recovery start database revision")
+if not re.fullmatch(r"[A-Za-z0-9_]+", values["TARGET_REVISION"]):
+    raise SystemExit("invalid recovery target database revision")
+if not re.fullmatch(r"[0-9a-f]{40}", values["COMMIT"]):
+    raise SystemExit("invalid recovery commit")
+if not re.fullmatch(r"[0-9a-f]{64}", values["CHECKSUMS_SHA256"]):
+    raise SystemExit("invalid recovery checksums digest")
+release_json = Path(release_path, "release.json")
+checksums = Path(release_path, "SHA256SUMS")
+metadata = json.loads(release_json.read_text(encoding="utf-8"))
+if (
+    metadata.get("release_id") != release_id
+    or metadata.get("environment") != expected_environment
+    or metadata.get("artifact_db_head") != values["TARGET_REVISION"]
+    or metadata.get("commit") != values["COMMIT"]
+):
+    raise SystemExit("recovery marker release metadata mismatch")
+if hashlib.sha256(checksums.read_bytes()).hexdigest() != values["CHECKSUMS_SHA256"]:
+    raise SystemExit("recovery marker checksums digest mismatch")
+for key in (
+    "RELEASE_ID",
+    "RELEASE_PATH",
+    "PREVIOUS_CURRENT",
+    "DATABASE_PROFILE",
+    "INITIAL",
+    "PHASE",
+    "START_DB_REVISION",
+    "TARGET_REVISION",
+    "COMMIT",
+    "CHECKSUMS_SHA256",
+):
+    print(values[key])
+PY
+)"; then
+    fail "数据库迁移恢复标记格式非法"
+  fi
+  mapfile -t fields <<<"$marker_output"
+  [[ "${#fields[@]}" == "10" ]] || fail "数据库迁移恢复标记字段数量非法"
+  RECOVERY_RELEASE_ID="${fields[0]}"
+  RECOVERY_RELEASE="${fields[1]}"
+  RECOVERY_PREVIOUS_CURRENT="${fields[2]}"
+  RECOVERY_DATABASE_PROFILE="${fields[3]}"
+  RECOVERY_INITIAL="${fields[4]}"
+  RECOVERY_PHASE="${fields[5]}"
+  RECOVERY_START_DB_REVISION="${fields[6]}"
+  RECOVERY_TARGET_REVISION="${fields[7]}"
+  RECOVERY_COMMIT="${fields[8]}"
+  RECOVERY_CHECKSUMS_SHA256="${fields[9]}"
+  [[ -d "$RECOVERY_RELEASE" && ! -L "$RECOVERY_RELEASE" ]] \
+    || fail "恢复标记指向的版本不存在"
+  assert_installed_release_safety "$RECOVERY_RELEASE"
+  assert_release_environment "$RECOVERY_RELEASE"
+  verify_source_checksums "$RECOVERY_RELEASE" false
+  [[ "$(json_field "$RECOVERY_RELEASE/release.json" release_id)" == "$RECOVERY_RELEASE_ID" ]] \
+    || fail "恢复标记与版本元数据不一致"
+  if [[ "$RECOVERY_PREVIOUS_CURRENT" != "NONE" ]]; then
+    [[ -d "$RECOVERY_PREVIOUS_CURRENT" && ! -L "$RECOVERY_PREVIOUS_CURRENT" ]] \
+      || fail "恢复标记中的上一版本不存在"
+    assert_installed_release_safety "$RECOVERY_PREVIOUS_CURRENT"
+    assert_release_environment "$RECOVERY_PREVIOUS_CURRENT"
+  fi
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    [[ "$RECOVERY_DATABASE_PROFILE" == "cloud" ]] \
+      || fail "正式服恢复标记必须使用 cloud 数据库"
+  fi
+}
+
+write_recovery_marker() (
+  local release_id="$1" release="$2" previous="$3" initial="$4" phase="$5"
+  local start_db_revision="$6" expected_token="$7" temporary current_token=NONE
+  local target_revision commit checksums_sha
+  valid_release_id "$release_id" || fail "恢复标记 release_id 非法"
+  [[ "$release" == "$RELEASES_ROOT/$release_id/backend" ]] \
+    || fail "恢复标记版本路径非法"
+  [[ -d "$release" && ! -L "$release" ]] || fail "恢复标记版本不存在"
+  assert_installed_release_safety "$release"
+  verify_source_checksums "$release" false
+  [[ "$previous" == "NONE" || "$previous" == "$RELEASES_ROOT/"*/backend ]] \
+    || fail "恢复标记上一版本路径非法"
+  [[ "$initial" == "true" || "$initial" == "false" ]] || fail "恢复标记 initial 非法"
+  [[ "$phase" == "prepared" || "$phase" == "stopped" || "$phase" == "migrating" ]] \
+    || fail "恢复标记 phase 非法"
+  valid_revision "$start_db_revision" || fail "恢复标记起始 DB revision 非法"
+  [[ "$SELECTED_DATABASE_PROFILE" == "local" || "$SELECTED_DATABASE_PROFILE" == "cloud" ]] \
+    || fail "恢复标记数据库 profile 非法"
+  if recovery_marker_exists; then current_token="$(recovery_marker_token)"; fi
+  [[ "$current_token" == "$expected_token" ]] \
+    || fail "恢复标记 CAS 已变化，拒绝覆盖"
+  target_revision="$(json_field "$release/release.json" artifact_db_head)"
+  commit="$(json_field "$release/release.json" commit)"
+  checksums_sha="$(sha256sum "$release/SHA256SUMS" | awk '{print $1}')"
+  valid_revision "$target_revision" || fail "恢复标记目标 DB revision 非法"
+  valid_commit "$commit" || fail "恢复标记 commit 非法"
+  valid_sha256 "$checksums_sha" || fail "恢复标记 checksums digest 非法"
+  temporary="$(mktemp "$REMOTE_ROOT/.migration-recovery-required.XXXXXX")"
+  trap 'rm -f -- "$temporary"' EXIT INT TERM HUP
+  chmod 0600 "$temporary"
+  chown root:root "$temporary"
+  printf '%s\n' \
+    'SCHEMA_VERSION=1' \
+    "RELEASE_ID=$release_id" \
+    "RELEASE_PATH=$release" \
+    "PREVIOUS_CURRENT=$previous" \
+    "DATABASE_PROFILE=$SELECTED_DATABASE_PROFILE" \
+    "INITIAL=$initial" \
+    "ENVIRONMENT=$ENVIRONMENT" \
+    "DATABASE_NAME=$SELECTED_DATABASE_NAME" \
+    "TARGET_REVISION=$target_revision" \
+    "COMMIT=$commit" \
+    "CHECKSUMS_SHA256=$checksums_sha" > "$temporary"
+  printf '%s\n' \
+    "PHASE=$phase" \
+    "START_DB_REVISION=$start_db_revision" >> "$temporary"
+  mv -fT -- "$temporary" "$RECOVERY_FILE"
+  trap - EXIT INT TERM HUP
+  assert_root_secret_file "$RECOVERY_FILE"
+)
+
+recovery_marker_token() {
+  assert_root_secret_file "$RECOVERY_FILE"
+  sha256sum "$RECOVERY_FILE" | awk '{print $1}'
+}
+
+clear_recovery_marker() {
+  local expected_token="$1" actual_token
+  recovery_marker_exists || fail "恢复标记已意外消失"
+  assert_root_secret_file "$RECOVERY_FILE"
+  actual_token="$(recovery_marker_token)"
+  [[ "$actual_token" == "$expected_token" ]] || fail "恢复标记 CAS 已变化，拒绝清除"
+  rm -f -- "$RECOVERY_FILE"
+}
+
+assert_no_recovery_marker() {
+  recovery_marker_exists \
+    && fail "检测到数据库迁移恢复标记；普通发布/回滚已锁定，请使用 backend recover"
+  return 0
 }
 
 load_app_environment() {
@@ -285,21 +1261,129 @@ PY
   rm -f -- "$parsed_file"
 }
 
+clear_runner_environment() {
+  local entry key
+  while IFS= read -r -d '' entry; do
+    key="${entry%%=*}"
+    unset "$key" 2>/dev/null || true
+  done < <(/usr/bin/env -0)
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8
+  unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+}
+
 run_in_release() (
   local release="$1"
   shift
   cd "$release"
+  clear_runner_environment
   load_app_environment
+  unset MIGRATION_DATABASE_URL BACKUP_DATABASE_URL
   export HOME="$(getent passwd "$SERVICE_USER" | awk -F: '{print $6}')"
   export USER="$SERVICE_USER" LOGNAME="$SERVICE_USER" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-  runuser -u "$SERVICE_USER" --preserve-environment -- "$@"
+  /usr/sbin/runuser -u "$SERVICE_USER" --preserve-environment -- "$@"
 )
 
-db_revision_for_release() {
-  local release="$1"
+run_migration_in_release() (
+  local release="$1" migration_url
+  shift
+  cd "$release"
+  clear_runner_environment
+  load_app_environment
+  migration_url="${MIGRATION_DATABASE_URL:-${DATABASE_URL:-}}"
+  [[ -n "$migration_url" ]] || fail "迁移运行器缺少数据库 URL"
+  export DATABASE_URL="$migration_url"
+  unset MIGRATION_DATABASE_URL BACKUP_DATABASE_URL
+  export HOME="$(getent passwd "$MIGRATION_USER" | awk -F: '{print $6}')"
+  export USER="$MIGRATION_USER" LOGNAME="$MIGRATION_USER" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+  /usr/sbin/runuser -u "$MIGRATION_USER" --preserve-environment -- "$@"
+)
+
+run_backup_in_release() (
+  local release="$1" backup_url
+  shift
+  cd "$release"
+  clear_runner_environment
+  load_app_environment
+  backup_url="${BACKUP_DATABASE_URL:-}"
+  if [[ "$ENVIRONMENT" != "production" && -z "$backup_url" ]]; then
+    backup_url="${MIGRATION_DATABASE_URL:-${DATABASE_URL:-}}"
+  fi
+  [[ -n "$backup_url" ]] || fail "备份运行器缺少独立只读数据库 URL"
+  clear_runner_environment
+  export DATABASE_URL="$backup_url"
+  export HOME="$(getent passwd "$BACKUP_USER" | awk -F: '{print $6}')"
+  export USER="$BACKUP_USER" LOGNAME="$BACKUP_USER" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+  /usr/sbin/runuser -u "$BACKUP_USER" --preserve-environment -- "$@"
+)
+
+db_revision_for_release_as() {
+  local runner="$1" release="$2"
+  [[ "$runner" == "run_in_release" || "$runner" == "run_migration_in_release" ]] \
+    || fail "数据库 revision 检查运行器非法"
   [[ -x "$release/.venv/bin/python" ]] || fail "版本缺少 Python：$release"
-  run_in_release "$release" "$release/.venv/bin/python" -c \
-    'from sqlalchemy import text; from app.db.session import engine; c=engine.connect(); print(c.execute(text("select version_num from alembic_version")).scalar_one()); c.close()'
+  "$runner" "$release" "$release/.venv/bin/python" -c \
+    'from sqlalchemy import text
+from app.db.session import engine
+
+managed_public_tables = {"pg_stat_statements", "pg_stat_statements_info"}
+
+with engine.connect() as connection:
+    has_alembic_version = connection.execute(
+        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+        {"table_name": "public.alembic_version"},
+    ).scalar_one()
+    if has_alembic_version:
+        revisions = connection.execute(
+            text("SELECT version_num FROM public.alembic_version")
+        ).scalars().all()
+        if len(revisions) != 1:
+            raise SystemExit("alembic_version must contain exactly one revision")
+        print(revisions[0])
+    else:
+        tables = connection.execute(
+            text("""
+                SELECT namespace.nspname, object.relname
+                FROM pg_catalog.pg_class object
+                JOIN pg_catalog.pg_namespace namespace
+                  ON namespace.oid = object.relnamespace
+                WHERE object.relkind IN (:ordinary_table, :partitioned_table)
+                  AND namespace.nspname NOT IN (:pg_catalog, :information_schema)
+                  AND namespace.nspname !~ :toast_pattern
+                ORDER BY namespace.nspname, object.relname
+            """),
+            {
+                "ordinary_table": "r",
+                "partitioned_table": "p",
+                "pg_catalog": "pg_catalog",
+                "information_schema": "information_schema",
+                "toast_pattern": "^pg_toast",
+            },
+        ).all()
+        application_tables = [
+            f"{schema}.{name}"
+            for schema, name in tables
+            if not (
+                schema == "public"
+                and (
+                    name in managed_public_tables
+                    or name.startswith("tencentdb_tbl_dial_test_")
+                )
+            )
+        ]
+        if application_tables:
+            names = ", ".join(application_tables[:5])
+            raise SystemExit(
+                "unversioned non-empty database; refusing automatic migration: " + names
+            )
+        print("base")'
+}
+
+db_revision_for_release() {
+  db_revision_for_release_as run_in_release "$1"
+}
+
+migration_db_revision_for_release() {
+  db_revision_for_release_as run_migration_in_release "$1"
 }
 
 current_db_revision() {
@@ -369,6 +1453,7 @@ verify_release_metadata() {
   [[ "$(json_field "$backend/release.json" release_id)" == "$release_id" ]] || fail "release_id 不匹配"
   [[ "$(json_field "$backend/release.json" commit)" == "$commit" ]] || fail "commit 不匹配"
   [[ "$(json_field "$backend/release.json" artifact_db_head)" == "$db_head" ]] || fail "DB head 不匹配"
+	assert_release_environment "$backend"
   [[ "$(json_field "$backend/release.json" database_rollback_policy)" == "NO_AUTOMATIC_DOWNGRADE_OR_RESTORE" ]] \
     || fail "数据库回滚策略不匹配"
 }
@@ -392,28 +1477,44 @@ assert_installed_release_safety() {
 }
 
 install_runtime() {
-  local backend="$1" expected_checksums="$2" build_dir build_source build_home build_group
+  local backend="$1" expected_checksums="$2" build_dir build_source build_home build_group uv_cache runtime_user
   build_dir="${backend%/*}/.runtime-build"
   build_source="$build_dir/source"
   build_home="$(getent passwd "$BUILD_USER" | awk -F: '{print $6}')"
   [[ -n "$build_home" && -d "$build_home" ]] || fail "构建用户 HOME 无效"
   build_group="$(id -gn "$BUILD_USER")"
+  uv_cache="$build_home/.cache/uv"
+  install -d -m 0700 -o "$BUILD_USER" -g "$build_group" -- "$uv_cache"
   install -d -m 0700 -o "$BUILD_USER" -g "$build_group" -- "$build_dir" "$build_source"
   cp -a --no-preserve=ownership -- "$backend/." "$build_source/"
   chown -hR "$BUILD_USER:$build_group" "$build_source"
   install -d -m 0700 -o "$BUILD_USER" -g "$build_group" -- "$backend/.venv"
-  runuser -u "$BUILD_USER" -- /usr/bin/env \
-    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" venv --python "$BASE_PYTHON" --seed "$backend/.venv"
-  runuser -u "$BUILD_USER" -- /usr/bin/env \
-    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
+    "$UV_BIN" pip install \
+      --python "$backend/.venv/bin/python" \
+      --constraint "$backend/runtime-constraints.txt" \
+      setuptools
+  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" pip install \
       --python "$backend/.venv/bin/python" \
       --no-build-isolation \
       --constraint "$backend/runtime-constraints.txt" \
       "$build_source"
-  runuser -u "$BUILD_USER" -- /usr/bin/env \
-    HOME="$build_home" UV_CACHE_DIR="$build_dir/cache" UV_LINK_MODE=copy \
+  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" pip freeze --python "$backend/.venv/bin/python" \
       > "$backend/installed-requirements.txt"
   rm -rf -- "$build_dir"
@@ -424,20 +1525,29 @@ install_runtime() {
   verify_source_checksums "$backend" false
   assert_installed_release_safety "$backend"
   [[ -x "$backend/.venv/bin/python" ]] || fail "新版本虚拟环境无效"
-  runuser -u "$SERVICE_USER" -- "$backend/.venv/bin/python" -c \
-    'import sys; raise SystemExit(0 if sys.prefix else 1)' \
-    || fail "服务用户无法执行新版本虚拟环境"
+  for runtime_user in "$SERVICE_USER" "$MIGRATION_USER"; do
+    run_as_clean "$runtime_user" /usr/bin/env -i \
+      HOME="$(getent passwd "$runtime_user" | awk -F: '{print $6}')" \
+      USER="$runtime_user" LOGNAME="$runtime_user" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      "$backend/.venv/bin/python" -I -S -c \
+      'import sys; raise SystemExit(0 if sys.prefix else 1)' \
+      || fail "$runtime_user 无法执行新版本虚拟环境"
+  done
 }
 
-assert_database_targets() {
-  local backend="$1"
-  run_in_release "$backend" "$backend/.venv/bin/python" -c '
+assert_database_target_for_runner() {
+  local runner="$1" backend="$2"
+  [[ "$runner" == "run_in_release" || "$runner" == "run_migration_in_release" \
+    || "$runner" == "run_backup_in_release" ]] \
+    || fail "数据库目标检查运行器非法"
+  "$runner" "$backend" "$backend/.venv/bin/python" -c '
 import os
 import sys
+from ipaddress import ip_address
 from sqlalchemy.engine import make_url
 from sqlalchemy import create_engine, text
 
-expected_database = sys.argv[1]
+expected_database, expected_profile, cloud_host, environment, expected_ca = sys.argv[1:6]
 targets = {}
 application_url = os.getenv("DATABASE_URL")
 for name, raw in (
@@ -452,51 +1562,613 @@ for name, raw in (
     forbidden_routing_keys = {"host", "hostaddr", "port", "service", "servicefile", "dbname"}
     if forbidden_routing_keys.intersection(url.query):
         raise SystemExit(f"{name} contains forbidden connection-routing query parameters")
+    configured_host = url.host
+    configured_port = url.port or 5432
+    if environment == "production":
+        if url.query.get("sslmode") != "verify-full":
+            raise SystemExit(f"{name} must use sslmode=verify-full in production")
+        if url.query.get("sslrootcert") != expected_ca:
+            raise SystemExit(f"{name} must use the configured production CA file")
+    if configured_port != 5432:
+        raise SystemExit(f"{name} is not using the configured PostgreSQL endpoint port")
     engine = create_engine(raw, pool_pre_ping=True)
     try:
         with engine.connect() as connection:
-            database, address, port = connection.execute(
-                text("SELECT current_database(), inet_server_addr()::text, inet_server_port()")
+            database, address, port, tls_active = connection.execute(
+                text("""
+                    SELECT current_database(), inet_server_addr()::text, inet_server_port(),
+                           COALESCE((SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()), false)
+                """)
             ).one()
     except Exception:
         raise SystemExit(f"unable to verify {name} target") from None
     finally:
         engine.dispose()
-    if database != expected_database or address not in {None, "127.0.0.1", "::1"} or port != 5432:
-        raise SystemExit(f"{name} does not match the configured local backup target")
-    targets[name] = (address or "local", port, database)
+    normalized_address = None if address is None else address.split("/", 1)[0]
+    if database != expected_database:
+        raise SystemExit(f"{name} does not connect to the configured database")
+    if environment == "production" and not tls_active:
+        raise SystemExit(f"{name} production connection is not using TLS")
+    if expected_profile == "local":
+        try:
+            configured_is_loopback = ip_address(configured_host).is_loopback
+        except (TypeError, ValueError):
+            configured_is_loopback = (
+                isinstance(configured_host, str) and configured_host.lower() == "localhost"
+            )
+        if not configured_is_loopback:
+            raise SystemExit(f"{name} is not configured for local PostgreSQL")
+        if normalized_address is not None and not ip_address(normalized_address).is_loopback:
+            raise SystemExit(f"{name} is not the configured local PostgreSQL target")
+        if port != configured_port:
+            raise SystemExit(f"{name} does not match the configured local PostgreSQL port")
+        normalized_target = ("local", configured_host, configured_port)
+    elif expected_profile == "cloud":
+        if configured_host != cloud_host:
+            raise SystemExit(f"{name} is not the configured TencentDB PostgreSQL target")
+        # TencentDB may sit behind a proxy/NAT endpoint. In that topology,
+        # inet_server_addr()/inet_server_port() identify the selected backend
+        # node rather than the configured client endpoint, so they must not be
+        # compared with cloud_host:5432. The URL endpoint is checked above and
+        # the live connection still has to report the expected database name.
+        normalized_target = ("cloud", configured_host, configured_port)
+    else:
+        raise SystemExit("invalid expected database profile")
+    targets[name] = (normalized_target, database)
 if targets["DATABASE_URL"] != targets["MIGRATION_DATABASE_URL"]:
     raise SystemExit("application and migration database targets differ")
-' "$DATABASE_NAME"
+print(repr(targets["DATABASE_URL"]))
+' "$SELECTED_DATABASE_NAME" "$SELECTED_DATABASE_PROFILE" "$CLOUD_DATABASE_HOST" \
+    "$ENVIRONMENT" "$DATABASE_CA_FILE"
+}
+
+assert_database_targets() {
+  local backend="$1" runtime_target migration_target backup_target
+  runtime_target="$(assert_database_target_for_runner run_in_release "$backend")"
+  migration_target="$(assert_database_target_for_runner run_migration_in_release "$backend")"
+  backup_target="$(assert_database_target_for_runner run_backup_in_release "$backend")"
+  [[ "$runtime_target" == "$migration_target" && "$runtime_target" == "$backup_target" ]] \
+    || fail "runtime, migration and backup database targets differ"
+}
+
+validate_target_application_contract() {
+  local backend="$1"
+  local required_script
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    for required_script in \
+      scripts/run_video_transcode_worker.py \
+      scripts/run_tencent_im_callback_worker.py \
+      scripts/run_app_push_dispatcher.py \
+      scripts/run_rent_billing_jobs.py \
+      scripts/run_file_storage_cleanup.py; do
+      [[ -f "$backend/$required_script" && ! -L "$backend/$required_script" ]] \
+        || fail "正式服产物缺少受控运行脚本：$required_script"
+    done
+  fi
+  run_in_release "$backend" "$backend/.venv/bin/python" -c \
+    'from app.core.config import Settings; Settings(_env_file=None)'
+}
+
+validate_runtime_database_privileges() {
+  local backend="$1" mode="${2:-full}"
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  [[ "$mode" == "safety" || "$mode" == "full" ]] || fail "runtime 权限检查模式非法"
+  run_in_release "$backend" "$backend/.venv/bin/python" - "$mode" <<'PY'
+from sqlalchemy import create_engine, text
+import os
+import sys
+
+engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+with engine.connect() as connection:
+    role = dict(connection.execute(text("""
+        SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication,
+               r.rolbypassrls,
+               has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+               has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_db,
+               has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp,
+               EXISTS (SELECT 1 FROM pg_roles inherited
+                 WHERE inherited.rolname <> current_user
+                   AND pg_has_role(current_user,inherited.oid,'MEMBER')
+                   AND (inherited.rolsuper OR inherited.rolcreatedb OR inherited.rolcreaterole
+                     OR inherited.rolreplication OR inherited.rolbypassrls)) AS dangerous_membership,
+               (SELECT count(*) FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+                   AND n.nspname !~ '^pg_toast'
+                   AND c.relkind IN ('r','p','S','v','m','f')
+                   AND c.relname NOT IN ('pg_stat_statements','pg_stat_statements_info')
+                   AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+                   AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                     WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+                   AND pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned_objects
+          FROM pg_roles r WHERE r.rolname = current_user
+    """)).mappings().one())
+    dangerous = [
+        key for key in ('rolsuper','rolcreatedb','rolcreaterole','rolreplication',
+                        'rolbypassrls','can_create_db','can_temp','dangerous_membership')
+        if role[key]
+    ]
+    if dangerous or not role['can_connect'] or role['owned_objects']:
+        raise SystemExit('runtime database role has unsafe role/database privileges')
+    unsafe_schemas = connection.execute(text("""
+        SELECT n.nspname FROM pg_namespace n
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast'
+           AND has_schema_privilege(current_user, n.oid, 'CREATE')
+    """)).scalars().all()
+    if unsafe_schemas:
+        raise SystemExit('runtime database role can CREATE in an application schema')
+    missing_schema_usage = connection.execute(text("""
+        SELECT DISTINCT n.nspname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast'
+           AND c.relkind IN ('r','p','S','v','m','f')
+           AND c.relname NOT IN ('pg_stat_statements','pg_stat_statements_info')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT has_schema_privilege(current_user, n.oid, 'USAGE')
+    """)).scalars().all()
+    missing_table_dml = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind IN ('r','p')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT (n.nspname='public' AND c.relname='alembic_version')
+           AND NOT (has_table_privilege(current_user,c.oid,'SELECT')
+                AND has_table_privilege(current_user,c.oid,'INSERT')
+                AND has_table_privilege(current_user,c.oid,'UPDATE')
+                AND has_table_privilege(current_user,c.oid,'DELETE'))
+    """)).scalars().all()
+    unsafe_table_grants = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind IN ('r','p')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND (has_table_privilege(current_user,c.oid,'TRUNCATE')
+             OR has_table_privilege(current_user,c.oid,'REFERENCES')
+             OR has_table_privilege(current_user,c.oid,'TRIGGER'))
+    """)).scalars().all()
+    unsafe_alembic_grants = connection.execute(text("""
+        SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname='public' AND c.relname='alembic_version'
+           AND (NOT has_table_privilege(current_user,c.oid,'SELECT')
+             OR has_table_privilege(current_user,c.oid,'INSERT')
+             OR has_table_privilege(current_user,c.oid,'UPDATE')
+             OR has_table_privilege(current_user,c.oid,'DELETE')
+             OR has_table_privilege(current_user,c.oid,'TRUNCATE')
+             OR has_table_privilege(current_user,c.oid,'REFERENCES')
+             OR has_table_privilege(current_user,c.oid,'TRIGGER'))
+    """)).scalars().all()
+    missing_sequences = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind='S'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT (has_sequence_privilege(current_user,c.oid,'USAGE')
+                AND has_sequence_privilege(current_user,c.oid,'SELECT')
+                AND has_sequence_privilege(current_user,c.oid,'UPDATE'))
+    """)).scalars().all()
+if unsafe_schemas or unsafe_table_grants or unsafe_alembic_grants:
+    raise SystemExit('runtime database role has unsafe schema/table privileges')
+if sys.argv[1] == 'safety':
+    print('runtime database role safety verified')
+    raise SystemExit(0)
+if missing_schema_usage or missing_table_dml or missing_sequences:
+    raise SystemExit('runtime database grants do not match the required DML-only contract')
+print('runtime database privilege contract verified')
+PY
+}
+
+validate_backup_database_privileges() {
+  local backend="$1" mode="${2:-full}"
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  [[ "$mode" == "safety" || "$mode" == "full" ]] || fail "backup 权限检查模式非法"
+  run_backup_in_release "$backend" "$backend/.venv/bin/python" - "$mode" <<'PY'
+from sqlalchemy import create_engine, text
+import os
+import sys
+
+engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+with engine.connect() as connection:
+    role = dict(connection.execute(text("""
+        SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication,
+               r.rolbypassrls,
+               has_database_privilege(current_user, current_database(), 'CONNECT') AS can_connect,
+               has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_db,
+               has_database_privilege(current_user, current_database(), 'TEMP') AS can_temp,
+               EXISTS (SELECT 1 FROM pg_roles inherited
+                 WHERE inherited.rolname <> current_user
+                   AND pg_has_role(current_user,inherited.oid,'MEMBER')
+                   AND (inherited.rolsuper OR inherited.rolcreatedb OR inherited.rolcreaterole
+                     OR inherited.rolreplication OR inherited.rolbypassrls)) AS dangerous_membership,
+               (SELECT count(*) FROM pg_class c
+                  JOIN pg_namespace n ON n.oid=c.relnamespace
+                 WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+                   AND n.nspname !~ '^pg_toast'
+                   AND c.relkind IN ('r','p','S','v','m','f')
+                   AND c.relname NOT IN ('pg_stat_statements','pg_stat_statements_info')
+                   AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+                   AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                     WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+                   AND pg_has_role(current_user,c.relowner,'MEMBER')) AS owned_objects
+          FROM pg_roles r WHERE r.rolname=current_user
+    """)).mappings().one())
+    dangerous = [
+        key for key in ('rolsuper','rolcreatedb','rolcreaterole','rolreplication',
+                        'rolbypassrls','can_create_db','can_temp','dangerous_membership')
+        if role[key]
+    ]
+    if dangerous or not role['can_connect'] or role['owned_objects']:
+        raise SystemExit('backup database role has unsafe role/database privileges')
+    unsafe_schemas = connection.execute(text("""
+        SELECT n.nspname FROM pg_namespace n
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast'
+           AND has_schema_privilege(current_user,n.oid,'CREATE')
+    """)).scalars().all()
+    unsafe_tables = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind IN ('r','p')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND (has_table_privilege(current_user,c.oid,'INSERT')
+             OR has_table_privilege(current_user,c.oid,'UPDATE')
+             OR has_table_privilege(current_user,c.oid,'DELETE')
+             OR has_table_privilege(current_user,c.oid,'TRUNCATE')
+             OR has_table_privilege(current_user,c.oid,'REFERENCES')
+             OR has_table_privilege(current_user,c.oid,'TRIGGER'))
+    """)).scalars().all()
+    missing_schema_usage = connection.execute(text("""
+        SELECT DISTINCT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind IN ('r','p','S','v','m','f')
+           AND c.relname NOT IN ('pg_stat_statements','pg_stat_statements_info')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT has_schema_privilege(current_user,n.oid,'USAGE')
+    """)).scalars().all()
+    missing_select = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind IN ('r','p','v','m','f')
+           AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT has_table_privilege(current_user,c.oid,'SELECT')
+        UNION ALL
+        SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind='S'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND NOT has_sequence_privilege(current_user,c.oid,'SELECT')
+    """)).scalars().all()
+if unsafe_schemas or unsafe_tables:
+    raise SystemExit('backup database role has unsafe schema/table privileges')
+if sys.argv[1] == 'safety':
+    print('backup database role safety verified')
+    raise SystemExit(0)
+if missing_schema_usage or missing_select:
+    raise SystemExit('backup database grants do not match the read-only pg_dump contract')
+print('backup database privilege contract verified')
+PY
+}
+
+database_role_names() (
+  load_app_environment
+  /usr/bin/python3 - <<'PY'
+import os
+import re
+from urllib.parse import unquote, urlsplit
+
+names = []
+for key in ("DATABASE_URL", "BACKUP_DATABASE_URL"):
+    name = unquote(urlsplit(os.environ.get(key, "")).username or "")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise SystemExit(f"invalid PostgreSQL role name in {key}")
+    names.append(name)
+if len(set(names)) != len(names):
+    raise SystemExit("runtime and backup PostgreSQL roles must differ")
+print("\n".join(names))
+PY
+)
+
+validate_migration_database_privileges() {
+  local backend="$1"
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  run_migration_in_release "$backend" "$backend/.venv/bin/python" - <<'PY'
+from sqlalchemy import create_engine, text
+import os
+
+engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+with engine.connect() as connection:
+    audit = dict(connection.execute(text("""
+        SELECT r.rolsuper, r.rolcreatedb, r.rolcreaterole, r.rolreplication,
+               r.rolbypassrls,
+               has_database_privilege(current_user,current_database(),'CONNECT') AS can_connect,
+               has_database_privilege(current_user,current_database(),'CREATE') AS can_create_db,
+               has_database_privilege(current_user,current_database(),'TEMP') AS can_temp,
+               EXISTS (SELECT 1 FROM pg_roles inherited
+                 WHERE inherited.rolname <> current_user
+                   AND pg_has_role(current_user,inherited.oid,'MEMBER')
+                   AND (inherited.rolsuper OR inherited.rolcreatedb OR inherited.rolcreaterole
+                     OR inherited.rolreplication OR inherited.rolbypassrls)) AS dangerous_membership,
+               has_schema_privilege(current_user,'public','USAGE') AS schema_usage,
+               has_schema_privilege(current_user,'public','CREATE') AS schema_create,
+               (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                 WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+                   AND n.nspname !~ '^pg_toast'
+                   AND c.relkind IN ('r','p','S','v','m','f')
+                   AND c.relname NOT IN ('pg_stat_statements','pg_stat_statements_info')
+                   AND c.relname NOT LIKE 'tencentdb_tbl_dial_test_%'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pg_depend d
+                        WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e'
+                   )
+                   AND NOT pg_has_role(current_user,c.relowner,'MEMBER')) AS foreign_owned_objects
+          FROM pg_roles r WHERE r.rolname=current_user
+    """)).mappings().one())
+unsafe = [key for key in ('rolsuper','rolcreatedb','rolcreaterole','rolreplication',
+                          'rolbypassrls','can_create_db','can_temp','dangerous_membership') if audit[key]]
+if (unsafe or not audit['can_connect'] or not audit['schema_usage']
+        or not audit['schema_create'] or audit['foreign_owned_objects']):
+    raise SystemExit('migration database role does not match the schema-owner-only contract')
+print('migration database privilege contract verified')
+PY
+}
+
+apply_database_role_grants() {
+  local backend="$1" role_output
+  local -a roles
+  [[ "$ENVIRONMENT" == "production" ]] || return 0
+  role_output="$(database_role_names)"
+  mapfile -t roles <<<"$role_output"
+  [[ "${#roles[@]}" == "2" ]] || fail "数据库角色名解析失败"
+  run_migration_in_release "$backend" "$backend/.venv/bin/python" - \
+    "${roles[0]}" "${roles[1]}" <<'PY'
+from sqlalchemy import create_engine, text
+import os
+import re
+import sys
+
+runtime_role, backup_role = sys.argv[1:3]
+for role in (runtime_role, backup_role):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", role):
+        raise SystemExit("invalid PostgreSQL role name")
+
+engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+with engine.begin() as connection:
+    quote = connection.dialect.identifier_preparer.quote
+    runtime = quote(runtime_role)
+    backup = quote(backup_role)
+    statements = [
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {runtime}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLES FROM {runtime}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO {runtime}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {backup}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO {backup}",
+    ]
+    for statement in statements:
+        connection.execute(text(statement))
+    objects = connection.execute(text("""
+        SELECT n.nspname, c.relname, c.relkind
+          FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname='public' AND c.relkind IN ('r','p','S','v','m','f')
+           AND pg_has_role(current_user,c.relowner,'MEMBER')
+           AND NOT EXISTS (
+               SELECT 1 FROM pg_depend d
+                WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e'
+           )
+    """)).all()
+    for schema_name, object_name, object_kind in objects:
+        qualified = f"{quote(schema_name)}.{quote(object_name)}"
+        if object_kind in ('r','p'):
+            connection.execute(text(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {qualified} TO {runtime}"
+            ))
+            connection.execute(text(
+                f"REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE {qualified} FROM {runtime}"
+            ))
+        if object_kind in ('r','p','v','m','f'):
+            connection.execute(text(f"REVOKE ALL PRIVILEGES ON TABLE {qualified} FROM {backup}"))
+            connection.execute(text(f"GRANT SELECT ON TABLE {qualified} TO {backup}"))
+        if object_kind == 'S':
+            connection.execute(text(
+                f"GRANT USAGE, SELECT, UPDATE ON SEQUENCE {qualified} TO {runtime}"
+            ))
+            connection.execute(text(f"REVOKE ALL PRIVILEGES ON SEQUENCE {qualified} FROM {backup}"))
+            connection.execute(text(f"GRANT SELECT ON SEQUENCE {qualified} TO {backup}"))
+    if connection.execute(text("SELECT to_regclass('public.alembic_version')")).scalar_one():
+        connection.execute(text(f"REVOKE ALL PRIVILEGES ON TABLE public.alembic_version FROM {runtime}"))
+        connection.execute(text(f"GRANT SELECT ON TABLE public.alembic_version TO {runtime}"))
+print('runtime and backup database grants reconciled')
+PY
+}
+
+validate_property_video_direct_upload() {
+  local backend="$1"
+  run_in_release "$backend" "$backend/.venv/bin/python" -c '
+import sys
+from datetime import datetime, timedelta, timezone
+
+from app.core.config import Settings
+from app.modules.files.tencent_cos import (
+    assert_tencent_cos_bucket_unversioned,
+    issue_tencent_cos_post_object_credential,
+)
+
+settings = Settings(_env_file=None)
+if not settings.property_video_direct_upload_enabled:
+    raise SystemExit(0)
+if sys.argv[1] != "true":
+    raise SystemExit("PROPERTY_VIDEO direct upload requires explicit deployment approval")
+assert_tencent_cos_bucket_unversioned(
+    bucket=settings.tencent_cos_bucket,
+    region=settings.tencent_cos_region,
+    secret_id=settings.tencent_cos_secret_id,
+    secret_key=settings.tencent_cos_secret_key,
+)
+now = datetime.now(timezone.utc)
+issue_tencent_cos_post_object_credential(
+    bucket=settings.tencent_cos_bucket,
+    region=settings.tencent_cos_region,
+    secret_id=settings.tencent_cos_secret_id,
+    secret_key=settings.tencent_cos_secret_key,
+    storage_key=f"deployment-preflight/property-video/{int(now.timestamp())}.mp4",
+    expires_at=now + timedelta(minutes=30),
+    now=now,
+)
+' "$DIRECT_UPLOAD_APPROVED"
 }
 
 assert_revision_path() {
   local backend="$1" current_revision="$2" target_revision="$3"
   run_in_release "$backend" "$backend/.venv/bin/python" -c \
-    'import sys; from alembic.config import Config; from alembic.script import ScriptDirectory; current,target=sys.argv[1:3]; c=Config("alembic.ini"); c.set_main_option("script_location","alembic"); s=ScriptDirectory.from_config(c); revisions={r.revision for r in s.walk_revisions(target,"base")}; raise SystemExit(0 if current==target or current in revisions else 2)' \
+    'import sys; from alembic.config import Config; from alembic.script import ScriptDirectory; current,target=sys.argv[1:3]; c=Config("alembic.ini"); c.set_main_option("script_location","alembic"); s=ScriptDirectory.from_config(c); target_script=s.get_revision(target); revisions=set() if current=="base" else {r.revision for r in s.walk_revisions(current,target)}; raise SystemExit(0 if target_script is not None and (current=="base" or current==target or current in revisions) else 2)' \
     "$current_revision" "$target_revision" || fail "当前 DB revision 不是目标迁移的祖先"
 }
 
 stop_writers() {
-  local unit
-  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl stop "$unit"; done
-  for unit in "${SERVICES[@]}"; do systemctl stop "$unit"; done
+  stop_all_units || fail "未能确认所有数据库 writer 已停止"
 }
 
 start_services() {
-  local unit
-  for unit in "${SERVICES[@]}"; do systemctl start "$unit"; done
+  local index
+  for ((index=${#SERVICES[@]} - 1; index>=0; index--)); do
+    systemctl start "${SERVICES[$index]}" || return 1
+  done
+  for ((index=${#AUXILIARY_DATABASE_SERVICES[@]} - 1; index>=0; index--)); do
+    systemctl start "${AUXILIARY_DATABASE_SERVICES[$index]}" || return 1
+  done
 }
 
 start_timers() {
   local unit
-  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl start "$unit"; done
+  for unit in "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl start "$unit" || return 1
+    systemctl is-active --quiet "$unit" || return 1
+  done
+}
+
+assert_initial_units_stopped() {
+  local unit
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" \
+    "${ONESHOT_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    if systemctl is-active --quiet "$unit"; then
+      fail "首次发布要求所有 writer 预先停止：$unit"
+    fi
+  done
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" == "disabled" ]] \
+      || fail "首次发布要求所有持久 writer 预先 disabled：$unit"
+  done
+}
+
+enable_persistent_units() {
+  local unit
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl enable "$unit"
+  done
+}
+
+disable_persistent_units() {
+  local unit state failed=0
+  for unit in "${TIMERS[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${SERVICES[@]}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl disable "$unit" || failed=1
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    [[ "$state" == "disabled" ]] || failed=1
+  done
+  return "$failed"
+}
+
+verify_persistent_units() {
+  local unit state
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    [[ "$state" == "enabled" ]] \
+      || fail "正式服持久服务必须精确设置为 enabled：$unit（当前 $state）"
+  done
+  for unit in "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl is-active --quiet "$unit" || fail "正式服定时器未运行：$unit"
+  done
 }
 
 stop_all_units() {
-  local unit
-  for unit in "${TIMERS[@]}"; do [[ -n "$unit" ]] && systemctl stop "$unit" || true; done
-  for unit in "${SERVICES[@]}"; do systemctl stop "$unit" || true; done
+  local unit failed=0
+  for unit in "${TIMERS[@]}" "${ONESHOT_SERVICES[@]}" \
+    "${AUXILIARY_DATABASE_SERVICES[@]}" "${SERVICES[@]}"; do
+    [[ -n "$unit" ]] || continue
+    systemctl stop "$unit" || failed=1
+  done
+  verify_all_units_stopped || failed=1
+  return "$failed"
+}
+
+verify_all_units_stopped() {
+  local unit state main_pid failed=0
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" \
+    "${ONESHOT_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+    if [[ "$state" != "inactive" && "$state" != "failed" ]]; then
+      printf 'CRITICAL: writer 未停止：%s（state=%s）\n' "$unit" "${state:-unknown}" >&2
+      failed=1
+    fi
+    if [[ "$main_pid" != "0" ]]; then
+      printf 'CRITICAL: writer 仍有 MainPID：%s（MainPID=%s）\n' "$unit" "${main_pid:-unknown}" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+verify_persistent_units_disabled() {
+  local unit state failed=0
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${TIMERS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    if [[ "$state" != "disabled" ]]; then
+      printf 'CRITICAL: writer 未持久禁用：%s（enabled=%s）\n' "$unit" "${state:-unknown}" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+assert_recovery_units_fail_closed() {
+  verify_all_units_stopped || fail "恢复模式要求所有 writer 精确停止"
+  verify_persistent_units_disabled || fail "恢复模式要求所有持久 writer 精确 disabled"
+}
+
+ensure_fail_closed_state() {
+  local failed=0
+  stop_all_units || failed=1
+  disable_persistent_units || failed=1
+  verify_all_units_stopped || failed=1
+  verify_persistent_units_disabled || failed=1
+  return "$failed"
 }
 
 switch_current() {
@@ -507,36 +2179,134 @@ switch_current() {
   mv -Tf -- "$next" "$CURRENT_LINK"
 }
 
-create_database_backup() {
-  local release_id="$1" backup="$BACKUP_ROOT/${DATABASE_NAME}_before_${release_id}.dump"
-  local partial sha_partial digest
-  partial="$BACKUP_ROOT/.${DATABASE_NAME}_before_${release_id}.dump.partial.$$"
-  sha_partial="$BACKUP_ROOT/.${DATABASE_NAME}_before_${release_id}.dump.sha256.partial.$$"
+restore_current() {
+  local target="$1"
+  if [[ "$target" == "NONE" ]]; then
+    [[ -L "$CURRENT_LINK" ]] && rm -f -- "$CURRENT_LINK"
+    return
+  fi
+  switch_current "$target"
+}
+
+create_database_backup() (
+  local release_id="$1"
+  local backup="$BACKUP_ROOT/${SELECTED_DATABASE_PROFILE}_${SELECTED_DATABASE_NAME}_before_${release_id}.dump"
+  local partial sha_partial digest metadata passfile host port username database sslmode sslrootcert backup_group
+	local -a pg_environment
+  load_app_environment
+  [[ "$(backup_root_status)" == "ready" ]] \
+    || fail "数据库备份目录尚未准备完成：$BACKUP_ROOT"
+  partial="$BACKUP_ROOT/.${SELECTED_DATABASE_PROFILE}_${SELECTED_DATABASE_NAME}_before_${release_id}.dump.partial.$$"
+  sha_partial="$BACKUP_ROOT/.${SELECTED_DATABASE_PROFILE}_${SELECTED_DATABASE_NAME}_before_${release_id}.dump.sha256.partial.$$"
+  metadata="$(mktemp "$REMOTE_ROOT/.database-backup-metadata.XXXXXX")"
+  passfile="$(mktemp "$BACKUP_ROOT/.pgpass.XXXXXX")"
+  trap 'rm -f -- "$metadata" "$passfile" "$partial" "$sha_partial"' EXIT INT TERM HUP
+  chmod 0600 "$metadata" "$passfile"
+  backup_group="$(id -gn "$BACKUP_USER")"
+  chown "$BACKUP_USER:$backup_group" "$passfile"
   [[ ! -e "$backup" && ! -L "$backup" ]] || fail "数据库备份已存在：$backup"
   [[ ! -e "$partial" && ! -e "$sha_partial" ]] || fail "数据库临时备份路径已存在"
-  if ! runuser -u postgres -- pg_dump -Fc --no-owner --no-acl --file "$partial" "$DATABASE_NAME"; then
+  if ! /usr/bin/python3 - "$metadata" "$passfile" <<'PY'
+import os
+import sys
+from urllib.parse import parse_qs, unquote, urlsplit
+
+metadata_path, passfile_path = sys.argv[1:3]
+raw = os.getenv("BACKUP_DATABASE_URL")
+if not raw and os.getenv("APP_ENVIRONMENT") != "production":
+    raw = os.getenv("MIGRATION_DATABASE_URL") or os.getenv("DATABASE_URL")
+if not raw:
+    raise SystemExit("missing independent backup database URL")
+url = urlsplit(raw)
+if not url.scheme.startswith("postgresql"):
+    raise SystemExit("backup target must use PostgreSQL")
+host = url.hostname or "localhost"
+port = int(url.port or 5432)
+username = unquote(url.username or "")
+password = unquote(url.password or "")
+database = unquote(url.path.lstrip("/"))
+query = parse_qs(url.query)
+sslmode = (query.get("sslmode") or ["prefer"])[-1]
+sslrootcert = (query.get("sslrootcert") or [""])[-1]
+if not username or not database or not (1 <= port <= 65535):
+    raise SystemExit("incomplete PostgreSQL backup target")
+if any("\x00" in value or "\r" in value or "\n" in value for value in (
+    host,
+    username,
+    password,
+    database,
+    sslmode,
+    sslrootcert,
+)):
+    raise SystemExit("invalid control byte in PostgreSQL backup target")
+
+def pgpass_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:")
+
+with open(passfile_path, "w", encoding="utf-8") as handle:
+    fields = [host, str(port), database, username, password]
+    handle.write(":".join(pgpass_escape(field) for field in fields) + "\n")
+os.chmod(passfile_path, 0o600)
+with open(metadata_path, "wb") as handle:
+    for value in (host, str(port), username, database, sslmode, sslrootcert):
+        handle.write(value.encode() + b"\0")
+PY
+  then
     rm -f -- "$partial" "$sha_partial"
     return 1
   fi
-  if ! runuser -u postgres -- pg_restore --list "$partial" >/dev/null; then
+  if ! {
+    IFS= read -r -d '' host \
+      && IFS= read -r -d '' port \
+      && IFS= read -r -d '' username \
+      && IFS= read -r -d '' database \
+      && IFS= read -r -d '' sslmode \
+      && IFS= read -r -d '' sslrootcert
+  } < "$metadata"; then
+    rm -f -- "$partial" "$sha_partial"
+    return 1
+  fi
+  if [[ -z "$host" || -z "$port" || -z "$username" || -z "$database" || -z "$sslmode" ]]; then
+    printf 'ERROR: 数据库备份连接元数据读取不完整。\n' >&2
+    rm -f -- "$partial" "$sha_partial"
+    return 1
+  fi
+  rm -f -- "$metadata"
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    [[ "$sslmode" == "verify-full" && "$sslrootcert" == "$DATABASE_CA_FILE" ]] \
+      || fail "正式服数据库备份必须使用配置的 CA 和 sslmode=verify-full"
+  fi
+  pg_environment=(PGPASSFILE="$passfile" PGSSLMODE="$sslmode")
+  [[ -z "$sslrootcert" ]] || pg_environment+=(PGSSLROOTCERT="$sslrootcert")
+  if ! run_as_clean "$BACKUP_USER" /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 "${pg_environment[@]}" \
+    /usr/bin/pg_dump -Fc --no-owner --no-acl --host "$host" --port "$port" \
+    --username "$username" --dbname "$database" --file "$partial"; then
+    rm -f -- "$partial" "$sha_partial"
+    return 1
+  fi
+  rm -f -- "$passfile"
+  if ! run_as_clean "$BACKUP_USER" /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    /usr/bin/pg_restore --list "$partial" >/dev/null; then
     rm -f -- "$partial" "$sha_partial"
     return 1
   fi
   digest="$(sha256sum "$partial" | awk '{print $1}')"
   printf '%s  %s\n' "$digest" "$(basename "$backup")" > "$sha_partial"
   chmod 0600 "$partial" "$sha_partial"
-  chown postgres:postgres "$partial" "$sha_partial"
+  chown "$BACKUP_USER:$backup_group" "$partial" "$sha_partial"
   mv -- "$partial" "$backup"
   mv -- "$sha_partial" "$backup.sha256"
   printf 'BACKUP=%s\n' "$backup"
-}
+)
 
 run_migrations() {
   local backend="$1"
-  run_in_release "$backend" "$backend/.venv/bin/python" -c \
-    'import os,runpy; migration=os.getenv("MIGRATION_DATABASE_URL"); os.environ["DATABASE_URL"]=migration or os.environ["DATABASE_URL"]; runpy.run_path("scripts/run_alembic_upgrade.py",run_name="__main__")'
-  run_in_release "$backend" "$backend/.venv/bin/python" -c \
-    'import os,runpy; migration=os.getenv("MIGRATION_DATABASE_URL"); os.environ["DATABASE_URL"]=migration or os.environ["DATABASE_URL"]; runpy.run_path("scripts/verify_database_schema.py",run_name="__main__")'
+  run_migration_in_release "$backend" "$backend/.venv/bin/python" \
+    scripts/run_alembic_upgrade.py
+  run_migration_in_release "$backend" "$backend/.venv/bin/python" \
+    scripts/verify_database_schema.py
 }
 
 wait_for_health() {
@@ -551,6 +2321,69 @@ wait_for_health() {
   return 1
 }
 
+verify_unit_database_target() {
+  local unit="$1" pid result
+  [[ -n "$SELECTED_DATABASE_ENV" ]] || return 0
+  pid="$(systemctl show "$unit" -p MainPID --value)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "服务 MainPID 无效：$unit"
+  result="$(/usr/bin/python3 - "$pid" "$SELECTED_DATABASE_PROFILE" \
+    "$SELECTED_DATABASE_NAME" "$CLOUD_DATABASE_HOST" "$ENVIRONMENT" "$DATABASE_CA_FILE" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import parse_qs, urlsplit
+
+pid, expected_profile, expected_database, cloud_host, target_environment, expected_ca = sys.argv[1:]
+with open(f"/proc/{pid}/environ", "rb") as handle:
+    environment = {}
+    for entry in handle.read().split(b"\0"):
+        if b"=" not in entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        environment[key.decode("utf-8", "strict")] = value.decode("utf-8", "strict")
+
+if target_environment == "production" and (
+    "MIGRATION_DATABASE_URL" in environment or "BACKUP_DATABASE_URL" in environment
+):
+    raise SystemExit(11)
+if environment.get("LOUMAI_DATABASE_PROFILE") != expected_profile:
+    raise SystemExit(2)
+raw_url = environment.get("DATABASE_URL")
+if not raw_url:
+    raise SystemExit(3)
+url = urlsplit(raw_url)
+if not url.scheme.startswith("postgresql"):
+    raise SystemExit(4)
+host = url.hostname or ""
+port = int(url.port or 5432)
+database = url.path.lstrip("/")
+if port != 5432 or database != expected_database:
+    raise SystemExit(5)
+if target_environment == "production":
+    query = parse_qs(url.query)
+    if (query.get("sslmode") or [""])[-1] != "verify-full":
+        raise SystemExit(9)
+    if (query.get("sslrootcert") or [""])[-1] != expected_ca:
+        raise SystemExit(10)
+if expected_profile == "local":
+    if host == "localhost":
+        pass
+    else:
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                raise SystemExit(6)
+        except ValueError:
+            raise SystemExit(6) from None
+elif expected_profile == "cloud":
+    if host != cloud_host:
+        raise SystemExit(7)
+else:
+    raise SystemExit(8)
+print("OK")
+PY
+)" || fail "服务实际数据库目标与活动 profile 不一致：$unit"
+  [[ "$result" == "OK" ]] || fail "服务实际数据库目标校验异常：$unit"
+}
+
 verify_service_release() {
   local expected="$1" unit pid cwd
   for unit in "${SERVICES[@]}"; do
@@ -559,26 +2392,285 @@ verify_service_release() {
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "服务 MainPID 无效：$unit"
     cwd="$(readlink -f "/proc/$pid/cwd")"
     [[ "$cwd" == "$expected" ]] || fail "服务运行目录不是目标版本：$unit -> $cwd"
+    verify_unit_database_target "$unit"
+  done
+  for unit in "${AUXILIARY_DATABASE_SERVICES[@]}"; do
+    [[ "$(systemctl is-active "$unit")" == "active" ]] || fail "独立数据库服务未运行：$unit"
+    verify_unit_database_target "$unit"
   done
 }
 
+valid_operation_mode() {
+  [[ "$1" == "bootstrap" || "$1" == "deploy" || "$1" == "recover" ]]
+}
+
+assert_operation_marker_state() {
+  local mode="$1" expected_token="$2" active_profile actual_token
+  valid_operation_mode "$mode" || fail "发布操作模式非法：$mode"
+  if [[ "$mode" == "recover" ]]; then
+    [[ "$ENVIRONMENT" == "production" ]] || fail "recover 只允许用于正式服"
+    load_recovery_marker
+    actual_token="$(recovery_marker_token)"
+    [[ "$expected_token" == "$actual_token" ]] || fail "恢复标记已变化，请重新执行 recover"
+    [[ "$SELECTED_DATABASE_PROFILE" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "recover 数据库 profile 与恢复标记不一致"
+    active_profile="$(active_database_profile)"
+    [[ "$active_profile" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "recover 活动数据库 profile 与恢复标记不一致"
+    if [[ "$RECOVERY_PHASE" != "prepared" ]]; then
+      assert_recovery_units_fail_closed
+    fi
+  else
+    [[ "$expected_token" == "NONE" ]] || fail "普通发布的恢复 token 必须是 NONE"
+    assert_no_recovery_marker
+  fi
+}
+
 action_preflight() {
-  local current revision
+  local requested_profile="$1" mode="$2" current revision backup_status active_profile initialized
+  local recovery_required=false recovery_token=NONE recovery_phase=none recovery_initial=false
+  local deployment_state
+  valid_operation_mode "$mode" || fail "preflight 操作模式非法：$mode"
+  select_database_profile "$requested_profile"
   validate_server_contract
   current="$(current_target)"
-  revision="$(current_db_revision)"
+  if [[ "$mode" == "recover" ]]; then
+    [[ "$ENVIRONMENT" == "production" ]] || fail "recover 只允许用于正式服"
+    load_recovery_marker
+    [[ "$SELECTED_DATABASE_PROFILE" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "recover 数据库 profile 与恢复标记不一致"
+    active_profile="$(active_database_profile)"
+    [[ "$active_profile" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "recover 活动数据库 profile 与恢复标记不一致"
+    if [[ "$RECOVERY_PHASE" != "prepared" ]]; then
+      assert_recovery_units_fail_closed
+    fi
+    validate_property_video_direct_upload "$RECOVERY_RELEASE"
+    revision="$(migration_db_revision_for_release "$RECOVERY_RELEASE")"
+    recovery_required=true
+    recovery_token="$(recovery_marker_token)"
+    recovery_phase="$RECOVERY_PHASE"
+    recovery_initial="$RECOVERY_INITIAL"
+    deployment_state=RECOVERY_REQUIRED
+    [[ "$current" == "NONE" ]] && initialized=false || initialized=true
+  else
+    assert_no_recovery_marker
+    if [[ "$mode" == "bootstrap" ]]; then
+      [[ "$current" == "NONE" ]] || fail "目标服已经初始化，不能再次 bootstrap"
+      assert_initial_units_stopped
+      revision="bootstrap"
+      initialized="false"
+      deployment_state=UNINITIALIZED
+    else
+      [[ "$current" != "NONE" ]] || fail "目标服尚未初始化；首次正式发布必须使用 bootstrap"
+      validate_property_video_direct_upload "$current"
+      revision="$(current_db_revision)"
+      initialized="true"
+      deployment_state=HEALTHY
+      [[ "$ENVIRONMENT" != "production" ]] || verify_persistent_units
+    fi
+    active_profile="$(active_database_profile)"
+  fi
+  backup_status="$(backup_root_status)"
   valid_revision "$revision" || fail "数据库 revision 非法"
   printf 'HELPER_VERSION=%s\n' "$HELPER_VERSION"
+	printf 'ENVIRONMENT=%s\n' "$ENVIRONMENT"
+  printf 'REMOTE_ROOT=%s\n' "$REMOTE_ROOT"
   printf 'STAGING_ROOT=%s\n' "$STAGING_ROOT"
+	printf 'PUBLIC_HEALTH_URL=%s\n' "$PUBLIC_HEALTH_URL"
+  printf 'INITIALIZED=%s\n' "$initialized"
   printf 'CURRENT=%s\n' "$current"
   printf 'DB_REVISION=%s\n' "$revision"
+  printf 'DATABASE_PROFILE=%s\n' "$SELECTED_DATABASE_PROFILE"
+  printf 'ACTIVE_DATABASE_PROFILE=%s\n' "$active_profile"
+  printf 'BACKUP_ROOT_STATUS=%s\n' "$backup_status"
+  printf 'OPERATION_MODE=%s\n' "$mode"
+  printf 'RECOVERY_REQUIRED=%s\n' "$recovery_required"
+  printf 'RECOVERY_TOKEN=%s\n' "$recovery_token"
+  printf 'RECOVERY_PHASE=%s\n' "$recovery_phase"
+  printf 'RECOVERY_INITIAL=%s\n' "$recovery_initial"
+  printf 'DEPLOYMENT_STATE=%s\n' "$deployment_state"
+}
+
+action_env_audit() {
+  local target_environment="$1" current settings_output
+  [[ "$target_environment" == "test" || "$target_environment" == "production" ]] \
+    || fail "env-audit 只支持 test 或 production"
+  [[ "$target_environment" == "$ENVIRONMENT" ]] \
+    || fail "env-audit 目标与服务器环境不匹配"
+  select_database_profile active
+  validate_environment_files
+  current="$(current_target)"
+  [[ "$current" != "NONE" ]] || fail "没有当前后端，无法校验 Settings"
+  [[ -x "$current/.venv/bin/python" ]] || fail "当前后端缺少 Python"
+
+  printf 'ENV_AUDIT_PROTOCOL=1\n'
+  printf 'ENV_FILE_COUNT=%s\n' "${#ENV_FILES[@]}"
+  /usr/bin/python3 - "$SELECTED_DATABASE_ENV" "${ENV_FILES[@]}" <<'PY'
+import base64
+import re
+import sys
+
+
+def encode(value: str) -> str:
+    return base64.b64encode(value.encode()).decode() or "-"
+
+
+def parse_value(raw: str, filename: str, line_number: int) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] == "'":
+        if len(value) < 2 or value[-1] != "'" or "'" in value[1:-1]:
+            raise SystemExit(f"invalid single-quoted value: {filename}:{line_number}")
+        return value[1:-1]
+    if value[0] == '"':
+        if len(value) < 2 or value[-1] != '"':
+            raise SystemExit(f"invalid double-quoted value: {filename}:{line_number}")
+        parsed: list[str] = []
+        inner = value[1:-1]
+        index = 0
+        while index < len(inner):
+            character = inner[index]
+            if character == "\\" and index + 1 < len(inner) and inner[index + 1] in {'"', "\\"}:
+                parsed.append(inner[index + 1])
+                index += 2
+                continue
+            parsed.append(character)
+            index += 1
+        return "".join(parsed)
+    if any(character.isspace() for character in value):
+        raise SystemExit(f"unquoted whitespace in environment value: {filename}:{line_number}")
+    return value
+
+
+def sensitive(key: str) -> bool:
+    return bool(
+        re.search(r"(^|_)(SECRET|PASSWORD|TOKEN|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY|API_KEY|APP_KEY)($|_)", key)
+        or re.search(r"(^|_)(DATABASE_URL|MIGRATION_DATABASE_URL|REDIS_URL)$", key)
+        or re.search(r"(_KEY|_SECRET|_PASSWORD|_TOKEN)$", key)
+    )
+
+
+def public(key: str) -> bool:
+    if sensitive(key):
+        return False
+    return bool(
+        key == "APP_ENVIRONMENT"
+        or key in {
+            "BACKEND_ALLOWED_HOSTS",
+            "BACKEND_CORS_ORIGINS",
+            "BACKEND_CORS_ORIGIN_REGEX",
+            "BAILIAN_BASE_URL",
+            "DEEPSEEK_BASE_URL",
+            "GEO_WEBVIEW_ALLOWED_ORIGINS",
+            "TENCENT_IM_REST_BASE_URL",
+            "TIANDITU_API_BASE_URL",
+            "VIDEO_TRANSCODE_WORKER_ID",
+        }
+        or key.startswith("RUN_")
+        or key.startswith("ALLOW_")
+        or re.search(r"_ENABLED$", key)
+        or re.search(r"_COOKIE_SECURE$", key)
+        or re.search(r"_(PROVIDER|MODE|REGION|ENGINE|ALGORITHM|PRESET|COORDINATE_SYSTEM)$", key)
+        or re.search(r"_(PATH|ROOT)$", key)
+        or re.search(
+            r"_(SECONDS|MINUTES|HOURS|METERS|BYTES|PIXELS|EDGE|QUALITY|CONCURRENCY|THREADS|ATTEMPTS|RETRIES|FPS|CRF|SIZE)$",
+            key,
+        )
+    )
+
+
+key_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+selected_database_env = sys.argv[1]
+environment_files = sys.argv[2:]
+values: dict[str, str] = {}
+locations: dict[str, list[str]] = {}
+for filename in environment_files:
+    with open(filename, encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            line = raw_line.rstrip("\r\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].lstrip()
+            if "=" not in stripped:
+                raise SystemExit(f"invalid environment line: {filename}:{line_number}")
+            key, raw_value = stripped.split("=", 1)
+            key = key.strip()
+            if not key_pattern.fullmatch(key):
+                raise SystemExit(f"invalid environment key: {filename}:{line_number}")
+            value = parse_value(raw_value, filename, line_number)
+            if "\x00" in value or "\n" in value or "\r" in value:
+                raise SystemExit(f"invalid control byte in environment value: {filename}:{line_number}")
+            values[key] = value
+            locations.setdefault(key, []).append(f"{filename}:{line_number}")
+
+for key in sorted(values):
+    value = values[key]
+    state = "EMPTY" if value == "" else "SET"
+    visibility = "PUBLIC" if state == "SET" and public(key) else "HIDDEN"
+    encoded = encode(value) if visibility == "PUBLIC" else "-"
+    source = encode(locations[key][-1])
+    print(f"ENV_KEY\t{key}\t{state}\t{visibility}\t{encoded}\t{source}")
+for key in sorted(locations):
+    key_locations = locations[key]
+    intentional_database_profile_override = (
+        key in {"DATABASE_URL", "MIGRATION_DATABASE_URL"}
+        and selected_database_env
+        and len(key_locations) == 2
+        and key_locations[0].rsplit(":", 1)[0] != selected_database_env
+        and key_locations[-1].rsplit(":", 1)[0] == selected_database_env
+    )
+    if len(key_locations) > 1 and not intentional_database_profile_override:
+        print(f"ENV_DUPLICATE\t{key}\t{encode(chr(10).join(key_locations))}")
+PY
+
+  load_app_environment
+  if [[ "${APP_ENVIRONMENT:-}" == "$target_environment" ]]; then
+    printf 'ENV_TARGET_MATCH=1\n'
+  else
+    printf 'ENV_TARGET_MATCH=0\n'
+  fi
+  settings_output="$(run_in_release "$current" "$current/.venv/bin/python" -c '
+from app.core.config import Settings
+
+
+def encode(value: str) -> str:
+    import base64
+    return base64.b64encode(value.encode()).decode() or "-"
+
+
+try:
+    Settings(_env_file=None)
+except Exception as exc:
+    print("ENV_SETTINGS_VALID=0")
+    if hasattr(exc, "errors"):
+        for error in exc.errors(include_input=False, include_url=False):
+            location = "_".join(str(item) for item in (error.get("loc") or ("__SETTINGS__",))).upper()
+            error_type = str(error.get("type") or type(exc).__name__)
+            print(f"ENV_SETTINGS_ERROR\t{encode(location)}\t{encode(error_type)}")
+    else:
+        root_label = encode("__SETTINGS__")
+        error_type = encode(type(exc).__name__)
+        print(f"ENV_SETTINGS_ERROR\t{root_label}\t{error_type}")
+else:
+    print("ENV_SETTINGS_VALID=1")
+')"
+  printf '%s\n' "$settings_output"
 }
 
 action_prepare() {
-  local release_id="$1" stage_dir group
+  local release_id="$1" requested_profile="$2" mode="$3" expected_recovery_token="$4"
+  local stage_dir group
   valid_release_id "$release_id" || fail "release_id 格式非法"
+  valid_operation_mode "$mode" || fail "prepare 操作模式非法：$mode"
   acquire_lock
+  select_database_profile "$requested_profile"
   validate_server_contract
+  assert_operation_marker_state "$mode" "$expected_recovery_token"
+  prepare_backup_root
   stage_dir="$STAGING_ROOT/$release_id.partial"
   [[ ! -e "$stage_dir" && ! -L "$stage_dir" ]] || fail "staging 已存在"
   group="$(id -gn "$DEPLOY_USER")"
@@ -600,23 +2692,86 @@ action_abort() {
 }
 
 action_status() {
-  local current revision unit
+  local requested_profile="$1" current revision unit active_profile initialized
+  local recovery_required=false recovery_token=NONE recovery_phase=none recovery_initial=false
+  local deployment_state
+  select_database_profile "$requested_profile"
   validate_server_contract
   current="$(current_target)"
-  revision="$(current_db_revision)"
-  printf 'CURRENT=%s\nDB_REVISION=%s\n' "$current" "$revision"
-  for unit in "${SERVICES[@]}" "${TIMERS[@]}"; do
+  active_profile="$(active_database_profile)"
+  if recovery_marker_exists; then
+    load_recovery_marker
+    [[ "$SELECTED_DATABASE_PROFILE" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "status 数据库 profile 与恢复标记不一致"
+    [[ "$active_profile" == "$RECOVERY_DATABASE_PROFILE" ]] \
+      || fail "status 活动数据库 profile 与恢复标记不一致"
+    revision="$(migration_db_revision_for_release "$RECOVERY_RELEASE")"
+    [[ "$current" == "NONE" ]] && initialized=false || initialized=true
+    recovery_required=true
+    recovery_token="$(recovery_marker_token)"
+    recovery_phase="$RECOVERY_PHASE"
+    recovery_initial="$RECOVERY_INITIAL"
+    deployment_state=RECOVERY_REQUIRED
+  elif [[ "$current" == "NONE" ]]; then
+    revision="bootstrap"
+    initialized="false"
+    deployment_state=UNINITIALIZED
+  else
+    revision="$(current_db_revision)"
+    initialized="true"
+    deployment_state=HEALTHY
+  fi
+  printf 'ENVIRONMENT=%s\nINITIALIZED=%s\nCURRENT=%s\nDB_REVISION=%s\n' \
+    "$ENVIRONMENT" "$initialized" "$current" "$revision"
+  printf 'DATABASE_PROFILE=%s\nACTIVE_DATABASE_PROFILE=%s\n' \
+    "$SELECTED_DATABASE_PROFILE" "$active_profile"
+  printf 'RECOVERY_REQUIRED=%s\nRECOVERY_TOKEN=%s\nRECOVERY_PHASE=%s\nRECOVERY_INITIAL=%s\n' \
+    "$recovery_required" "$recovery_token" "$recovery_phase" "$recovery_initial"
+  printf 'DEPLOYMENT_STATE=%s\n' "$deployment_state"
+  for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" \
+    "${ONESHOT_SERVICES[@]}" "${TIMERS[@]}"; do
     [[ -n "$unit" ]] || continue
     printf 'UNIT_%s=%s\n' "${unit//[^A-Za-z0-9]/_}" "$(systemctl is-active "$unit" 2>/dev/null || true)"
   done
-  if [[ -f "$current/release.json" ]]; then cat "$current/release.json"; fi
+  if [[ "$recovery_required" == "true" ]]; then
+    if [[ "$recovery_phase" == "prepared" ]]; then
+      printf 'DATABASE_WRITERS=recovery_prepared\n'
+    else
+      assert_recovery_units_fail_closed
+      printf 'DATABASE_WRITERS=recovery_fail_closed\n'
+    fi
+  elif [[ "$initialized" == "true" && "$SELECTED_DATABASE_PROFILE" == "$active_profile" ]]; then
+    verify_service_release "$current"
+    [[ "$ENVIRONMENT" != "production" ]] || verify_persistent_units
+    printf 'DATABASE_WRITERS=verified\n'
+  elif [[ "$initialized" == "false" ]]; then
+    assert_initial_units_stopped
+    printf 'DATABASE_WRITERS=not_initialized\n'
+  else
+    printf 'DATABASE_WRITERS=not_active_profile\n'
+  fi
+  if ! unit_is_configured "$VIDEO_SERVICE"; then
+    printf 'UNIT_%s=%s\n' "${VIDEO_SERVICE//[^A-Za-z0-9]/_}" \
+      "$(systemctl is-active "$VIDEO_SERVICE" 2>/dev/null || true)"
+    printf 'UNIT_%s_ENABLED=%s\n' "${VIDEO_SERVICE//[^A-Za-z0-9]/_}" \
+      "$(systemctl is-enabled "$VIDEO_SERVICE" 2>/dev/null || true)"
+  fi
+  if [[ "$initialized" == "true" ]]; then
+    [[ "$current" == "$RELEASES_ROOT/"*/backend ]] \
+      || fail "当前版本路径不在受控版本目录"
+    [[ -f "$current/release.json" && ! -L "$current/release.json" ]] \
+      || fail "当前版本 release.json 不存在或异常"
+    cat -- "$current/release.json"
+  fi
 }
 
 action_activate() {
   local release_id="$1" expected_commit="$2" artifact_db_head="$3" expected_checksums="$4"
-  local expected_archive="$5" expected_current="$6" expected_db_revision="$7"
-  local stage_dir partial_root release_root backend actual_current actual_db archive_sha checksums_sha final_db
-  local migration_required=0 writers_stopped=0 migration_attempted=0 switched=0 partial_created=0
+  local expected_archive="$5" expected_current="$6" expected_db_revision="$7" requested_profile="$8"
+  local mode="$9" expected_recovery_token="${10}"
+  local stage_dir partial_root release_root backend actual_current actual_db observed_db archive_sha checksums_sha final_db
+  local migration_required=0 initial_activation=0 initial_flag=false recovery_activation=0
+  local marker_previous_current marker_token
 
   valid_release_id "$release_id" || fail "release_id 格式非法"
   valid_commit "$expected_commit" || fail "commit 格式非法"
@@ -624,6 +2779,7 @@ action_activate() {
   valid_sha256 "$expected_checksums" || fail "checksums sha 格式非法"
   valid_sha256 "$expected_archive" || fail "archive sha 格式非法"
   valid_revision "$expected_db_revision" || fail "expected DB revision 格式非法"
+  valid_operation_mode "$mode" || fail "activate 操作模式非法：$mode"
 
   stage_dir="$STAGING_ROOT/$release_id.partial"
   partial_root="$RELEASES_ROOT/.$release_id.partial"
@@ -631,31 +2787,107 @@ action_activate() {
   backend="$partial_root/backend"
 
   acquire_lock
+  select_database_profile "$requested_profile"
   validate_server_contract
+  assert_operation_marker_state "$mode" "$expected_recovery_token"
+  marker_token="$expected_recovery_token"
   actual_current="$(current_target)"
-  actual_db="$(current_db_revision)"
   [[ "$actual_current" == "$expected_current" ]] || fail "backend-current 已被其他发布修改"
-  [[ "$actual_db" == "$expected_db_revision" ]] || fail "数据库 revision 已被其他发布修改"
+  if [[ "$mode" == "recover" ]]; then
+    [[ "$expected_db_revision" != "bootstrap" ]] || fail "recover 不能使用 bootstrap 数据库哨兵"
+    [[ "$actual_current" == "$RECOVERY_PREVIOUS_CURRENT" \
+      || "$actual_current" == "$RECOVERY_RELEASE" ]] \
+      || fail "recover 当前版本与恢复标记不一致"
+    actual_db="$(migration_db_revision_for_release "$RECOVERY_RELEASE")"
+    [[ "$actual_db" == "$expected_db_revision" ]] || fail "recover 数据库 revision 已变化"
+    [[ "$RECOVERY_INITIAL" == "true" ]] && initial_activation=1
+    recovery_activation=1
+    marker_previous_current="$RECOVERY_PREVIOUS_CURRENT"
+  elif [[ "$mode" == "bootstrap" ]]; then
+    [[ "$expected_current" == "NONE" ]] || fail "bootstrap 要求未初始化目标服"
+    [[ "$expected_db_revision" == "bootstrap" ]] \
+      || fail "首次发布必须使用 bootstrap 数据库哨兵"
+    assert_initial_units_stopped
+    initial_activation=1
+    actual_db="bootstrap"
+  else
+    [[ "$expected_current" != "NONE" ]] || fail "deploy 要求已初始化目标服"
+    [[ "$expected_db_revision" != "bootstrap" ]] || fail "已初始化服务器不能使用 bootstrap 哨兵"
+    actual_db="$(current_db_revision)"
+    [[ "$actual_db" == "$expected_db_revision" ]] || fail "数据库 revision 已被其他发布修改"
+  fi
+  if [[ "$initial_activation" == "1" ]]; then initial_flag=true; fi
+
+  ACTIVATION_RELEASE_ID="$release_id"
+  ACTIVATION_PARTIAL_ROOT="$partial_root"
+  ACTIVATION_RELEASE_ROOT="$release_root"
+  ACTIVATION_PREVIOUS_CURRENT="$actual_current"
+  ACTIVATION_PARTIAL_CREATED=0
+  ACTIVATION_WRITERS_STOPPED=0
+  ACTIVATION_MIGRATION_ATTEMPTED=0
+  ACTIVATION_SWITCHED=0
+  ACTIVATION_DATABASE_PROFILE_SWITCHED=0
+  ACTIVATION_PREVIOUS_DATABASE_ENV=""
+  ACTIVATION_INITIAL="$initial_activation"
+  ACTIVATION_RECOVERY="$recovery_activation"
+  ACTIVATION_MARKER_WRITTEN="$recovery_activation"
+  ACTIVATION_PERSISTENT_DISABLED=0
+  ACTIVATION_RECOVERY_TOKEN="$marker_token"
+  ACTIVATION_ENABLE_ATTEMPTED=0
 
   activation_failure() {
-    local exit_code=$?
+    local exit_code=$? restored=0
     trap - EXIT INT TERM HUP
     [[ "$exit_code" -ne 0 ]] || exit_code=1
-    if [[ "$partial_created" == "1" && -d "$partial_root" && ! -e "$release_root" ]]; then
-      rm -rf -- "$partial_root"
+    if [[ "${ACTIVATION_PARTIAL_CREATED:-0}" == "1" \
+      && -d "${ACTIVATION_PARTIAL_ROOT:-/nonexistent}" \
+      && ! -e "${ACTIVATION_RELEASE_ROOT:-/nonexistent}" ]]; then
+      rm -rf -- "$ACTIVATION_PARTIAL_ROOT"
     fi
-    if [[ "$writers_stopped" == "1" ]]; then
-      stop_all_units
-      if [[ "$migration_attempted" == "0" ]]; then
-        if [[ "$switched" == "1" ]]; then switch_current "$actual_current"; fi
-        start_services || true
-        start_timers || true
-        printf 'ERROR: 发布失败，数据库未迁移，已尝试恢复旧应用。\n' >&2
-      else
-        printf 'CRITICAL: 数据库迁移已经尝试；所有 writer 保持停止。禁止自动 downgrade/restore，请人工前向修复或评估备份恢复。\n' >&2
-        printf 'CRITICAL_BACKUP=%s/%s_before_%s.dump\n' "$BACKUP_ROOT" "$DATABASE_NAME" "$release_id" >&2
+    if [[ "${ACTIVATION_MARKER_WRITTEN:-0}" == "1" \
+      || "${ACTIVATION_PERSISTENT_DISABLED:-0}" == "1" \
+      || "${ACTIVATION_WRITERS_STOPPED:-0}" == "1" ]]; then
+      if [[ "${ACTIVATION_RECOVERY:-0}" == "0" \
+        && "${ACTIVATION_MIGRATION_ATTEMPTED:-0}" == "0" ]]; then
+        if stop_all_units && (
+          if [[ "${ACTIVATION_SWITCHED:-0}" == "1" ]]; then
+            restore_current "$ACTIVATION_PREVIOUS_CURRENT"
+          fi
+          if [[ "${ACTIVATION_DATABASE_PROFILE_SWITCHED:-0}" == "1" \
+            && -n "${ACTIVATION_PREVIOUS_DATABASE_ENV:-}" ]]; then
+            install -m 0600 -o root -g root -- \
+              "$ACTIVATION_PREVIOUS_DATABASE_ENV" "$ACTIVE_DATABASE_ENV"
+          fi
+          [[ "$ACTIVATION_PREVIOUS_CURRENT" != "NONE" ]]
+          start_services
+          wait_for_health
+          verify_service_release "$ACTIVATION_PREVIOUS_CURRENT"
+          start_timers
+          enable_persistent_units
+          verify_persistent_units
+          clear_recovery_marker "$ACTIVATION_RECOVERY_TOKEN"
+        ); then
+          restored=1
+          printf 'ERROR: 发布失败，数据库未迁移，已恢复并验证旧应用。\n' >&2
+        fi
+      fi
+      if [[ "$restored" == "0" ]]; then
+        if ensure_fail_closed_state; then
+          printf 'CRITICAL: 发布未能安全恢复；所有 writer 已确认停止且持久禁用，必须使用 backend recover。\n' >&2
+        else
+          printf 'CRITICAL: 发布未能安全恢复，且无法确认所有 writer 已停止/禁用；禁止重启主机并立即人工隔离。\n' >&2
+        fi
+        if [[ "${ACTIVATION_MIGRATION_ATTEMPTED:-0}" == "1" ]]; then
+          printf 'CRITICAL: 数据库迁移已经尝试，禁止自动 downgrade/restore。\n' >&2
+          printf 'CRITICAL_BACKUP=%s/%s_before_%s.dump\n' \
+            "$BACKUP_ROOT" \
+            "${SELECTED_DATABASE_PROFILE}_${SELECTED_DATABASE_NAME}" \
+            "$ACTIVATION_RELEASE_ID" >&2
+        fi
       fi
     fi
+    [[ -z "${ACTIVATION_PREVIOUS_DATABASE_ENV:-}" ]] \
+      || rm -f -- "$ACTIVATION_PREVIOUS_DATABASE_ENV"
     exit "$exit_code"
   }
   activation_signal() {
@@ -665,12 +2897,18 @@ action_activate() {
   trap activation_failure EXIT
   trap activation_signal INT TERM HUP
 
+  if [[ -n "$SELECTED_DATABASE_ENV" ]]; then
+    ACTIVATION_PREVIOUS_DATABASE_ENV="$(mktemp "$REMOTE_ROOT/.database-active.previous.XXXXXX")"
+    chmod 0600 "$ACTIVATION_PREVIOUS_DATABASE_ENV"
+    cp --no-dereference -- "$ACTIVE_DATABASE_ENV" "$ACTIVATION_PREVIOUS_DATABASE_ENV"
+  fi
+
   assert_upload_safety "$stage_dir"
   [[ ! -e "$partial_root" && ! -L "$partial_root" ]] || fail "partial 目录已存在"
   [[ ! -e "$release_root" && ! -L "$release_root" ]] || fail "版本目录已存在"
 
   install -d -m 0755 -o root -g root -- "$partial_root"
-  partial_created=1
+  ACTIVATION_PARTIAL_CREATED=1
   cp --no-dereference --reflink=never -- "$stage_dir/backend.tar" "$partial_root/backend.tar"
   [[ -f "$partial_root/backend.tar" && ! -L "$partial_root/backend.tar" ]] \
     || fail "接管后的 backend.tar 不是普通文件"
@@ -690,46 +2928,97 @@ action_activate() {
   verify_source_checksums "$backend" true
   verify_release_metadata "$backend" "$release_id" "$expected_commit" "$artifact_db_head"
   install_runtime "$backend" "$expected_checksums"
+	validate_target_application_contract "$backend"
+  if [[ "$initial_activation" == "1" ]]; then
+    actual_db="$(migration_db_revision_for_release "$backend")"
+    valid_revision "$actual_db" || fail "首次发布未读取到合法数据库 revision"
+  fi
   assert_revision_path "$backend" "$actual_db" "$artifact_db_head"
   assert_database_targets "$backend"
+	validate_migration_database_privileges "$backend"
+	validate_runtime_database_privileges "$backend" safety
+	validate_backup_database_privileges "$backend" safety
+	validate_property_video_direct_upload "$backend"
   chown -hR root:root "$partial_root"
   chmod -R go-w "$partial_root"
   mv -- "$partial_root" "$release_root"
-  partial_created=0
+  ACTIVATION_PARTIAL_CREATED=0
   backend="$release_root/backend"
   [[ "$artifact_db_head" == "$actual_db" ]] || migration_required=1
 
-  writers_stopped=1
+  marker_previous_current="$actual_current"
+  write_recovery_marker "$release_id" "$backend" "$marker_previous_current" \
+    "$initial_flag" prepared "$actual_db" "$marker_token"
+  marker_token="$(recovery_marker_token)"
+  ACTIVATION_RECOVERY_TOKEN="$marker_token"
+  ACTIVATION_MARKER_WRITTEN=1
+  ACTIVATION_PERSISTENT_DISABLED=1
+  disable_persistent_units
+  verify_persistent_units_disabled
   stop_writers
+  ACTIVATION_WRITERS_STOPPED=1
+  write_recovery_marker "$release_id" "$backend" "$marker_previous_current" \
+    "$initial_flag" stopped "$actual_db" "$marker_token"
+  marker_token="$(recovery_marker_token)"
+  ACTIVATION_RECOVERY_TOKEN="$marker_token"
+  observed_db="$(migration_db_revision_for_release "$backend")"
+  [[ "$observed_db" == "$actual_db" ]] || fail "停写后数据库 revision 与预检不一致"
+  if [[ -n "$SELECTED_DATABASE_ENV" ]]; then
+    switch_active_database_profile
+    ACTIVATION_DATABASE_PROFILE_SWITCHED=1
+  fi
+  apply_database_role_grants "$backend"
+  validate_runtime_database_privileges "$backend"
+  validate_backup_database_privileges "$backend"
   if [[ "$migration_required" == "1" ]]; then
     create_database_backup "$release_id"
-    migration_attempted=1
+    write_recovery_marker "$release_id" "$backend" "$marker_previous_current" \
+      "$initial_flag" migrating "$actual_db" "$marker_token"
+    marker_token="$(recovery_marker_token)"
+    ACTIVATION_RECOVERY_TOKEN="$marker_token"
+    ACTIVATION_MIGRATION_ATTEMPTED=1
     run_migrations "$backend"
-    [[ "$(db_revision_for_release "$backend")" == "$artifact_db_head" ]] || fail "迁移后 DB revision 不正确"
+    apply_database_role_grants "$backend"
+    [[ "$(migration_db_revision_for_release "$backend")" == "$artifact_db_head" ]] \
+      || fail "迁移后 DB revision 不正确"
+    validate_runtime_database_privileges "$backend"
+    validate_backup_database_privileges "$backend"
   fi
   switch_current "$backend"
-  switched=1
+  ACTIVATION_SWITCHED=1
   start_services
   wait_for_health || fail "新版本健康检查失败"
   verify_service_release "$backend"
   start_timers
+  ACTIVATION_ENABLE_ATTEMPTED=1
+  enable_persistent_units
+  verify_persistent_units
   final_db="$(db_revision_for_release "$backend")"
-  writers_stopped=0
+  [[ "$final_db" == "$artifact_db_head" ]] || fail "最终 DB revision 与产物 head 不一致"
+  trap '' INT TERM HUP
+  clear_recovery_marker "$marker_token"
+  ACTIVATION_WRITERS_STOPPED=0
+  ACTIVATION_MARKER_WRITTEN=0
   trap - EXIT INT TERM HUP
+  [[ -z "$ACTIVATION_PREVIOUS_DATABASE_ENV" ]] \
+    || rm -f -- "$ACTIVATION_PREVIOUS_DATABASE_ENV"
   rm -rf -- "$stage_dir" || printf 'WARNING: staging 清理失败：%s\n' "$stage_dir" >&2
   printf 'ACTIVATED=%s\nDB_REVISION=%s\n' "$backend" "$final_db"
 }
 
 action_rollback() {
   local release_id="$1" expected_current="$2" expected_db_revision="$3" acknowledgement="$4"
-  local actual_current actual_db target target_head final_db switched=0 writers_stopped=0
+  local actual_current actual_db target target_head final_db marker_token=NONE
   valid_release_id "$release_id" || fail "release_id 格式非法"
   valid_revision "$expected_db_revision" || fail "expected DB revision 格式非法"
   [[ "$acknowledgement" == "ACK_DB_SCHEMA_COMPATIBLE" ]] || fail "缺少数据库兼容确认"
   target="$RELEASES_ROOT/$release_id/backend"
   [[ -d "$target" ]] || fail "回滚版本不存在"
+	assert_release_environment "$target"
   acquire_lock
+  select_database_profile active
   validate_server_contract
+  assert_no_recovery_marker
   actual_current="$(current_target)"
   actual_db="$(current_db_revision)"
   [[ "$actual_current" == "$expected_current" ]] || fail "backend-current 已变化"
@@ -739,17 +3028,47 @@ action_rollback() {
   verify_source_checksums "$target" false
   assert_installed_release_safety "$target"
   assert_revision_path "$actual_current" "$target_head" "$actual_db"
+  validate_target_application_contract "$target"
+  assert_database_targets "$target"
+  validate_migration_database_privileges "$target"
+  validate_runtime_database_privileges "$target" safety
+  validate_backup_database_privileges "$target" safety
+  validate_property_video_direct_upload "$target"
+
+  ROLLBACK_PREVIOUS_CURRENT="$actual_current"
+  ROLLBACK_WRITERS_STOPPED=0
+  ROLLBACK_SWITCHED=0
+  ROLLBACK_MARKER_WRITTEN=0
+  ROLLBACK_RECOVERY_TOKEN=NONE
 
   rollback_failure() {
-    local exit_code=$?
+    local exit_code=$? restored=0
     trap - EXIT INT TERM HUP
     [[ "$exit_code" -ne 0 ]] || exit_code=1
-    if [[ "$writers_stopped" == "1" ]]; then
-      stop_all_units
-      if [[ "$switched" == "1" ]]; then switch_current "$actual_current"; fi
-      start_services || true
-      start_timers || true
-      printf 'ERROR: 应用回滚失败，已尝试恢复原应用指向。数据库从未被回滚。\n' >&2
+    if [[ "${ROLLBACK_MARKER_WRITTEN:-0}" == "1" \
+      || "${ROLLBACK_WRITERS_STOPPED:-0}" == "1" ]]; then
+      if stop_all_units && (
+        if [[ "${ROLLBACK_SWITCHED:-0}" == "1" ]]; then
+          switch_current "$ROLLBACK_PREVIOUS_CURRENT"
+        fi
+        start_services
+        wait_for_health
+        verify_service_release "$ROLLBACK_PREVIOUS_CURRENT"
+        start_timers
+        enable_persistent_units
+        verify_persistent_units
+        clear_recovery_marker "$ROLLBACK_RECOVERY_TOKEN"
+      ); then
+        restored=1
+        printf 'ERROR: 应用回滚失败，已恢复并验证原应用。数据库从未被回滚。\n' >&2
+      fi
+      if [[ "$restored" == "0" ]]; then
+        if ensure_fail_closed_state; then
+          printf 'CRITICAL: 应用回滚失败且原应用未能恢复；writer 已停止并持久禁用，请使用 backend recover。\n' >&2
+        else
+          printf 'CRITICAL: 应用回滚失败且无法确认 writer 已停止/禁用；禁止重启主机并立即人工隔离。\n' >&2
+        fi
+      fi
     fi
     exit "$exit_code"
   }
@@ -759,49 +3078,78 @@ action_rollback() {
   }
   trap rollback_failure EXIT
   trap rollback_signal INT TERM HUP
-  writers_stopped=1
+  write_recovery_marker "$release_id" "$target" "$actual_current" false prepared "$actual_db" "$marker_token"
+  marker_token="$(recovery_marker_token)"
+  ROLLBACK_RECOVERY_TOKEN="$marker_token"
+  ROLLBACK_MARKER_WRITTEN=1
+  disable_persistent_units
+  verify_persistent_units_disabled
   stop_writers
+  ROLLBACK_WRITERS_STOPPED=1
+  write_recovery_marker "$release_id" "$target" "$actual_current" false stopped "$actual_db" "$marker_token"
+  marker_token="$(recovery_marker_token)"
+  ROLLBACK_RECOVERY_TOKEN="$marker_token"
+  [[ "$(migration_db_revision_for_release "$target")" == "$actual_db" ]] \
+    || fail "回滚停写后数据库 revision 已变化"
+  apply_database_role_grants "$target"
+  validate_runtime_database_privileges "$target"
+  validate_backup_database_privileges "$target"
   switch_current "$target"
-  switched=1
+  ROLLBACK_SWITCHED=1
   start_services
   wait_for_health || fail "回滚版本健康检查失败"
   verify_service_release "$target"
   start_timers
+  enable_persistent_units
+  verify_persistent_units
   final_db="$(db_revision_for_release "$target")"
-  writers_stopped=0
+  [[ "$final_db" == "$actual_db" ]] || fail "回滚后数据库 revision 已变化"
+  trap '' INT TERM HUP
+  clear_recovery_marker "$marker_token"
+  ROLLBACK_WRITERS_STOPPED=0
+  ROLLBACK_MARKER_WRITTEN=0
   trap - EXIT INT TERM HUP
   printf 'ROLLED_BACK=%s\nDB_REVISION=%s\n' "$target" "$final_db"
 }
 
 case "${1:-}" in
   version)
+    [[ "$#" -eq 1 ]] || fail "version 参数数量错误"
     printf '%s\n' "$HELPER_VERSION"
     ;;
+  fingerprint)
+    [[ "$#" -eq 1 ]] || fail "fingerprint 参数数量错误"
+    sha256sum "$0" | awk '{print $1}'
+    ;;
   preflight)
-    [[ "$#" -eq 1 ]] || fail "preflight 参数数量错误"
-    action_preflight
+    [[ "$#" -eq 3 ]] || fail "preflight 参数数量错误"
+    action_preflight "$2" "$3"
+    ;;
+  env-audit)
+    [[ "$#" -eq 2 ]] || fail "env-audit 参数数量错误"
+    action_env_audit "$2"
     ;;
   prepare)
-    [[ "$#" -eq 2 ]] || fail "prepare 参数数量错误"
-    action_prepare "$2"
+    [[ "$#" -eq 5 ]] || fail "prepare 参数数量错误"
+    action_prepare "$2" "$3" "$4" "$5"
     ;;
   abort)
     [[ "$#" -eq 2 ]] || fail "abort 参数数量错误"
     action_abort "$2"
     ;;
   status)
-    [[ "$#" -eq 1 ]] || fail "status 参数数量错误"
-    action_status
+    [[ "$#" -eq 2 ]] || fail "status 参数数量错误"
+    action_status "$2"
     ;;
   activate)
-    [[ "$#" -eq 8 ]] || fail "activate 参数数量错误"
-    action_activate "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+    [[ "$#" -eq 11 ]] || fail "activate 参数数量错误"
+    action_activate "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
     ;;
   rollback)
     [[ "$#" -eq 5 ]] || fail "rollback 参数数量错误"
     action_rollback "$2" "$3" "$4" "$5"
     ;;
   *)
-    fail "用法：loumai-backend-release version|preflight|prepare|abort|status|activate|rollback"
+    fail "用法：loumai-backend-release version|fingerprint|preflight|env-audit|prepare|abort|status|activate|rollback（发布模式：bootstrap|deploy|recover）"
     ;;
 esac

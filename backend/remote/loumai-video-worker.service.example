@@ -1,0 +1,49 @@
+[Unit]
+Description=Loumai Property Video Transcode Worker
+After=network-online.target postgresql.service redis-server.service loumai-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/loumai-backend/backend-current
+EnvironmentFile=/etc/loumai/backend.env
+EnvironmentFile=/etc/loumai/sms.env
+EnvironmentFile=/etc/loumai/database-active.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/test -x /opt/loumai-runtime/ffmpeg/bin/ffmpeg
+ExecStartPre=/usr/bin/test -x /opt/loumai-runtime/ffmpeg/bin/ffprobe
+ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python scripts/run_video_transcode_worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/loumai-video/tmp
+
+# 测试服 2 vCPU / 4 GiB：单并发 Worker + FFmpeg 单线程的外层硬限制。
+MemoryHigh=1G
+MemoryMax=1200M
+CPUQuota=150%
+TasksMax=96
+LimitNOFILE=4096
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

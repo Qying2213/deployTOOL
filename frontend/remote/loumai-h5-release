@@ -5,7 +5,7 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 unset BASH_ENV ENV CDPATH TAR_OPTIONS
 umask 022
 
-readonly HELPER_VERSION="2"
+readonly HELPER_VERSION="4"
 readonly CONFIG_FILE="/etc/loumai/h5-release.env"
 
 config_parent="${CONFIG_FILE%/*}"
@@ -71,11 +71,13 @@ unset BASH_ENV ENV CDPATH TAR_OPTIONS
 : "${LOUMAI_H5_STAGING_ROOT:?缺少 LOUMAI_H5_STAGING_ROOT}"
 : "${LOUMAI_H5_PUBLIC_URL:?缺少 LOUMAI_H5_PUBLIC_URL}"
 : "${LOUMAI_H5_DEPLOY_USER:?缺少 LOUMAI_H5_DEPLOY_USER}"
+: "${LOUMAI_H5_ENVIRONMENT:?缺少 LOUMAI_H5_ENVIRONMENT}"
 
 readonly REMOTE_ROOT="$LOUMAI_H5_REMOTE_ROOT"
 readonly STAGING_ROOT="$LOUMAI_H5_STAGING_ROOT"
 readonly PUBLIC_URL="${LOUMAI_H5_PUBLIC_URL%/}"
 readonly DEPLOY_USER="$LOUMAI_H5_DEPLOY_USER"
+readonly DEPLOY_ENVIRONMENT="$LOUMAI_H5_ENVIRONMENT"
 readonly WEB_USER="${LOUMAI_H5_WEB_USER:-www-data}"
 readonly NGINX_BIN="${LOUMAI_H5_NGINX_BIN:-/usr/sbin/nginx}"
 readonly RELEASES_ROOT="$REMOTE_ROOT/frontend-releases"
@@ -89,6 +91,8 @@ ROLLBACK_RELEASE_ID=""
 
 valid_absolute_path "$REMOTE_ROOT" || fail "REMOTE_ROOT 不是安全绝对路径"
 valid_absolute_path "$STAGING_ROOT" || fail "STAGING_ROOT 不是安全绝对路径"
+[[ "$DEPLOY_ENVIRONMENT" == "test" || "$DEPLOY_ENVIRONMENT" == "production" ]] \
+  || fail "LOUMAI_H5_ENVIRONMENT 必须为 test 或 production"
 [[ "$PUBLIC_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] \
   || fail "PUBLIC_URL 必须是 HTTPS 根地址"
 [[ "$NGINX_BIN" == /* ]] || fail "NGINX_BIN 必须是绝对路径"
@@ -122,6 +126,10 @@ assert_release_directories() {
   assert_root_controlled_directory "$RELEASES_ROOT"
   assert_root_controlled_directory "$STAGING_ROOT"
   id "$DEPLOY_USER" >/dev/null 2>&1 || fail "服务器不存在发布用户：$DEPLOY_USER"
+  if [[ "$DEPLOY_ENVIRONMENT" == "production" ]] \
+    && id -nG "$DEPLOY_USER" | tr ' ' '\n' | grep -Eq '^(root|sudo|admin|wheel)$'; then
+    fail "正式服发布用户不能属于通用提权组"
+  fi
 }
 
 current_target() {
@@ -234,6 +242,8 @@ verify_release_metadata() {
     || fail "release.json 的 commit 不匹配"
   grep -Fq "\"index_sha256\": \"$expected_index_sha\"" "$frontend_dir/release.json" \
     || fail "release.json 的 index_sha256 不匹配"
+  grep -Fq "\"environment\": \"$DEPLOY_ENVIRONMENT\"" "$frontend_dir/release.json" \
+    || fail "release.json 的 environment 与服务器部署环境不匹配"
 
   actual_index_sha="$(sha256sum "$frontend_dir/index.html" | awk '{print $1}')"
   [[ "$actual_index_sha" == "$expected_index_sha" ]] \
@@ -350,6 +360,8 @@ public_verify() {
     result=1
   elif ! grep -Fq "\"commit\": \"$expected_commit\"" "$response_file"; then
     result=1
+  elif ! grep -Fq "\"environment\": \"$DEPLOY_ENVIRONMENT\"" "$response_file"; then
+    result=1
   elif ! curl -fsSL --connect-timeout 5 --max-time 30 \
     --retry 2 --retry-delay 1 --retry-max-time 60 --max-filesize 8388608 \
     "$PUBLIC_URL/?release_check=$release_id" \
@@ -401,13 +413,34 @@ extract_release_field() {
   sed -n "s/.*\"$field\": \"\([^\"]*\)\".*/\1/p" "$manifest" | head -1
 }
 
+assert_current_release_environment() {
+  local current="$1"
+  local release_id expected_commit expected_index_sha
+
+  [[ -n "$current" ]] || return 0
+  [[ -f "$current/release.json" ]] || fail "当前版本缺少 release.json"
+  release_id="$(basename "$(dirname "$current")")"
+  expected_commit="$(extract_release_field "$current/release.json" commit)"
+  expected_index_sha="$(extract_release_field "$current/release.json" index_sha256)"
+  valid_release_id "$release_id" || fail "当前版本 release_id 非法"
+  valid_commit "$expected_commit" || fail "当前版本 commit 非法"
+  valid_sha256 "$expected_index_sha" || fail "当前版本 index sha256 非法"
+  verify_checksums "$current" allow-inherited-assets
+  verify_release_metadata "$current" "$release_id" "$expected_commit" "$expected_index_sha"
+}
+
 action_preflight() {
+  local current
   assert_release_directories
   "$NGINX_BIN" -t >/dev/null
+  current="$(current_target)"
+  assert_current_release_environment "$current"
   printf 'HELPER_VERSION=%s\n' "$HELPER_VERSION"
+  printf 'ENVIRONMENT=%s\n' "$DEPLOY_ENVIRONMENT"
   printf 'REMOTE_ROOT=%s\n' "$REMOTE_ROOT"
   printf 'STAGING_ROOT=%s\n' "$STAGING_ROOT"
-  printf 'CURRENT=%s\n' "$(current_target)"
+  printf 'PUBLIC_URL=%s\n' "$PUBLIC_URL"
+  printf 'CURRENT=%s\n' "$current"
 }
 
 action_prepare() {
@@ -452,6 +485,8 @@ action_status() {
   local current
   assert_release_directories
   current="$(current_target)"
+  assert_current_release_environment "$current"
+  printf 'ENVIRONMENT=%s\n' "$DEPLOY_ENVIRONMENT"
   printf 'CURRENT=%s\n' "$current"
   if [[ -n "$current" && -f "$current/release.json" ]]; then
     cat "$current/release.json"
@@ -520,6 +555,7 @@ action_activate() {
     assert_stage_safety "$actual_current"
     [[ -z "$(find "$actual_current" \( ! -user root -o ! -group root \) -print -quit)" ]] \
       || fail "当前版本包含非 root 所有内容"
+    assert_current_release_environment "$actual_current"
   fi
   assert_asset_collisions_safe "$partial_root/frontend" "$actual_current"
   merge_previous_assets "$actual_current" "$partial_root/frontend"
@@ -571,6 +607,7 @@ action_rollback() {
   assert_stage_safety "$actual_current"
   [[ -z "$(find "$actual_current" \( ! -user root -o ! -group root \) -print -quit)" ]] \
     || fail "当前版本包含非 root 所有内容"
+  assert_current_release_environment "$actual_current"
 
   target_frontend="$RELEASES_ROOT/$release_id/frontend"
   [[ -d "$target_frontend" ]] || fail "回滚版本不存在：$target_frontend"
@@ -605,36 +642,92 @@ action_rollback() {
   fi
   disarm_current_rollback
 
-  printf 'ROLLED_BACK=%s\n' "$target_frontend"
+	printf 'ROLLED_BACK=%s\n' "$target_frontend"
+}
+
+action_check_release() {
+  local release_id="$1"
+  local expected_current="$2"
+  local target_frontend actual_current after_current expected_commit expected_index_sha
+
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  actual_current="$(current_target)"
+  [[ -n "$actual_current" && -d "$actual_current" ]] \
+    || fail "当前前端版本不存在，不能检查 rollback"
+  [[ "${actual_current:-NONE}" == "$expected_current" ]] \
+    || fail "frontend-current 已被其他发布修改，拒绝预演回滚"
+  assert_stage_safety "$actual_current"
+  [[ -z "$(find "$actual_current" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "当前版本包含非 root 所有内容"
+  assert_current_release_environment "$actual_current"
+
+  target_frontend="$RELEASES_ROOT/$release_id/frontend"
+  [[ -d "$target_frontend" ]] || fail "回滚版本不存在：$target_frontend"
+  [[ -f "$target_frontend/release.json" ]] || fail "回滚版本缺少 release.json"
+  assert_root_controlled_directory "$target_frontend"
+  assert_stage_safety "$target_frontend"
+  [[ -z "$(find "$target_frontend" \( ! -user root -o ! -group root \) -print -quit)" ]] \
+    || fail "回滚版本包含非 root 所有内容"
+
+  expected_commit="$(extract_release_field "$target_frontend/release.json" commit)"
+  expected_index_sha="$(extract_release_field "$target_frontend/release.json" index_sha256)"
+  valid_commit "$expected_commit" || fail "回滚版本 commit 非法"
+  valid_sha256 "$expected_index_sha" || fail "回滚版本 index sha256 非法"
+  verify_checksums "$target_frontend" allow-inherited-assets
+  verify_release_metadata "$target_frontend" "$release_id" "$expected_commit" "$expected_index_sha"
+  [[ "$actual_current" != "$target_frontend" ]] || fail "目标版本已经是当前版本"
+  assert_asset_collisions_safe "$actual_current" "$target_frontend"
+
+  after_current="$(current_target)"
+  [[ "$after_current" == "$actual_current" ]] \
+    || fail "检查期间 frontend-current 已变化，请重新执行"
+  printf 'RELEASE_VALID=%s\n' "$target_frontend"
 }
 
 case "${1:-}" in
   version)
     printf '%s\n' "$HELPER_VERSION"
     ;;
+  fingerprint)
+    [[ "$#" -eq 1 ]] || fail "fingerprint 参数数量错误"
+    sha256sum "$0" | awk '{print $1}'
+    ;;
   preflight)
+    [[ "$#" -eq 2 ]] || fail "preflight 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
     action_preflight
     ;;
   prepare)
-    [[ "$#" -eq 2 ]] || fail "prepare 参数数量错误"
-    action_prepare "$2"
+    [[ "$#" -eq 3 ]] || fail "prepare 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
+    action_prepare "$3"
     ;;
   abort)
-    [[ "$#" -eq 2 ]] || fail "abort 参数数量错误"
-    action_abort "$2"
+    [[ "$#" -eq 3 ]] || fail "abort 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
+    action_abort "$3"
     ;;
   status)
+    [[ "$#" -eq 2 ]] || fail "status 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
     action_status
     ;;
   activate)
-    [[ "$#" -eq 7 ]] || fail "activate 参数数量错误"
-    action_activate "$2" "$3" "$4" "$5" "$6" "$7"
+    [[ "$#" -eq 8 ]] || fail "activate 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
+    action_activate "$3" "$4" "$5" "$6" "$7" "$8"
     ;;
   rollback)
-    [[ "$#" -eq 3 ]] || fail "rollback 参数数量错误"
-    action_rollback "$2" "$3"
+    [[ "$#" -eq 4 ]] || fail "rollback 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
+    action_rollback "$3" "$4"
+    ;;
+  check-release)
+    [[ "$#" -eq 4 ]] || fail "check-release 参数数量错误"
+    [[ "$2" == "$DEPLOY_ENVIRONMENT" ]] || fail "部署环境不匹配：请求 $2，服务器 $DEPLOY_ENVIRONMENT"
+    action_check_release "$3" "$4"
     ;;
   *)
-    fail "用法：loumai-h5-release version|preflight|prepare|abort|status|activate|rollback"
+    fail "用法：loumai-h5-release version|fingerprint|preflight|prepare|abort|status|activate|check-release|rollback"
     ;;
 esac

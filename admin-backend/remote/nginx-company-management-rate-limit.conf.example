@@ -1,0 +1,2 @@
+# 必须位于 Nginx http 上下文（/etc/nginx/conf.d 会在当前服务器的 http 中加载）。
+limit_req_zone $binary_remote_addr zone=loumai_admin_login:10m rate=10r/m;

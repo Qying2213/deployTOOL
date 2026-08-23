@@ -1,0 +1,45 @@
+# Requires the loumai_no_query log format from nginx-no-media-ticket-log.conf.example
+# in nginx.conf's http {} block. Replace certificate paths only after DNS is ready.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name api.yinlizhangyu.com;
+    access_log /var/log/nginx/loumai-api.access.log loumai_no_query;
+    return 301 https://api.yinlizhangyu.com$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name api.yinlizhangyu.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.yinlizhangyu.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.yinlizhangyu.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+    client_max_body_size 220m;
+
+    access_log /var/log/nginx/loumai-api.access.log loumai_no_query;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 75s;
+        proxy_send_timeout 75s;
+    }
+}

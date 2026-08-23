@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+[[ $# == 1 ]] || { echo "用法：$0 BUNDLE_DIR" >&2; exit 2; }
+readonly BUNDLE="$(readlink -f "$1")"
+[[ -d "$BUNDLE" && ! -L "$BUNDLE" && "$BUNDLE" == /tmp/* ]] \
+  || { echo "安装包必须是 /tmp 下的真实目录" >&2; exit 1; }
+
+readonly STAMP="$(date +%Y%m%d-%H%M%S)"
+readonly BACKUP="/etc/loumai/.company-management-install-$STAMP"
+readonly SERVICE="loumai-company-management.service"
+readonly -a TARGETS=(
+  /usr/local/sbin/loumai-company-management-release
+  /usr/local/sbin/loumai-company-management-run
+  /etc/systemd/system/loumai-company-management.service
+  /etc/nginx/conf.d/loumai-company-management-rate-limit.conf
+  /etc/nginx/snippets/loumai-company-management-api.conf
+  /etc/loumai/company-management-release.env
+)
+readonly -a KEYS=(release-helper service-runner systemd-unit nginx-rate-limit nginx-api-snippet release-env)
+
+for required in \
+  loumai-company-management-release \
+  loumai-company-management-run \
+  loumai-company-management.service \
+  nginx-company-management-rate-limit.conf \
+  nginx-company-management-api.conf \
+  company-management-release.env; do
+  [[ -f "$BUNDLE/$required" && ! -L "$BUNDLE/$required" ]] \
+    || { echo "安装包缺少安全文件：$required" >&2; exit 1; }
+done
+
+install -d -m 0700 -o root -g root "$BACKUP"
+for index in "${!TARGETS[@]}"; do
+  target="${TARGETS[$index]}"
+  key="${KEYS[$index]}"
+  if [[ -e "$target" || -L "$target" ]]; then
+    cp -a -- "$target" "$BACKUP/$key"
+  else
+    : > "$BACKUP/$key.absent"
+  fi
+done
+
+restore_previous_install() {
+  local rc="$1" index target key
+  trap - ERR
+  set +e
+  printf '安装失败，正在恢复安装前配置（backup=%s）\n' "$BACKUP" >&2
+  for index in "${!TARGETS[@]}"; do
+    target="${TARGETS[$index]}"
+    key="${KEYS[$index]}"
+    if [[ -e "$BACKUP/$key" || -L "$BACKUP/$key" ]]; then
+      rm -f -- "$target"
+      cp -a -- "$BACKUP/$key" "$target"
+    elif [[ -f "$BACKUP/$key.absent" ]]; then
+      rm -f -- "$target"
+    fi
+  done
+  systemctl daemon-reload
+  if nginx -t; then systemctl reload nginx; fi
+  systemctl restart "$SERVICE"
+  exit "$rc"
+}
+trap 'restore_previous_install $?' ERR
+
+install -m 0755 -o root -g root \
+  "$BUNDLE/loumai-company-management-release" \
+  /usr/local/sbin/loumai-company-management-release
+install -m 0755 -o root -g root \
+  "$BUNDLE/loumai-company-management-run" \
+  /usr/local/sbin/loumai-company-management-run
+install -m 0644 -o root -g root \
+  "$BUNDLE/loumai-company-management.service" \
+  /etc/systemd/system/loumai-company-management.service
+install -m 0644 -o root -g root \
+  "$BUNDLE/nginx-company-management-rate-limit.conf" \
+  /etc/nginx/conf.d/loumai-company-management-rate-limit.conf
+install -m 0644 -o root -g root \
+  "$BUNDLE/nginx-company-management-api.conf" \
+  /etc/nginx/snippets/loumai-company-management-api.conf
+if [[ ! -f /etc/loumai/company-management-release.env ]]; then
+  install -m 0600 -o root -g root \
+    "$BUNDLE/company-management-release.env" \
+    /etc/loumai/company-management-release.env
+fi
+
+systemctl daemon-reload
+nginx -t
+systemctl reload nginx
+systemctl restart "$SERVICE"
+
+healthy=false
+for _ in $(seq 1 45); do
+  if curl -fsS --max-time 5 http://127.0.0.1:8100/health >/dev/null \
+    && curl -fsS --max-time 8 https://test.yinlizhangyu.com/admin-api/health >/dev/null \
+    && curl -fsS --max-time 8 https://test.yinlizhangyu.com/admin-api/ready >/dev/null; then
+    healthy=true
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$healthy" != true ]]; then
+  systemctl status "$SERVICE" --no-pager -l || true
+  journalctl -u "$SERVICE" -n 100 --no-pager || true
+  false
+fi
+
+trap - ERR
+printf 'INSTALL_OK=%s\nBACKUP=%s\n' "$STAMP" "$BACKUP"

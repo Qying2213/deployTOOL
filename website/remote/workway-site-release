@@ -1,0 +1,664 @@
+#!/bin/bash
+
+set -eEuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS
+umask 022
+
+readonly HELPER_VERSION="1"
+readonly CONFIG_FILE="/etc/workway-site-release.env"
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "服务器缺少命令：$1"
+}
+
+valid_release_id() {
+  [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7,12}$ ]]
+}
+
+valid_sha256() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+valid_commit() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+valid_domain() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+}
+
+valid_absolute_path() {
+  [[ "$1" == /* && "$1" != "/" && "$1" != *".."* && "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
+}
+
+[[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || fail "缺少服务器配置：$CONFIG_FILE"
+[[ "$(stat -c '%u' "$CONFIG_FILE")" == "0" ]] || fail "服务器配置必须归 root 所有"
+[[ -z "$(find "$CONFIG_FILE" -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "服务器配置不能允许组或其他用户写入"
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS
+
+: "${WORKWAY_SITE_REMOTE_ROOT:?缺少 WORKWAY_SITE_REMOTE_ROOT}"
+: "${WORKWAY_SITE_PRIMARY_DOMAIN:?缺少 WORKWAY_SITE_PRIMARY_DOMAIN}"
+: "${WORKWAY_SITE_EXPECTED_IPV4:?缺少 WORKWAY_SITE_EXPECTED_IPV4}"
+: "${WORKWAY_SITE_DEPLOY_USER:?缺少 WORKWAY_SITE_DEPLOY_USER}"
+
+readonly REMOTE_ROOT="$WORKWAY_SITE_REMOTE_ROOT"
+readonly PRIMARY_DOMAIN="$WORKWAY_SITE_PRIMARY_DOMAIN"
+readonly WWW_DOMAIN="${WORKWAY_SITE_WWW_DOMAIN:-}"
+readonly EXPECTED_IPV4="$WORKWAY_SITE_EXPECTED_IPV4"
+readonly DEPLOY_USER="$WORKWAY_SITE_DEPLOY_USER"
+readonly CERTBOT_EMAIL="${WORKWAY_SITE_CERTBOT_EMAIL:-}"
+readonly RELEASES_ROOT="$REMOTE_ROOT/releases"
+readonly INCOMING_ROOT="$REMOTE_ROOT/incoming"
+readonly CURRENT_LINK="$REMOTE_ROOT/current"
+readonly LOCK_FILE="$REMOTE_ROOT/.site-release.lock"
+readonly NGINX_AVAILABLE="/etc/nginx/sites-available/workway-official"
+readonly NGINX_ENABLED="/etc/nginx/sites-enabled/workway-official"
+readonly ACME_ROOT="/var/www/workway-acme"
+readonly CERTBOT_RELOAD_HOOK="/etc/letsencrypt/renewal-hooks/deploy/reload-nginx"
+
+ROLLBACK_ARMED=0
+ROLLBACK_PREVIOUS=""
+ROLLBACK_TARGET=""
+ROLLBACK_RELEASE_ID=""
+CLEANUP_PARTIAL=""
+NGINX_ROLLBACK_ARMED=0
+NGINX_SNAPSHOT_DIR=""
+NGINX_AVAILABLE_EXISTED=0
+NGINX_ENABLED_EXISTED=0
+NGINX_ENABLED_TARGET=""
+NGINX_WRITE_TMP=""
+NGINX_LINK_TMP=""
+
+valid_absolute_path "$REMOTE_ROOT" || fail "官网远端根目录不是安全绝对路径"
+valid_domain "$PRIMARY_DOMAIN" || fail "主域名格式非法"
+[[ -z "$WWW_DOMAIN" ]] || valid_domain "$WWW_DOMAIN" || fail "WWW 域名格式非法"
+[[ "$EXPECTED_IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "预期 IPv4 格式非法"
+[[ "$PRIMARY_DOMAIN" != "test.yinlizhangyu.com" && "$WWW_DOMAIN" != "test.yinlizhangyu.com" ]] \
+  || fail "官网配置禁止接管测试域名"
+
+for name in flock sha256sum curl find readlink mv ln grep awk sed head sort uniq stat install cp \
+  chown chmod tar runuser nginx systemctl getent rsync; do
+  require_command "$name"
+done
+id "$DEPLOY_USER" >/dev/null 2>&1 || fail "服务器不存在发布用户：$DEPLOY_USER"
+
+assert_root_directory() {
+  local path="$1" checked unsafe
+  [[ -d "$path" && ! -L "$path" ]] || fail "目录不存在或是软链接：$path"
+  [[ "$(readlink -f "$path")" == "$path" ]] || fail "目录路径包含软链接：$path"
+  checked="$path"
+  while [[ "$checked" != "/" ]]; do
+    [[ "$(stat -c '%u' "$checked")" == "0" ]] || fail "目录必须归 root 所有：$checked"
+    unsafe="$(find "$checked" -maxdepth 0 -perm /022 -print -quit)"
+    [[ -z "$unsafe" ]] || fail "目录不能被组或其他用户写入：$checked"
+    checked="${checked%/*}"
+    [[ -n "$checked" ]] || checked="/"
+  done
+}
+
+ensure_directories() {
+  install -d -m 0755 -o root -g root -- "$REMOTE_ROOT" "$RELEASES_ROOT" "$INCOMING_ROOT" "$ACME_ROOT"
+  assert_root_directory "$REMOTE_ROOT"
+  assert_root_directory "$RELEASES_ROOT"
+  assert_root_directory "$INCOMING_ROOT"
+}
+
+acquire_lock() {
+  ensure_directories
+  [[ ! -L "$LOCK_FILE" ]] || fail "发布锁不能是软链接"
+  exec 9>"$LOCK_FILE"
+  flock -w 120 9 || fail "另一个官网发布仍在执行"
+}
+
+current_target() {
+  local target
+  if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+    printf '\n'
+    return 0
+  fi
+  [[ -L "$CURRENT_LINK" ]] || fail "current 必须是软链接"
+  target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+  [[ -n "$target" ]] || fail "current 是失效软链接"
+  [[ "$target" == "$RELEASES_ROOT"/*/site ]] || fail "current 指向官网版本目录之外"
+  assert_root_directory "$target"
+  printf '%s\n' "$target"
+}
+
+switch_current() {
+  local target="$1" release_id="$2" next_link="$REMOTE_ROOT/.current.next.$release_id.$$"
+  [[ ! -e "$next_link" && ! -L "$next_link" ]] || fail "临时软链接已存在"
+  ln -s -- "$target" "$next_link"
+  mv -Tf -- "$next_link" "$CURRENT_LINK"
+}
+
+restore_previous_current() {
+  local exit_code=$? actual=""
+  set +e
+  if [[ "$ROLLBACK_ARMED" == "1" ]]; then
+    ROLLBACK_ARMED=0
+    actual="$(readlink -f "$CURRENT_LINK" 2>/dev/null)"
+    if [[ "$actual" == "$ROLLBACK_TARGET" ]]; then
+      if [[ -n "$ROLLBACK_PREVIOUS" ]]; then
+        switch_current "$ROLLBACK_PREVIOUS" "restore-$ROLLBACK_RELEASE_ID"
+      else
+        rm -f -- "$CURRENT_LINK"
+      fi
+      printf '官网操作失败，已按 current 指向安全恢复旧版本。\n' >&2
+    fi
+  fi
+  if [[ "$NGINX_ROLLBACK_ARMED" == "1" ]]; then
+    NGINX_ROLLBACK_ARMED=0
+    [[ -z "$NGINX_WRITE_TMP" ]] || rm -f -- "$NGINX_WRITE_TMP"
+    [[ -z "$NGINX_LINK_TMP" ]] || rm -f -- "$NGINX_LINK_TMP"
+    if [[ "$NGINX_AVAILABLE_EXISTED" == "1" ]]; then
+      cp --no-dereference --reflink=never -- "$NGINX_SNAPSHOT_DIR/available" "$NGINX_AVAILABLE"
+      chown root:root "$NGINX_AVAILABLE"
+      chmod 0644 "$NGINX_AVAILABLE"
+    else
+      rm -f -- "$NGINX_AVAILABLE"
+    fi
+    if [[ "$NGINX_ENABLED_EXISTED" == "1" ]]; then
+      NGINX_LINK_TMP="$NGINX_ENABLED.restore.$$"
+      ln -s -- "$NGINX_ENABLED_TARGET" "$NGINX_LINK_TMP"
+      mv -Tf -- "$NGINX_LINK_TMP" "$NGINX_ENABLED"
+    else
+      rm -f -- "$NGINX_ENABLED"
+    fi
+    nginx -t >/dev/null 2>&1 && reload_nginx >/dev/null 2>&1
+    printf '官网操作失败，已恢复原 Nginx 配置。\n' >&2
+  fi
+  if [[ -n "$CLEANUP_PARTIAL" && "$CLEANUP_PARTIAL" == "$RELEASES_ROOT"/.*.partial \
+    && -d "$CLEANUP_PARTIAL" && ! -L "$CLEANUP_PARTIAL" ]]; then
+    rm -rf -- "$CLEANUP_PARTIAL"
+  fi
+  [[ -z "$NGINX_SNAPSHOT_DIR" ]] || rm -rf -- "$NGINX_SNAPSHOT_DIR"
+  set -e
+  return "$exit_code"
+}
+
+arm_current_rollback() {
+  ROLLBACK_PREVIOUS="$1"
+  ROLLBACK_TARGET="$2"
+  ROLLBACK_RELEASE_ID="$3"
+  ROLLBACK_ARMED=1
+}
+
+disarm_current_rollback() {
+  ROLLBACK_ARMED=0
+  ROLLBACK_PREVIOUS=""
+  ROLLBACK_TARGET=""
+  ROLLBACK_RELEASE_ID=""
+}
+
+trap restore_previous_current EXIT
+
+snapshot_nginx_state() {
+  [[ "$NGINX_ROLLBACK_ARMED" == "0" ]] || fail "Nginx 配置快照已经启用"
+  NGINX_SNAPSHOT_DIR="/etc/nginx/.workway-official.snapshot.$$"
+  install -d -m 0700 -o root -g root -- "$NGINX_SNAPSHOT_DIR"
+  if [[ -e "$NGINX_AVAILABLE" || -L "$NGINX_AVAILABLE" ]]; then
+    [[ -f "$NGINX_AVAILABLE" && ! -L "$NGINX_AVAILABLE" ]] || fail "官网 available 配置必须是普通文件"
+    cp --no-dereference --reflink=never -- "$NGINX_AVAILABLE" "$NGINX_SNAPSHOT_DIR/available"
+    NGINX_AVAILABLE_EXISTED=1
+  fi
+  if [[ -e "$NGINX_ENABLED" || -L "$NGINX_ENABLED" ]]; then
+    [[ -L "$NGINX_ENABLED" ]] || fail "官网 enabled 配置必须是软链接"
+    NGINX_ENABLED_TARGET="$(readlink "$NGINX_ENABLED")"
+    [[ -n "$NGINX_ENABLED_TARGET" ]] || fail "官网 enabled 软链接目标为空"
+    NGINX_ENABLED_EXISTED=1
+  fi
+  NGINX_ROLLBACK_ARMED=1
+}
+
+discard_nginx_snapshot() {
+  NGINX_ROLLBACK_ARMED=0
+  [[ -z "$NGINX_SNAPSHOT_DIR" ]] || rm -rf -- "$NGINX_SNAPSHOT_DIR"
+  NGINX_SNAPSHOT_DIR=""
+  NGINX_AVAILABLE_EXISTED=0
+  NGINX_ENABLED_EXISTED=0
+  NGINX_ENABLED_TARGET=""
+}
+
+assert_tree_safety() {
+  local root="$1" unsafe
+  [[ -d "$root" && ! -L "$root" ]] || fail "官网产物目录不存在或是软链接"
+  for required in index.html release.json SHA256SUMS loumai-ui/landlord/channels.html; do
+    [[ -f "$root/$required" && ! -L "$root/$required" ]] || fail "官网产物缺少：$required"
+  done
+  unsafe="$(find "$root" -type l -print -quit)"
+  [[ -z "$unsafe" ]] || fail "官网产物包含软链接：$unsafe"
+  unsafe="$(find "$root" ! -type d ! -type f -print -quit)"
+  [[ -z "$unsafe" ]] || fail "官网产物包含特殊文件：$unsafe"
+  unsafe="$(find "$root" -type f -links +1 -print -quit)"
+  [[ -z "$unsafe" ]] || fail "官网产物包含硬链接：$unsafe"
+  unsafe="$(find "$root" -mindepth 1 -name '.*' -print -quit)"
+  [[ -z "$unsafe" ]] || fail "官网产物包含隐藏文件：$unsafe"
+  unsafe="$(find "$root" -type f \( -iname '*.env' -o -iname '*.pem' -o -iname '*.key' \
+    -o -iname '*.p12' -o -iname '*.pfx' -o -iname '*.sql' -o -iname '*.sqlite' \
+    -o -iname '*.db' -o -iname '*.bak' \) -print -quit)"
+  [[ -z "$unsafe" ]] || fail "官网产物包含敏感文件：$unsafe"
+}
+
+verify_checksums() {
+  local root="$1" line hash relative absolute
+  local -A expected=()
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([0-9a-f]{64})\ \ ([A-Za-z0-9._/-]+)$ ]] || fail "SHA256SUMS 格式非法"
+    hash="${BASH_REMATCH[1]}"
+    relative="${BASH_REMATCH[2]}"
+    valid_sha256 "$hash" || fail "SHA256SUMS 包含非法哈希"
+    [[ "$relative" != /* && "$relative" != *".."* && "$relative" != "-" \
+      && "$relative" != "SHA256SUMS" ]] || fail "SHA256SUMS 包含不安全路径"
+    [[ ! "$relative" =~ (^|/)\. ]] || fail "SHA256SUMS 包含隐藏文件"
+    [[ ! "$relative" =~ \.(bak|db|env|key|p12|pem|pfx|sql|sqlite)$ ]] \
+      || fail "SHA256SUMS 包含敏感文件"
+    [[ -z "${expected[$relative]+x}" ]] || fail "SHA256SUMS 包含重复路径"
+    expected[$relative]=1
+  done < "$root/SHA256SUMS"
+  [[ "${#expected[@]}" -gt 10 ]] || fail "SHA256SUMS 文件数量异常"
+  (cd "$root" && sha256sum -c SHA256SUMS >/dev/null) || fail "官网文件哈希校验失败"
+  while IFS= read -r -d '' absolute; do
+    relative="${absolute#"$root"/}"
+    [[ "$relative" == "SHA256SUMS" ]] && continue
+    [[ -n "${expected[$relative]+x}" ]] || fail "存在哈希清单之外的文件：$relative"
+  done < <(find "$root" -type f -print0)
+}
+
+verify_metadata() {
+  local root="$1" release_id="$2" commit="$3" index_sha="$4" actual
+  grep -Fq "\"release_id\": \"$release_id\"" "$root/release.json" || fail "release_id 不匹配"
+  grep -Fq "\"commit\": \"$commit\"" "$root/release.json" || fail "commit 不匹配"
+  grep -Fq "\"index_sha256\": \"$index_sha\"" "$root/release.json" || fail "index 哈希元数据不匹配"
+  actual="$(sha256sum "$root/index.html" | awk '{print $1}')"
+  [[ "$actual" == "$index_sha" ]] || fail "index.html 哈希不匹配"
+}
+
+domain_list() {
+  printf '%s' "$PRIMARY_DOMAIN"
+  [[ -z "$WWW_DOMAIN" ]] || printf ' %s' "$WWW_DOMAIN"
+}
+
+certificate_exists() {
+  [[ -s "/etc/letsencrypt/live/$PRIMARY_DOMAIN/fullchain.pem" \
+    && -s "/etc/letsencrypt/live/$PRIMARY_DOMAIN/privkey.pem" ]]
+}
+
+certbot_timer_enabled() {
+  systemctl is-enabled --quiet certbot.timer \
+    || systemctl is-enabled --quiet snap.certbot.renew.timer
+}
+
+https_ready() {
+  certificate_exists \
+    && [[ -f "$CERTBOT_RELOAD_HOOK" && ! -L "$CERTBOT_RELOAD_HOOK" \
+      && -x "$CERTBOT_RELOAD_HOOK" \
+      && "$(stat -c '%u' "$CERTBOT_RELOAD_HOOK")" == "0" ]] \
+    && certbot_timer_enabled
+}
+
+write_nginx_config() {
+  local domains
+  domains="$(domain_list)"
+  NGINX_WRITE_TMP="$NGINX_AVAILABLE.tmp.$$"
+  NGINX_LINK_TMP="$NGINX_ENABLED.tmp.$$"
+  if https_ready; then
+    cat > "$NGINX_WRITE_TMP" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domains;
+    location ^~ /.well-known/acme-challenge/ { root $ACME_ROOT; try_files \$uri =404; }
+    location / { return 301 https://$PRIMARY_DOMAIN\$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $domains;
+    root $CURRENT_LINK;
+    index index.html;
+    ssl_certificate /etc/letsencrypt/live/$PRIMARY_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$PRIMARY_DOMAIN/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    location = /_site_health { default_type text/plain; return 200 "ok\n"; }
+    location = /release.json { try_files \$uri =404; expires -1; }
+    location /assets/ { try_files \$uri =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }
+    location /loumai-ui/ { try_files \$uri =404; expires -1; }
+    location ~ /\. { deny all; }
+    location ~* \.(?:bak|db|env|key|p12|pem|pfx|sql|sqlite)$ { return 404; }
+    location / { try_files \$uri \$uri/ /index.html; expires -1; }
+}
+EOF
+  else
+    cat > "$NGINX_WRITE_TMP" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domains;
+    root $CURRENT_LINK;
+    index index.html;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    location ^~ /.well-known/acme-challenge/ { root $ACME_ROOT; try_files \$uri =404; }
+    location = /_site_health { default_type text/plain; return 200 "ok\n"; }
+    location = /release.json { try_files \$uri =404; expires -1; }
+    location /assets/ { try_files \$uri =404; add_header Cache-Control "public, max-age=31536000, immutable" always; }
+    location /loumai-ui/ { try_files \$uri =404; expires -1; }
+    location ~ /\. { deny all; }
+    location ~* \.(?:bak|db|env|key|p12|pem|pfx|sql|sqlite)$ { return 404; }
+    location / { try_files \$uri \$uri/ /index.html; expires -1; }
+}
+EOF
+  fi
+  chown root:root "$NGINX_WRITE_TMP"
+  chmod 0644 "$NGINX_WRITE_TMP"
+  mv -f -- "$NGINX_WRITE_TMP" "$NGINX_AVAILABLE"
+  NGINX_WRITE_TMP=""
+  rm -f -- "$NGINX_LINK_TMP"
+  ln -s -- "$NGINX_AVAILABLE" "$NGINX_LINK_TMP"
+  mv -Tf -- "$NGINX_LINK_TMP" "$NGINX_ENABLED"
+  NGINX_LINK_TMP=""
+  nginx -t >/dev/null
+}
+
+reload_nginx() {
+  systemctl reload nginx
+  systemctl is-active --quiet nginx || fail "Nginx 未处于运行状态"
+}
+
+install_certbot_reload_hook() {
+  local hook_dir="${CERTBOT_RELOAD_HOOK%/*}"
+  local hook="$CERTBOT_RELOAD_HOOK" temporary="$hook.tmp.$$"
+  install -d -m 0755 -o root -g root -- "$hook_dir"
+  cat > "$temporary" <<'EOF'
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+nginx -t
+systemctl reload nginx
+EOF
+  chown root:root "$temporary"
+  chmod 0755 "$temporary"
+  mv -f -- "$temporary" "$hook"
+  if ! certbot_timer_enabled; then
+    fail "Certbot 自动续期 timer 未启用"
+  fi
+}
+
+verify_current_locally() {
+  local release_id="$1" response
+  if https_ready; then
+    verify_current_https "$release_id"
+    curl -fsS --connect-timeout 5 --max-time 15 \
+      --resolve "$PRIMARY_DOMAIN:443:127.0.0.1" \
+      "https://$PRIMARY_DOMAIN/loumai-ui/landlord/channels.html" >/dev/null \
+      || fail "真实 loumai-ui HTTPS 页面验收失败"
+    return 0
+  fi
+  response="$(curl -fsS --connect-timeout 5 --max-time 15 \
+    -H "Host: $PRIMARY_DOMAIN" "http://127.0.0.1/release.json?release_check=$release_id")" \
+    || fail "官网 HTTP 本机验收失败"
+  grep -Fq "\"release_id\": \"$release_id\"" <<<"$response" || fail "官网 HTTP 返回了错误版本"
+  curl -fsS --connect-timeout 5 --max-time 15 -H "Host: $PRIMARY_DOMAIN" \
+    "http://127.0.0.1/loumai-ui/landlord/channels.html" >/dev/null \
+    || fail "真实 loumai-ui 页面验收失败"
+}
+
+verify_current_https() {
+  local release_id="$1" response
+  response="$(curl -fsS --connect-timeout 5 --max-time 20 \
+    --resolve "$PRIMARY_DOMAIN:443:127.0.0.1" \
+    "https://$PRIMARY_DOMAIN/release.json?release_check=$release_id")" \
+    || fail "官网 HTTPS 本机验收失败"
+  grep -Fq "\"release_id\": \"$release_id\"" <<<"$response" || fail "官网 HTTPS 返回了错误版本"
+}
+
+test_site_fingerprint() {
+  curl -kfsS --connect-timeout 5 --max-time 20 https://test.yinlizhangyu.com/ 2>/dev/null \
+    | sha256sum | awk '{print $1}' || true
+}
+
+dns_points_here() {
+  local domain="$1" answers ipv6
+  answers="$(getent ahostsv4 "$domain" | awk '{print $1}' | sort -u)"
+  [[ "$answers" == "$EXPECTED_IPV4" ]] || return 1
+  ipv6="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | sort -u \
+    | grep ':' | grep -v '^::ffff:' || true)"
+  [[ -z "$ipv6" ]]
+}
+
+action_prepare() {
+  local release_id="$1" stage group
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  stage="$INCOMING_ROOT/$release_id.partial"
+  [[ ! -e "$stage" && ! -L "$stage" ]] || fail "暂存版本已存在"
+  group="$(id -gn "$DEPLOY_USER")"
+  install -d -m 0700 -o "$DEPLOY_USER" -g "$group" -- "$stage"
+  printf 'STAGE_DIR=%s\n' "$stage"
+}
+
+action_abort() {
+  local release_id="$1" stage
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  stage="$INCOMING_ROOT/$release_id.partial"
+  if [[ -d "$stage" && ! -L "$stage" ]]; then
+    rm -rf -- "$stage"
+  fi
+  printf 'ABORTED=%s\n' "$release_id"
+}
+
+action_activate() {
+  local release_id="$1" commit="$2" index_sha="$3" sums_sha="$4" archive_sha="$5" expected_current="$6"
+  local stage archive trusted_archive partial release_root target current previous test_before test_after actual unsafe normalized
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  valid_commit "$commit" || fail "commit 格式非法"
+  valid_sha256 "$index_sha" || fail "index 哈希格式非法"
+  valid_sha256 "$sums_sha" || fail "清单哈希格式非法"
+  valid_sha256 "$archive_sha" || fail "归档哈希格式非法"
+  acquire_lock
+  current="$(current_target)"
+  [[ "${current:-NONE}" == "$expected_current" ]] || fail "current 已被其他发布修改，拒绝覆盖"
+  stage="$INCOMING_ROOT/$release_id.partial"
+  archive="$stage/site.tar"
+  [[ -f "$archive" && ! -L "$archive" ]] || fail "上传归档不存在"
+  release_root="$RELEASES_ROOT/$release_id"
+  partial="$RELEASES_ROOT/.$release_id.partial"
+  target="$release_root/site"
+  [[ ! -e "$release_root" && ! -L "$release_root" && ! -e "$partial" ]] || fail "版本目录已存在"
+  install -d -m 0755 -o root -g root -- "$partial/site"
+  CLEANUP_PARTIAL="$partial"
+  trusted_archive="$partial/site.tar"
+  cp --no-dereference --reflink=never -- "$archive" "$trusted_archive"
+  chown root:root "$trusted_archive"
+  chmod 0600 "$trusted_archive"
+  actual="$(sha256sum "$trusted_archive" | awk '{print $1}')"
+  [[ "$actual" == "$archive_sha" ]] || fail "上传归档哈希不匹配"
+  while IFS= read -r entry; do
+    [[ "$entry" == "./" || "$entry" =~ ^(\./)?[A-Za-z0-9._/-]+/?$ ]] || fail "归档包含非法路径"
+    [[ "$entry" != /* && "$entry" != *"../"* && "$entry" != ".." ]] || fail "归档包含越界路径"
+    normalized="${entry#./}"
+    normalized="${normalized%/}"
+    [[ -z "$normalized" || ! "$normalized" =~ (^|/)\. ]] || fail "归档包含隐藏文件"
+    [[ -z "$normalized" || ! "$normalized" =~ \.(bak|db|env|key|p12|pem|pfx|sql|sqlite)$ ]] \
+      || fail "归档包含敏感文件"
+  done < <(tar -tf "$trusted_archive")
+  unsafe="$(tar -tvf "$trusted_archive" | awk 'substr($1,1,1) != "-" && substr($1,1,1) != "d" { print; exit }')"
+  [[ -z "$unsafe" ]] || fail "归档包含软链接、硬链接或特殊文件：$unsafe"
+  tar -xf "$trusted_archive" -C "$partial/site" --no-same-owner --no-same-permissions
+  rm -f -- "$trusted_archive"
+  chown -R root:root "$partial"
+  find "$partial" -type d -exec chmod 0755 {} +
+  find "$partial" -type f -exec chmod 0644 {} +
+  assert_tree_safety "$partial/site"
+  actual="$(sha256sum "$partial/site/SHA256SUMS" | awk '{print $1}')"
+  [[ "$actual" == "$sums_sha" ]] || fail "安装后的哈希清单不匹配"
+  verify_checksums "$partial/site"
+  verify_metadata "$partial/site" "$release_id" "$commit" "$index_sha"
+  runuser -u www-data -- test -r "$partial/site/index.html" || fail "www-data 无法读取官网"
+  mv -- "$partial" "$release_root"
+  CLEANUP_PARTIAL=""
+  previous="$current"
+  test_before="$(test_site_fingerprint)"
+  snapshot_nginx_state
+  arm_current_rollback "$previous" "$target" "$release_id"
+  switch_current "$target" "$release_id"
+  write_nginx_config
+  reload_nginx
+  verify_current_locally "$release_id"
+  test_after="$(test_site_fingerprint)"
+  if [[ -n "$test_before" && "$test_before" != "$test_after" ]]; then
+    fail "测试站首页发生变化，拒绝保留本次官网版本"
+  fi
+  disarm_current_rollback
+  discard_nginx_snapshot
+  rm -rf -- "$stage"
+  printf 'ACTIVATED=%s\n' "$target"
+}
+
+action_enable_https() {
+  local current release_id certbot_args=()
+  acquire_lock
+  current="$(current_target)"
+  [[ -n "$current" ]] || fail "请先执行 prepare 部署官网版本"
+  dns_points_here "$PRIMARY_DOMAIN" || fail "$PRIMARY_DOMAIN 尚未解析到 $EXPECTED_IPV4"
+  if [[ -n "$WWW_DOMAIN" ]]; then
+    dns_points_here "$WWW_DOMAIN" || fail "$WWW_DOMAIN 尚未解析到 $EXPECTED_IPV4"
+  fi
+  release_id="${current#"$RELEASES_ROOT"/}"
+  release_id="${release_id%/site}"
+  snapshot_nginx_state
+  write_nginx_config
+  reload_nginx
+  if [[ -n "$CERTBOT_EMAIL" ]]; then
+    certbot_args+=(--email "$CERTBOT_EMAIL")
+  else
+    certbot_args+=(--register-unsafely-without-email)
+  fi
+  certbot_args+=(--cert-name "$PRIMARY_DOMAIN" -d "$PRIMARY_DOMAIN")
+  [[ -z "$WWW_DOMAIN" ]] || certbot_args+=(-d "$WWW_DOMAIN")
+  require_command certbot
+  install_certbot_reload_hook
+  certbot certonly --webroot -w "$ACME_ROOT" --non-interactive --agree-tos \
+    --keep-until-expiring --expand "${certbot_args[@]}"
+  https_ready || fail "证书、自动续期 timer 或 Nginx 重载钩子未就绪"
+  write_nginx_config
+  reload_nginx
+  verify_current_https "$release_id"
+  discard_nginx_snapshot
+  printf 'HTTPS_ENABLED=%s\n' "$PRIMARY_DOMAIN"
+}
+
+action_status() {
+  local current="" test_status
+  if [[ ! -d "$REMOTE_ROOT" ]]; then
+    printf 'HELPER_VERSION=%s\nCURRENT=NONE\nINITIALIZED=false\n' "$HELPER_VERSION"
+    return 0
+  fi
+  assert_root_directory "$REMOTE_ROOT"
+  [[ -d "$RELEASES_ROOT" && -d "$INCOMING_ROOT" ]] || fail "官网发布目录结构不完整"
+  current="$(current_target)"
+  test_status="$(curl -kfsS -o /dev/null -w '%{http_code}' --max-time 10 https://test.yinlizhangyu.com/ || true)"
+  printf 'HELPER_VERSION=%s\n' "$HELPER_VERSION"
+  printf 'CURRENT=%s\n' "${current:-NONE}"
+  printf 'PRIMARY_DOMAIN=%s\n' "$PRIMARY_DOMAIN"
+  printf 'WWW_DOMAIN=%s\n' "${WWW_DOMAIN:-NONE}"
+  printf 'HTTPS=%s\n' "$(https_ready && printf enabled || printf disabled)"
+  printf 'TEST_SITE_STATUS=%s\n' "${test_status:-unreachable}"
+  nginx -t >/dev/null
+  [[ -z "$current" || ! -f "$current/release.json" ]] || cat "$current/release.json"
+}
+
+action_check_release() {
+  local release_id="$1" expected_current="$2" target current after
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  [[ -d "$REMOTE_ROOT" && ! -L "$REMOTE_ROOT" ]] || fail "官网尚未初始化"
+  current="$(current_target)"
+  [[ "${current:-NONE}" == "$expected_current" ]] || fail "current 已变化，预演结果无效"
+  target="$RELEASES_ROOT/$release_id/site"
+  assert_root_directory "$target"
+  assert_tree_safety "$target"
+  verify_checksums "$target"
+  grep -Fq "\"release_id\": \"$release_id\"" "$target/release.json" \
+    || fail "目标版本元数据不匹配"
+  after="$(current_target)"
+  [[ "${after:-NONE}" == "$expected_current" ]] || fail "预演期间 current 已变化"
+  printf 'RELEASE_VALID=%s\n' "$target"
+}
+
+action_rollback() {
+  local release_id="$1" expected_current="$2" target current previous
+  valid_release_id "$release_id" || fail "release_id 格式非法"
+  acquire_lock
+  current="$(current_target)"
+  [[ "${current:-NONE}" == "$expected_current" ]] || fail "current 已变化，拒绝回滚"
+  target="$RELEASES_ROOT/$release_id/site"
+  assert_root_directory "$target"
+  assert_tree_safety "$target"
+  verify_checksums "$target"
+  previous="$current"
+  snapshot_nginx_state
+  arm_current_rollback "$previous" "$target" "$release_id"
+  switch_current "$target" "$release_id"
+  write_nginx_config
+  reload_nginx
+  verify_current_locally "$release_id"
+  https_ready && verify_current_https "$release_id"
+  disarm_current_rollback
+  discard_nginx_snapshot
+  printf 'ROLLED_BACK=%s\n' "$target"
+}
+
+case "${1:-}" in
+  version)
+    printf '%s\n' "$HELPER_VERSION"
+    ;;
+  prepare)
+    [[ "$#" -eq 2 ]] || fail "prepare 参数错误"
+    action_prepare "$2"
+    ;;
+  abort)
+    [[ "$#" -eq 2 ]] || fail "abort 参数错误"
+    action_abort "$2"
+    ;;
+  activate)
+    [[ "$#" -eq 7 ]] || fail "activate 参数错误"
+    action_activate "$2" "$3" "$4" "$5" "$6" "$7"
+    ;;
+  enable-https)
+    [[ "$#" -eq 1 ]] || fail "enable-https 参数错误"
+    action_enable_https
+    ;;
+  status)
+    [[ "$#" -eq 1 ]] || fail "status 参数错误"
+    action_status
+    ;;
+  check-release)
+    [[ "$#" -eq 3 ]] || fail "check-release 参数错误"
+    action_check_release "$2" "$3"
+    ;;
+  rollback)
+    [[ "$#" -eq 3 ]] || fail "rollback 参数错误"
+    action_rollback "$2" "$3"
+    ;;
+  *)
+    fail "用法：$0 {version|prepare RELEASE|abort RELEASE|activate ...|enable-https|status|check-release RELEASE EXPECTED_CURRENT|rollback RELEASE EXPECTED_CURRENT}"
+    ;;
+esac

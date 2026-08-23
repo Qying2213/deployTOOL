@@ -1,0 +1,45 @@
+[Unit]
+Description=Loumai Production Tencent IM Worker
+After=network-online.target redis-server.service loumai-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loumai-im
+Group=loumai-im
+SupplementaryGroups=loumai-db-ca
+WorkingDirectory=/srv/loumai-backend/backend-current
+EnvironmentFile=/etc/loumai/backend.env
+EnvironmentFile=/etc/loumai/sms.env
+EnvironmentFile=/etc/loumai/database-active.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python scripts/run_tencent_im_callback_worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryHigh=1G
+MemoryMax=1536M
+CPUQuota=150%
+TasksMax=128
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

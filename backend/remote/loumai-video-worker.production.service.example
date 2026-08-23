@@ -1,0 +1,49 @@
+[Unit]
+Description=Loumai Production Property Video Transcode Worker
+After=network-online.target redis-server.service loumai-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loumai-video
+Group=loumai-video
+SupplementaryGroups=loumai-db-ca
+WorkingDirectory=/srv/loumai-backend/backend-current
+EnvironmentFile=/etc/loumai/backend.env
+EnvironmentFile=/etc/loumai/sms.env
+EnvironmentFile=/etc/loumai/database-active.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStartPre=/usr/bin/test -x /opt/loumai-runtime/ffmpeg/bin/ffmpeg
+ExecStartPre=/usr/bin/test -x /opt/loumai-runtime/ffmpeg/bin/ffprobe
+ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python scripts/run_video_transcode_worker.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/loumai-video/tmp
+MemoryHigh=2G
+MemoryMax=2500M
+CPUQuota=200%
+TasksMax=128
+LimitNOFILE=8192
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

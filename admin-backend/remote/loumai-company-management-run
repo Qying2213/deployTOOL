@@ -1,0 +1,51 @@
+#!/bin/bash
+
+set -eEuo pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH PYTHONPATH PYTHONHOME
+umask 027
+
+readonly LIMITED_PROFILE_ROOT="/etc/loumai/company-database-profiles"
+readonly CURRENT_LINK="/srv/loumai-company-management/current"
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+# database-active.env 由 systemd(PID 1)以 root 身份读取后注入进程。/etc/loumai
+# 在测试服上不允许服务用户遍历，因此启动包装器只能验证继承后的非敏感 profile，
+# 不能自行 stat/source 这个 root-only 文件。
+profile="${LOUMAI_DATABASE_PROFILE:-}"
+[[ "$profile" == "local" || "$profile" == "cloud" ]] \
+  || fail "活动数据库 profile 非法：${profile:-empty}"
+
+limited_file="$LIMITED_PROFILE_ROOT/$profile.env"
+if [[ -f "$limited_file" && ! -L "$limited_file" ]]; then
+  [[ "$(stat -c '%U:%G' "$limited_file")" == "root:loumai-admin" ]] || fail "管理后台数据库 profile 必须归 root:loumai-admin"
+  [[ "$(stat -c '%a' "$limited_file")" == "640" ]] \
+    || fail "管理后台数据库 profile 权限必须为 0640"
+  # shellcheck source=/dev/null
+  source "$limited_file"
+fi
+
+: "${DATABASE_URL:?数据库 profile 缺少 DATABASE_URL}"
+export DATABASE_URL
+export LOUMAI_DATABASE_PROFILE="$profile"
+
+release="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+[[ "$release" == /srv/loumai-company-management/releases/*/backend ]] \
+  || fail "current 未指向受控管理后台版本"
+python="$release/.runtime/venv/bin/python"
+if [[ ! -x "$python" && -x "$release/.venv/bin/python" ]]; then
+  python="$release/.venv/bin/python"
+fi
+[[ -x "$python" ]] || fail "当前版本缺少 Python 运行时"
+
+cd "$release"
+exec "$python" -m uvicorn app.main:app \
+  --host 127.0.0.1 \
+  --port 8100 \
+  --workers 1 \
+  --proxy-headers \
+  --forwarded-allow-ips 127.0.0.1

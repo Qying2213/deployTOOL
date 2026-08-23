@@ -1,0 +1,3 @@
+# Validate with visudo -cf before installing as /etc/sudoers.d/loumai-deploy.
+# The deploy user must not belong to sudo/admin/wheel and must not receive any other sudo rule.
+loumai-deploy ALL=(root) NOPASSWD: /usr/local/sbin/loumai-backend-release *, /usr/local/sbin/loumai-h5-release *

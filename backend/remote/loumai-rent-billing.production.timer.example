@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Loumai rent billing jobs daily
+
+[Timer]
+OnCalendar=*-*-* 00:05:00 Asia/Shanghai
+RandomizedDelaySec=5min
+Persistent=true
+Unit=loumai-rent-billing.service
+
+[Install]
+WantedBy=timers.target
