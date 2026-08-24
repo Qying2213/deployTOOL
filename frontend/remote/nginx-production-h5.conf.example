@@ -8,8 +8,9 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name h5.example.com;
 
     ssl_certificate /etc/letsencrypt/live/h5.example.com/fullchain.pem;

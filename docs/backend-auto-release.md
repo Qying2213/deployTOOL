@@ -269,7 +269,7 @@ sudo -u loumai-build env --chdir=/var/lib/loumai-build \
   UV_LINK_MODE=copy \
   /opt/loumai-runtime/bin/uv pip install \
   --python /srv/loumai-backend/backend-releases/20260807T000000Z-b9f28ae000/backend/.venv/bin/python \
-  setuptools==82.0.1
+  setuptools==84.0.0
 sudo -u loumai-build env --chdir=/var/lib/loumai-build \
   HOME=/var/lib/loumai-build \
   UV_CACHE_DIR=/var/lib/loumai-build/.cache/uv \
