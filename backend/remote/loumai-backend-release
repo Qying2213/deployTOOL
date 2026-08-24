@@ -2061,6 +2061,14 @@ PY
 
 validate_property_video_direct_upload() {
   local backend="$1"
+  if run_in_release "$backend" "$backend/.venv/bin/python" -c '
+import os
+
+value = os.getenv("PROPERTY_VIDEO_DIRECT_UPLOAD_ENABLED", "false").strip().lower()
+raise SystemExit(0 if value in {"false", "0", "no", "off"} else 1)
+'; then
+    return 0
+  fi
   run_in_release "$backend" "$backend/.venv/bin/python" -c '
 import sys
 from datetime import datetime, timedelta, timezone
