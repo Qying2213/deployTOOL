@@ -770,6 +770,7 @@ test('迁移发布先停写与备份，迁移后故障保持服务停止且不�
 	assert.match(helper, /sha256sum "\$0"/)
 	assert.match(helper, /printf 'REMOTE_ROOT=%s\\n'/)
 	assert.match(helper, /printf 'PUBLIC_HEALTH_URL=%s\\n'/)
+	assert.match(helper, /-H "Host: \$PUBLIC_HEALTH_AUTHORITY" "\$LOCAL_HEALTH_URL"/)
 	const statusStart = helper.indexOf('action_status()')
 	const statusActivateStart = helper.indexOf('action_activate()', statusStart)
 	const status = helper.slice(statusStart, statusActivateStart)
