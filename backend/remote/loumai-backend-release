@@ -777,6 +777,7 @@ validate_production_environment() (
   [[ "${BACKEND_CORS_ORIGIN_REGEX:-}" == "" ]] \
     || fail "正式服禁止使用 BACKEND_CORS_ORIGIN_REGEX"
   /usr/bin/python3 - "$PUBLIC_HEALTH_URL" "$LOCAL_REDIS_APPROVED" <<'PY'
+import json
 import os
 import sys
 from ipaddress import ip_address
@@ -814,12 +815,27 @@ def unsafe_private_redis_host(host: str) -> bool:
     )
 
 
+def environment_string_list(name: str) -> list[str]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return []
+    if raw_value.startswith("["):
+        try:
+            values = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"production {name} must be a valid JSON string array") from exc
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise SystemExit(f"production {name} must be a JSON string array")
+        return [value.strip() for value in values if value.strip()]
+    return [value.strip() for value in raw_value.split(",") if value.strip()]
+
+
 public_host = urlsplit(sys.argv[1]).hostname or ""
-allowed_hosts = [value.strip() for value in os.getenv("BACKEND_ALLOWED_HOSTS", "").split(",") if value.strip()]
+allowed_hosts = environment_string_list("BACKEND_ALLOWED_HOSTS")
 if not allowed_hosts or public_host not in allowed_hosts or any(unsafe_host(host) for host in allowed_hosts):
     raise SystemExit("production BACKEND_ALLOWED_HOSTS is unsafe")
 
-origins = [value.strip() for value in os.getenv("BACKEND_CORS_ORIGINS", "").split(",") if value.strip()]
+origins = environment_string_list("BACKEND_CORS_ORIGINS")
 if not origins:
     raise SystemExit("production BACKEND_CORS_ORIGINS is empty")
 for origin in origins:
@@ -987,7 +1003,7 @@ validate_server_contract() {
 		  "$JOB_SERVICE_USER" "$MIGRATION_USER" "$BACKUP_USER"; do
 			id -nG "$user" | tr ' ' '\n' | grep -Fxq "$DATABASE_CA_GROUP" \
 				|| fail "$user 未加入数据库 CA 专用组 $DATABASE_CA_GROUP"
-			run_as_clean "$user" /usr/bin/test -r "$DATABASE_CA_FILE" \
+			run_as_clean "$user" /usr/bin/head -c 1 "$DATABASE_CA_FILE" >/dev/null \
 				|| fail "$user 无法读取数据库 CA 文件"
 		done
 		validate_offsite_backup_evidence
@@ -1963,9 +1979,10 @@ with engine.connect() as connection:
           FROM pg_roles r WHERE r.rolname=current_user
     """)).mappings().one())
 unsafe = [key for key in ('rolsuper','rolcreatedb','rolcreaterole','rolreplication',
-                          'rolbypassrls','can_create_db','can_temp','dangerous_membership') if audit[key]]
+                          'rolbypassrls','can_create_db','dangerous_membership') if audit[key]]
 if (unsafe or not audit['can_connect'] or not audit['schema_usage']
-        or not audit['schema_create'] or audit['foreign_owned_objects']):
+        or not audit['can_temp'] or not audit['schema_create']
+        or audit['foreign_owned_objects']):
     raise SystemExit('migration database role does not match the schema-owner-only contract')
 print('migration database privilege contract verified')
 PY
@@ -2176,7 +2193,9 @@ verify_all_units_stopped() {
       printf 'CRITICAL: writer 未停止：%s（state=%s）\n' "$unit" "${state:-unknown}" >&2
       failed=1
     fi
-    if [[ "$main_pid" != "0" ]]; then
+    # Timer units do not expose MainPID on current systemd versions. An empty
+    # value is safe only after ActiveState above has been proven inactive/failed.
+    if [[ -n "$main_pid" && "$main_pid" != "0" ]]; then
       printf 'CRITICAL: writer 仍有 MainPID：%s（MainPID=%s）\n' "$unit" "${main_pid:-unknown}" >&2
       failed=1
     fi

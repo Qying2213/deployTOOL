@@ -169,6 +169,17 @@ test('正式服 Host 拒绝通配、localhost、私网和非法域名', async (t
 	}
 })
 
+test('正式服 Host 和 CORS 接受后端要求的 JSON 字符串数组', () => {
+	const audit = productionAudit({
+		BACKEND_ALLOWED_HOSTS: '["api.example.com"]',
+		BACKEND_CORS_ORIGINS: '["https://app.example.com","https://admin.example.com:8443"]'
+	})
+	assert.ok(!audit.issues.some(({ key, severity }) => (
+		severity === 'BLOCKER'
+		&& ['BACKEND_ALLOWED_HOSTS', 'BACKEND_CORS_ORIGINS'].includes(key)
+	)))
+})
+
 test('正式服 CORS 只允许明确的公网 HTTPS Origin', async (t) => {
 	for (const value of [
 		'*',

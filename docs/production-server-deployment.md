@@ -101,6 +101,12 @@ sudo -u loumai-deploy sudo -n /usr/local/sbin/loumai-h5-release version
 
 `cloud.env` 同时保存运行 URL 与迁移 URL，只允许 root 发布 helper 读取。`database-active.env` 只保存运行 URL，由 systemd 加载，严禁包含 `MIGRATION_DATABASE_URL`。每次切换 profile 时 helper 都会重新生成这个最小运行文件，避免 API/Worker 获得 DDL 凭据。
 
+迁移账号必须具备目标数据库的 `CONNECT`、`TEMPORARY`，以及 `public` schema 的 `USAGE`、`CREATE`；部分历史迁移会创建事务级临时表。运行账号和备份账号必须继续禁止 `CREATE`、`TEMPORARY`。数据库所有者初始化时执行：
+
+```sql
+GRANT TEMPORARY ON DATABASE loumai_production TO loumai_migrate;
+```
+
 备份证据中的 `BACKUP_POLICY_REFERENCE` 必须使用
 `tencentdb-postgresql/地域/postgres-实例ID/策略ID` 格式，并对应腾讯云控制台中的真实实例与自动备份策略；模板占位值不会通过预检。
 

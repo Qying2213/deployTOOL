@@ -246,7 +246,17 @@ function environmentLabel(targetEnvironment) {
 }
 
 function commaSeparatedValues(value) {
-	return String(value).split(',').map((item) => item.trim()).filter(Boolean)
+	const raw = String(value).trim()
+	if (raw.startsWith('[')) {
+		try {
+			const parsed = JSON.parse(raw)
+			if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string')) return []
+			return parsed.map((item) => item.trim()).filter(Boolean)
+		} catch {
+			return []
+		}
+	}
+	return raw.split(',').map((item) => item.trim()).filter(Boolean)
 }
 
 function ipv4Octets(hostname) {
