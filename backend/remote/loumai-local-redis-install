@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+readonly REDIS_CONFIG=/etc/redis/redis.conf
+readonly REDIS_ACL=/etc/redis/users.acl
+readonly REDIS_SECRET=/etc/loumai/local-redis.secret
+readonly REDIS_CA_KEY=/etc/loumai/certs/local-redis-ca.key
+readonly REDIS_CA_CERT=/etc/loumai/certs/local-redis-ca.pem
+readonly REDIS_SERVER_KEY=/etc/redis/tls/local-redis.key
+readonly REDIS_SERVER_CERT=/etc/redis/tls/local-redis.pem
+readonly BACKEND_PENDING=/etc/loumai/backend.env.pending
+
+fail() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+[[ "${EUID}" -eq 0 ]] || fail "请使用 sudo 运行"
+[[ -f "$BACKEND_PENDING" && ! -L "$BACKEND_PENDING" ]] \
+  || fail "缺少待激活业务配置：$BACKEND_PENDING"
+
+export DEBIAN_FRONTEND=noninteractive
+/usr/bin/apt-get update -qq
+/usr/bin/apt-get install -y --no-install-recommends redis-server redis-tools openssl ca-certificates
+unset DEBIAN_FRONTEND
+
+getent passwd redis >/dev/null || fail "Redis 系统用户不存在"
+/usr/bin/install -d -o root -g root -m 0755 /etc/loumai/certs
+/usr/bin/install -d -o root -g redis -m 0750 /etc/redis/tls
+/usr/bin/install -d -o redis -g redis -m 0750 /var/lib/redis /var/log/redis
+
+certificate_paths=("$REDIS_CA_KEY" "$REDIS_CA_CERT" "$REDIS_SERVER_KEY" "$REDIS_SERVER_CERT")
+certificate_count=0
+for path in "${certificate_paths[@]}"; do
+  [[ -e "$path" ]] && certificate_count=$((certificate_count + 1))
+done
+if [[ "$certificate_count" -ne 0 && "$certificate_count" -ne "${#certificate_paths[@]}" ]]; then
+  fail "检测到不完整的本地 Redis TLS 证书集，请人工检查后重试"
+fi
+
+if [[ "$certificate_count" -eq 0 ]]; then
+  temporary_directory="$(/usr/bin/mktemp -d /tmp/loumai-local-redis-cert.XXXXXX)"
+  trap '/usr/bin/rm -rf -- "$temporary_directory"' EXIT
+  /usr/bin/openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
+    -subj '/CN=Loumai Local Redis CA/O=Loumai Production' \
+    -keyout "$temporary_directory/ca.key" \
+    -out "$temporary_directory/ca.pem" >/dev/null 2>&1
+  /usr/bin/openssl req -new -newkey rsa:3072 -sha256 -nodes \
+    -subj '/CN=127.0.0.1/O=Loumai Production' \
+    -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' \
+    -keyout "$temporary_directory/server.key" \
+    -out "$temporary_directory/server.csr" >/dev/null 2>&1
+  printf '%s\n' \
+    'basicConstraints=CA:FALSE' \
+    'keyUsage=digitalSignature,keyEncipherment' \
+    'extendedKeyUsage=serverAuth' \
+    'subjectAltName=IP:127.0.0.1,DNS:localhost' \
+    >"$temporary_directory/server.ext"
+  /usr/bin/openssl x509 -req -sha256 -days 825 \
+    -in "$temporary_directory/server.csr" \
+    -CA "$temporary_directory/ca.pem" \
+    -CAkey "$temporary_directory/ca.key" \
+    -CAcreateserial \
+    -extfile "$temporary_directory/server.ext" \
+    -out "$temporary_directory/server.pem" >/dev/null 2>&1
+  /usr/bin/install -o root -g root -m 0600 "$temporary_directory/ca.key" "$REDIS_CA_KEY"
+  /usr/bin/install -o root -g root -m 0644 "$temporary_directory/ca.pem" "$REDIS_CA_CERT"
+  /usr/bin/install -o root -g redis -m 0640 "$temporary_directory/server.key" "$REDIS_SERVER_KEY"
+  /usr/bin/install -o root -g redis -m 0640 "$temporary_directory/server.pem" "$REDIS_SERVER_CERT"
+fi
+
+/usr/bin/openssl verify -CAfile "$REDIS_CA_CERT" "$REDIS_SERVER_CERT" >/dev/null \
+  || fail "Redis 服务端证书校验失败"
+/usr/bin/openssl x509 -in "$REDIS_SERVER_CERT" -noout -checkend 2592000 >/dev/null \
+  || fail "Redis 服务端证书将在 30 天内过期"
+
+if [[ -e "$REDIS_SECRET" ]]; then
+  [[ -f "$REDIS_SECRET" && ! -L "$REDIS_SECRET" ]] || fail "$REDIS_SECRET 类型不安全"
+  [[ "$(stat -c '%U:%G:%a' "$REDIS_SECRET")" == 'root:root:600' ]] \
+    || fail "$REDIS_SECRET 必须是 root:root 0600"
+  redis_password="$(<"$REDIS_SECRET")"
+else
+  redis_password="$(/usr/bin/openssl rand -base64 48 | tr -d '\n')"
+  [[ "${#redis_password}" -ge 48 ]] || fail "Redis 随机密码生成失败"
+  temporary_secret="${REDIS_SECRET}.new"
+  printf '%s\n' "$redis_password" >"$temporary_secret"
+  /usr/bin/chown root:root "$temporary_secret"
+  /usr/bin/chmod 0600 "$temporary_secret"
+  /usr/bin/mv -f "$temporary_secret" "$REDIS_SECRET"
+fi
+
+temporary_acl="${REDIS_ACL}.new"
+printf '%s\n' \
+  'user default off' \
+  "user loumai on >${redis_password} ~* &* +@all -acl -bgrewriteaof -bgsave -config -debug -failover -flushall -flushdb -keys -migrate -module -psync -replicaof -restore -restore-asking -save -shutdown -slaveof -swapdb -sync" \
+  >"$temporary_acl"
+/usr/bin/chown root:redis "$temporary_acl"
+/usr/bin/chmod 0640 "$temporary_acl"
+/usr/bin/mv -f "$temporary_acl" "$REDIS_ACL"
+
+if [[ -f "$REDIS_CONFIG" && ! -e "${REDIS_CONFIG}.package" ]]; then
+  /usr/bin/cp --preserve=mode,ownership,timestamps "$REDIS_CONFIG" "${REDIS_CONFIG}.package"
+fi
+temporary_config="${REDIS_CONFIG}.new"
+cat >"$temporary_config" <<EOF
+bind 127.0.0.1
+protected-mode yes
+port 0
+tls-port 6379
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+daemonize no
+supervised systemd
+pidfile /run/redis/redis-server.pid
+loglevel notice
+logfile /var/log/redis/redis-server.log
+databases 16
+always-show-logo no
+dir /var/lib/redis
+dbfilename dump.rdb
+rdbcompression yes
+rdbchecksum yes
+save 900 1
+save 300 10
+save 60 10000
+stop-writes-on-bgsave-error yes
+appendonly yes
+appendfilename appendonly.aof
+appenddirname appendonlydir
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+maxmemory 512mb
+maxmemory-policy noeviction
+aclfile $REDIS_ACL
+tls-cert-file $REDIS_SERVER_CERT
+tls-key-file $REDIS_SERVER_KEY
+tls-ca-cert-file $REDIS_CA_CERT
+tls-auth-clients no
+tls-protocols "TLSv1.2 TLSv1.3"
+enable-protected-configs no
+enable-debug-command no
+enable-module-command no
+EOF
+/usr/bin/chown root:redis "$temporary_config"
+/usr/bin/chmod 0640 "$temporary_config"
+/usr/bin/mv -f "$temporary_config" "$REDIS_CONFIG"
+
+/usr/bin/systemctl daemon-reload
+/usr/bin/systemctl enable redis-server.service >/dev/null
+if ! /usr/bin/systemctl restart redis-server.service; then
+  if [[ -f "${REDIS_CONFIG}.package" ]]; then
+    /usr/bin/cp --preserve=mode,ownership,timestamps "${REDIS_CONFIG}.package" "$REDIS_CONFIG"
+    /usr/bin/systemctl restart redis-server.service || true
+  fi
+  fail "Redis TLS 配置启动失败；已恢复软件包默认配置"
+fi
+/usr/bin/systemctl is-active --quiet redis-server.service || fail "Redis 服务未启动"
+/usr/bin/systemctl is-enabled --quiet redis-server.service || fail "Redis 服务未设为开机启动"
+
+export REDISCLI_AUTH="$redis_password"
+redis_command=(/usr/bin/redis-cli --tls --cacert "$REDIS_CA_CERT" --user loumai -h 127.0.0.1 -p 6379)
+[[ "$("${redis_command[@]}" PING)" == 'PONG' ]] || fail "Redis TLS PING 失败"
+probe_value="$(/usr/bin/openssl rand -hex 16)"
+"${redis_command[@]}" SET loumai:deployment:probe "$probe_value" EX 60 >/dev/null
+[[ "$("${redis_command[@]}" GET loumai:deployment:probe)" == "$probe_value" ]] \
+  || fail "Redis TLS 读写校验失败"
+"${redis_command[@]}" DEL loumai:deployment:probe >/dev/null
+unset REDISCLI_AUTH
+
+export LOUMAI_LOCAL_REDIS_PASSWORD="$redis_password"
+/usr/bin/python3 - "$BACKEND_PENDING" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+
+path = Path(sys.argv[1])
+password = os.environ["LOUMAI_LOCAL_REDIS_PASSWORD"]
+values = {}
+for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith(("#", ";")):
+        continue
+    key, separator, raw_value = line.partition("=")
+    if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        raise SystemExit(f"待激活配置第 {line_number} 行格式错误")
+    if key in values:
+        raise SystemExit(f"待激活配置存在重复变量：{key}")
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    values[key] = value.replace("\\\"", '"').replace("\\\\", "\\")
+
+ca_path = quote("/etc/loumai/certs/local-redis-ca.pem", safe="")
+values["REDIS_URL"] = (
+    f"rediss://loumai:{quote(password, safe='')}@127.0.0.1:6379/0"
+    f"?ssl_cert_reqs=required&ssl_ca_certs={ca_path}&ssl_check_hostname=True"
+)
+
+
+def encode(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+temporary = path.with_suffix(path.suffix + ".new")
+temporary.write_text(
+    "".join(f"{key}={encode(value)}\n" for key, value in sorted(values.items())),
+    encoding="utf-8",
+)
+os.chown(temporary, 0, 0)
+os.chmod(temporary, 0o600)
+os.replace(temporary, path)
+PY
+unset LOUMAI_LOCAL_REDIS_PASSWORD
+unset redis_password
+
+listening="$(/usr/bin/ss -lntH '( sport = :6379 )' | awk '{print $4}')"
+[[ "$listening" == '127.0.0.1:6379' ]] \
+  || fail "Redis 监听地址不符合预期：${listening:-none}"
+
+printf '本地 Redis 已安全安装：TLS-only、loopback-only、AOF/RDB 已启用。\n'
+printf 'REDIS_URL 已写入 %s，未输出密码。\n' "$BACKEND_PENDING"

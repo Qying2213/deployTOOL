@@ -11,7 +11,9 @@
 - SSH：正式服 Host Key、`loumai-deploy` 的独立密钥和端口。`ubuntu` 只用于一次性主机初始化，不能作为日常发布账号。
 - PostgreSQL：使用腾讯云提供、可与证书名称匹配的 DNS endpoint；准备独立的运行账号和迁移账号，运行账号不得有 DDL 权限。
 - PostgreSQL CA：安装到 `/etc/loumai/certs/tencentdb-ca.pem`，不能使用 IP endpoint 或 `sslmode=require` 代替 `verify-full`。
-- Redis：正式环境只接受公网不可达、启用 TLS 的 `rediss://` 地址。
+- Redis：首选公网不可达的托管私网 TLS `rediss://` 地址。若负责人明确接受单机故障风险，
+  可临时使用只监听 `127.0.0.1`、启用 TLS 和持久化的本机 Redis，并将
+  `LOUMAI_BACKEND_LOCAL_REDIS_APPROVED=true`；迁移到托管 Redis 后必须恢复为 `false`。
 - COS/CAM：生产 Bucket、地域、最小权限凭据、CORS；房源视频直传第一次上线必须保持关闭。
 - TLS：API 和 H5 的有效证书。
 - 备份：腾讯数据库自动备份、异地或不可变副本，以及最近 90 天内真实恢复演练的证据。

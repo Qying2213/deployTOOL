@@ -143,6 +143,7 @@ readonly FFPROBE_BIN="${LOUMAI_BACKEND_FFPROBE_BIN:-$RUNTIME_ROOT/ffmpeg/bin/ffp
 readonly VIDEO_TEMP_ROOT="${LOUMAI_BACKEND_VIDEO_TEMP_ROOT:-/var/lib/loumai-video/tmp}"
 readonly DIRECT_UPLOAD_APPROVED="${LOUMAI_BACKEND_PROPERTY_VIDEO_DIRECT_UPLOAD_APPROVED:-false}"
 readonly MONOLITHIC_SECRET_SCOPE_APPROVED="${LOUMAI_BACKEND_MONOLITHIC_SETTINGS_SECRET_SCOPE_APPROVED:-false}"
+readonly LOCAL_REDIS_APPROVED="${LOUMAI_BACKEND_LOCAL_REDIS_APPROVED:-false}"
 readonly OFFSITE_BACKUP_EVIDENCE_FILE="${LOUMAI_BACKEND_OFFSITE_BACKUP_EVIDENCE_FILE:-}"
 readonly RELEASES_ROOT="$REMOTE_ROOT/backend-releases"
 readonly LOCK_FILE="$REMOTE_ROOT/.backend-release.lock"
@@ -752,6 +753,8 @@ validate_production_environment() (
   [[ "$ENVIRONMENT" == "production" ]] || return 0
   [[ "$MONOLITHIC_SECRET_SCOPE_APPROVED" == "true" ]] \
     || fail "正式服统一 Settings 密钥范围尚未获得安全负责人显式确认"
+  [[ "$LOCAL_REDIS_APPROVED" == "true" || "$LOCAL_REDIS_APPROVED" == "false" ]] \
+    || fail "正式服本地 Redis 审批值只能是 true 或 false"
   load_app_environment
   [[ "${APP_ENVIRONMENT:-}" == "production" ]] || fail "正式服 APP_ENVIRONMENT 必须是 production"
   [[ "${ALLOW_INSECURE_TEST_SETTINGS:-}" == "false" ]] \
@@ -773,7 +776,7 @@ validate_production_environment() (
     || fail "正式服腾讯云 COS 配置不完整"
   [[ "${BACKEND_CORS_ORIGIN_REGEX:-}" == "" ]] \
     || fail "正式服禁止使用 BACKEND_CORS_ORIGIN_REGEX"
-  /usr/bin/python3 - "$PUBLIC_HEALTH_URL" <<'PY'
+  /usr/bin/python3 - "$PUBLIC_HEALTH_URL" "$LOCAL_REDIS_APPROVED" <<'PY'
 import os
 import sys
 from ipaddress import ip_address
@@ -788,6 +791,27 @@ def unsafe_host(host: str) -> bool:
         return not ip_address(normalized).is_global
     except ValueError:
         return normalized.endswith((".local", ".localhost", ".internal"))
+
+
+def unsafe_private_redis_host(host: str) -> bool:
+    normalized = host.strip().lower().rstrip(".")
+    if not normalized or normalized in {"localhost", "*"}:
+        return True
+    try:
+        address = ip_address(normalized)
+    except ValueError:
+        # Tencent Redis exposes an internal IPv4 address in the instance details.
+        # Requiring a literal address keeps the production check deterministic and
+        # prevents a public DNS record from silently turning Redis into a public
+        # dependency.
+        return True
+    return (
+        not address.is_private
+        or address.is_loopback
+        or address.is_unspecified
+        or address.is_link_local
+        or address.is_multicast
+    )
 
 
 public_host = urlsplit(sys.argv[1]).hostname or ""
@@ -806,8 +830,24 @@ for origin in origins:
         raise SystemExit("production BACKEND_CORS_ORIGINS contains an invalid origin")
 
 redis = urlsplit(os.getenv("REDIS_URL", ""))
-if redis.scheme != "rediss" or not redis.hostname or unsafe_host(redis.hostname):
-    raise SystemExit("production REDIS_URL must use a non-local rediss endpoint")
+local_redis_approved = sys.argv[2] == "true"
+redis_host = (redis.hostname or "").strip().lower()
+if (
+    redis.scheme != "rediss"
+    or not redis_host
+    or (
+        redis_host == "127.0.0.1"
+        and not local_redis_approved
+    )
+    or (
+        redis_host != "127.0.0.1"
+        and unsafe_private_redis_host(redis_host)
+    )
+):
+    raise SystemExit(
+        "production REDIS_URL must use a private VPC rediss endpoint, "
+        "or explicitly approved loopback TLS Redis"
+    )
 
 application = urlsplit(os.environ["DATABASE_URL"])
 migration = urlsplit(os.environ.get("MIGRATION_DATABASE_URL") or os.environ["DATABASE_URL"])

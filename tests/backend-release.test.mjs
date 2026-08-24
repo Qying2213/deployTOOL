@@ -594,6 +594,89 @@ migration="\$(run_migration_in_release /tmp /bin/true)"
 	assert.equal(canary.status, 0, canary.stderr)
 })
 
+test('正式服 Redis 接受私网 TLS，且本地 TLS 必须显式批准', async (t) => {
+	const helper = remoteHelperContractSource()
+	const marker = `/usr/bin/python3 - "$PUBLIC_HEALTH_URL" "$LOCAL_REDIS_APPROVED" <<'PY'\n`
+	const start = helper.indexOf(marker)
+	const end = helper.indexOf('\nPY\n)', start)
+	assert.ok(start > 0 && end > start)
+	const policy = helper.slice(start + marker.length, end)
+	const baseEnvironment = {
+		PATH: process.env.PATH,
+		BACKEND_ALLOWED_HOSTS: 'api.yinlizhangyu.com',
+		BACKEND_CORS_ORIGINS: 'https://gongweiyoufang.yinlizhangyu.com',
+		DATABASE_URL: 'postgresql://runtime@172.27.0.3/loumai_production',
+		MIGRATION_DATABASE_URL: 'postgresql://migrate@172.27.0.3/loumai_production',
+		BACKUP_DATABASE_URL: 'postgresql://backup@172.27.0.3/loumai_production',
+	}
+	const runPolicy = (redisUrl, localApproved = 'false') => spawnSync('/usr/bin/python3', [
+		'-',
+		'https://api.yinlizhangyu.com/health',
+		localApproved,
+	], {
+		encoding: 'utf8',
+		env: { ...baseEnvironment, REDIS_URL: redisUrl },
+		input: policy,
+	})
+
+	assert.equal(runPolicy('rediss://:secret@172.27.0.9:6379/0').status, 0)
+	assert.notEqual(runPolicy('rediss://:secret@127.0.0.1:6379/0').status, 0)
+	assert.equal(runPolicy('rediss://:secret@127.0.0.1:6379/0', 'true').status, 0)
+	for (const redisUrl of [
+		'redis://:secret@172.27.0.9:6379/0',
+		'rediss://:secret@1.1.1.1:6379/0',
+		'rediss://:secret@redis.example.com:6379/0',
+	]) {
+		await t.test(redisUrl, () => {
+			const result = runPolicy(redisUrl)
+			assert.notEqual(result.status, 0)
+			assert.match(result.stderr, /private VPC rediss endpoint/)
+		})
+	}
+})
+
+test('正式资源录入工具不回显密钥并原子更新待激活配置', () => {
+	const installerPath = join(
+		TOOL_ROOT,
+		'backend/remote/loumai-production-resources-install',
+	)
+	const installer = readFileSync(installerPath, 'utf8')
+	const syntax = spawnSync('/bin/bash', ['-n', installerPath], { encoding: 'utf8' })
+	assert.equal(syntax.status, 0, syntax.stderr)
+	assert.doesNotMatch(installer, /set -x|printf[^\n]*(?:REDIS_AUTH|COS_SECRET_KEY)/)
+	assert.match(installer, /read -r -s -p 'Redis 鉴权串/)
+	assert.match(installer, /read -r -s -p 'COS CAM SecretKey/)
+	assert.match(installer, /ssl_cert_reqs=required/)
+	assert.match(installer, /ssl_check_hostname=True/)
+	assert.match(installer, /ipaddress\.ip_network\("172\.27\.0\.0\/16"\)/)
+	assert.match(installer, /--cos-only/)
+	assert.match(installer, /existing_redis\.hostname != "127\.0\.0\.1"/)
+	assert.match(installer, /os\.replace\(temporary, path\)/)
+	assert.match(installer, /os\.chmod\(temporary, 0o600\)/)
+})
+
+test('正式服本地 Redis 安装器强制 TLS、回环监听、持久化与随机凭据', () => {
+	const installerPath = join(TOOL_ROOT, 'backend/remote/loumai-local-redis-install')
+	const installer = readFileSync(installerPath, 'utf8')
+	const syntax = spawnSync('/bin/bash', ['-n', installerPath], { encoding: 'utf8' })
+	assert.equal(syntax.status, 0, syntax.stderr)
+	assert.doesNotMatch(installer, /set -x|requirepass|redis:\/\/127\.0\.0\.1/)
+	assert.match(installer, /bind 127\.0\.0\.1/)
+	assert.match(installer, /port 0/)
+	assert.match(installer, /tls-port 6379/)
+	assert.match(installer, /tls-protocols "TLSv1\.2 TLSv1\.3"/)
+	assert.match(installer, /appendonly yes/)
+	assert.match(installer, /appendfsync everysec/)
+	assert.match(installer, /maxmemory 512mb/)
+	assert.match(installer, /maxmemory-policy noeviction/)
+	assert.match(installer, /openssl rand -base64 48/)
+	assert.match(installer, /user default off/)
+	assert.match(installer, /rediss:\/\/loumai:/)
+	assert.match(installer, /ssl_cert_reqs=required/)
+	assert.match(installer, /ssl_check_hostname=True/)
+	assert.match(installer, /os\.replace\(temporary, path\)/)
+})
+
 test('迁移发布先停写与备份，迁移后故障保持服务停止且不自动回滚数据库', () => {
 	const helper = remoteHelperContractSource()
 	const activateStart = helper.indexOf('action_activate()')
@@ -743,6 +826,7 @@ test('前后端分离配置模板不保存凭据内容，并声明后端仓库�
 		productionRemoteTemplate,
 		/^LOUMAI_BACKEND_MONOLITHIC_SETTINGS_SECRET_SCOPE_APPROVED=false$/m,
 	)
+	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_LOCAL_REDIS_APPROVED=false$/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_ONESHOT_SERVICES=.*file-storage-cleanup/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_TIMERS=.*file-storage-cleanup\.timer/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_AUXILIARY_DATABASE_SERVICES=""$/m)
