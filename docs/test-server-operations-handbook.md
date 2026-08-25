@@ -708,6 +708,32 @@ systemctl is-active nginx
 
 规则：`nginx -t` 未通过时绝不 reload。日常配置更新使用 `reload`，不要无原因 `restart`。
 
+#### 测试 H5 的 Referrer-Policy
+
+`test.yinlizhangyu.com` 同时承载浏览器 H5 和 `/api`，必须在 HTTPS server block 中配置：
+
+```nginx
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+```
+
+不要给这个 H5 域名配置 `no-referrer`。华为 Map Kit 等按网站白名单校验的第三方浏览器 SDK
+需要收到来源站点；`strict-origin-when-cross-origin` 跨域时只发送
+`https://test.yinlizhangyu.com/`，不会发送路由、查询参数或页面路径。
+
+修改并 reload 后必须验证：
+
+```bash
+# [只读] 本机或服务器执行
+curl -fsSI https://test.yinlizhangyu.com/ | \
+  tr -d '\r' | \
+  grep -i '^Referrer-Policy: strict-origin-when-cross-origin$'
+
+# [只读] 服务器执行；确认生效配置中不再出现测试站的 no-referrer
+sudo nginx -T 2>/dev/null | grep -n 'Referrer-Policy'
+```
+
+API 独立域名可以采用更严格的 `no-referrer`；承载浏览器页面并需要调用域名白名单 SDK 的域名不能采用该值。
+
 ### 12.3 检查域名、证书和 DNS
 
 ```bash

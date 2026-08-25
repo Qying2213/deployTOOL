@@ -440,6 +440,11 @@ test('独立配置模板声明前端仓库且不保存密码和私钥内容', ()
 	assert.equal(productionPublicUrl, 'h5.example.com')
 	assert.equal(remoteProductionPublicUrl, productionPublicUrl)
 	assert.equal(nginxProductionHost, productionPublicUrl)
+	assert.match(
+		nginxProductionTemplate,
+		/^\s*add_header\s+Referrer-Policy\s+strict-origin-when-cross-origin\s+always;$/m
+	)
+	assert.doesNotMatch(nginxProductionTemplate, /^\s*add_header\s+Referrer-Policy\s+"?no-referrer"?\s+always;$/m)
 	assert.equal(DEFAULT_CONFIG_PATH, join(TOOL_ROOT, 'config/frontend.test.local.env'))
 })
 
