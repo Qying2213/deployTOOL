@@ -27,7 +27,7 @@ import {
 	renderEnvironmentAudit
 } from './env-audit.mjs'
 
-export const BACKEND_RELEASE_TOOL_VERSION = '5'
+export const BACKEND_RELEASE_TOOL_VERSION = '6'
 export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.test.local.env')
 export const PRODUCTION_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.production.local.env')

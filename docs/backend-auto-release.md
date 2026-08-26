@@ -131,6 +131,12 @@ scp -i /Users/qinyang/.ssh/loumai_test_hexhub \
 scp -i /Users/qinyang/.ssh/loumai_test_hexhub \
   backend/remote/loumai-backend-release.env.example \
   ubuntu@132.232.220.115:/tmp/backend-release.env
+scp -i /Users/qinyang/.ssh/loumai_test_hexhub \
+  backend/remote/loumai-file-storage-cleanup.service.example \
+  ubuntu@132.232.220.115:/tmp/loumai-file-storage-cleanup.service
+scp -i /Users/qinyang/.ssh/loumai_test_hexhub \
+  backend/remote/loumai-file-storage-cleanup.timer.example \
+  ubuntu@132.232.220.115:/tmp/loumai-file-storage-cleanup.timer
 ```
 
 登录服务器，先编辑 `/tmp/backend-release.env`，至少确认以下值：
@@ -150,7 +156,8 @@ LOUMAI_BACKEND_DATABASE_NAME=loumai_test_server
 LOUMAI_BACKEND_BACKUP_ROOT=/var/backups/loumai
 # 视频 Worker 一次性安装完成前先保持两项；4.1 节完成后再改为三项。
 LOUMAI_BACKEND_SERVICES="loumai-im-worker.service loumai-api.service"
-LOUMAI_BACKEND_TIMERS=""
+LOUMAI_BACKEND_TIMERS="loumai-file-storage-cleanup.timer"
+LOUMAI_BACKEND_ONESHOT_SERVICES="loumai-file-storage-cleanup.service"
 LOUMAI_BACKEND_VIDEO_SERVICE=loumai-video-worker.service
 LOUMAI_BACKEND_FFMPEG_BIN=/opt/loumai-runtime/ffmpeg/bin/ffmpeg
 LOUMAI_BACKEND_FFPROBE_BIN=/opt/loumai-runtime/ffmpeg/bin/ffprobe
@@ -168,8 +175,26 @@ sudo install -m 0755 -o root -g root \
 sudo install -m 0644 -o root -g root \
   /tmp/backend-release.env \
   /etc/loumai/backend-release.env
-rm -f /tmp/loumai-backend-release /tmp/backend-release.env
+sudo install -d -m 0750 -o ubuntu -g ubuntu /srv/loumai/shared/uploads
+sudo install -m 0644 -o root -g root \
+  /tmp/loumai-file-storage-cleanup.service \
+  /etc/systemd/system/loumai-file-storage-cleanup.service
+sudo install -m 0644 -o root -g root \
+  /tmp/loumai-file-storage-cleanup.timer \
+  /etc/systemd/system/loumai-file-storage-cleanup.timer
+sudo systemctl daemon-reload
+sudo systemd-analyze verify \
+  /etc/systemd/system/loumai-file-storage-cleanup.service \
+  /etc/systemd/system/loumai-file-storage-cleanup.timer
+sudo systemctl enable --now loumai-file-storage-cleanup.timer
+rm -f \
+  /tmp/loumai-backend-release \
+  /tmp/backend-release.env \
+  /tmp/loumai-file-storage-cleanup.service \
+  /tmp/loumai-file-storage-cleanup.timer
 ```
+
+测试服发布门禁会核对 cleanup service/timer 已安装且 timer 持续启用；这不是仅写在模板里的可选项。它负责把取消上传和超过 24 小时仍未引用的附件推进到物理删除。
 
 安装后分别核对本机文件和服务器已安装文件的 SHA256；两边必须完全相同：
 

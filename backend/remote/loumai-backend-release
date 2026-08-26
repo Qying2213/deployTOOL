@@ -6,7 +6,7 @@ export GIT_PAGER=cat PAGER=cat SYSTEMD_PAGER=cat SYSTEMD_COLORS=0
 unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
 umask 022
 
-readonly HELPER_VERSION="5"
+readonly HELPER_VERSION="6"
 readonly CONFIG_FILE="/etc/loumai/backend-release.env"
 
 # These two installation checks must work before the server configuration exists.
@@ -206,19 +206,19 @@ validate_units() {
   local unit primary auxiliary
   local -A seen=()
 	[[ "${#SERVICES[@]}" -gt 0 ]] || fail "至少配置一个后端 service"
+  [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-file-storage-cleanup.service "* ]] \
+    || fail "所有环境都必须纳管 loumai-file-storage-cleanup.service"
+  [[ " ${TIMERS[*]} " == *" loumai-file-storage-cleanup.timer "* ]] \
+    || fail "所有环境都必须纳管 loumai-file-storage-cleanup.timer"
   if [[ "$ENVIRONMENT" == "production" ]]; then
     [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-app-push-dispatcher.service "* ]] \
       || fail "正式服必须纳管 loumai-app-push-dispatcher.service"
     [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-rent-billing.service "* ]] \
       || fail "正式服必须纳管 loumai-rent-billing.service"
-    [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-file-storage-cleanup.service "* ]] \
-      || fail "正式服必须纳管 loumai-file-storage-cleanup.service"
     [[ " ${TIMERS[*]} " == *" loumai-app-push-dispatcher.timer "* ]] \
       || fail "正式服必须纳管 loumai-app-push-dispatcher.timer"
     [[ " ${TIMERS[*]} " == *" loumai-rent-billing.timer "* ]] \
       || fail "正式服必须纳管 loumai-rent-billing.timer"
-    [[ " ${TIMERS[*]} " == *" loumai-file-storage-cleanup.timer "* ]] \
-      || fail "正式服必须纳管 loumai-file-storage-cleanup.timer"
   fi
   for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${ONESHOT_SERVICES[@]}"; do
 		[[ -n "$unit" ]] || continue
@@ -1693,13 +1693,15 @@ assert_database_targets() {
 validate_target_application_contract() {
   local backend="$1"
   local required_script
+  [[ -f "$backend/scripts/run_file_storage_cleanup.py" \
+    && ! -L "$backend/scripts/run_file_storage_cleanup.py" ]] \
+    || fail "产物缺少受控文件存储清理脚本：scripts/run_file_storage_cleanup.py"
   if [[ "$ENVIRONMENT" == "production" ]]; then
     for required_script in \
       scripts/run_video_transcode_worker.py \
       scripts/run_tencent_im_callback_worker.py \
       scripts/run_app_push_dispatcher.py \
-      scripts/run_rent_billing_jobs.py \
-      scripts/run_file_storage_cleanup.py; do
+      scripts/run_rent_billing_jobs.py; do
       [[ -f "$backend/$required_script" && ! -L "$backend/$required_script" ]] \
         || fail "正式服产物缺少受控运行脚本：$required_script"
     done
@@ -2060,7 +2062,51 @@ PY
 }
 
 validate_property_video_direct_upload() {
-  local backend="$1"
+  local backend="$1" require_storage_contract="${2:-true}"
+  [[ "$require_storage_contract" == "true" || "$require_storage_contract" == "false" ]] \
+    || fail "COS 存储合同校验模式非法"
+  if [[ "$require_storage_contract" == "true" ]]; then
+    run_in_release "$backend" "$backend/.venv/bin/python" -c '
+from io import BytesIO
+from uuid import uuid4
+
+from app.core.config import Settings
+from app.modules.files.tencent_cos import (
+    delete_tencent_cos_object,
+    get_tencent_cos_bucket_versioning_status,
+    list_tencent_cos_object_versions,
+    tencent_cos_object_exists,
+    upload_tencent_cos_object,
+)
+
+settings = Settings(_env_file=None)
+if settings.file_storage_provider != "tencent_cos":
+    raise SystemExit(0)
+kwargs = {
+    "bucket": settings.tencent_cos_bucket,
+    "region": settings.tencent_cos_region,
+    "secret_id": settings.tencent_cos_secret_id,
+    "secret_key": settings.tencent_cos_secret_key,
+}
+storage_key = f"tencent-cos/deployment-preflight/storage-delete/{uuid4()}.txt"
+payload = b"loumai-storage-delete-preflight"
+upload_tencent_cos_object(
+    **kwargs,
+    storage_key=storage_key,
+    file_object=BytesIO(payload),
+    file_type="text/plain",
+    file_size=len(payload),
+    cache_control="no-store",
+)
+delete_tencent_cos_object(**kwargs, storage_key=storage_key)
+status = get_tencent_cos_bucket_versioning_status(**kwargs)
+if status in {"Enabled", "Suspended"}:
+    if list_tencent_cos_object_versions(**kwargs, storage_key=storage_key):
+        raise SystemExit("COS versioned object deletion preflight left object versions behind")
+if tencent_cos_object_exists(**kwargs, storage_key=storage_key):
+    raise SystemExit("COS object deletion preflight left the object behind")
+'
+  fi
   if run_in_release "$backend" "$backend/.venv/bin/python" -c '
 import os
 
@@ -2075,7 +2121,6 @@ from datetime import datetime, timedelta, timezone
 
 from app.core.config import Settings
 from app.modules.files.tencent_cos import (
-    assert_tencent_cos_bucket_unversioned,
     issue_tencent_cos_post_object_credential,
 )
 
@@ -2084,12 +2129,6 @@ if not settings.property_video_direct_upload_enabled:
     raise SystemExit(0)
 if sys.argv[1] != "true":
     raise SystemExit("PROPERTY_VIDEO direct upload requires explicit deployment approval")
-assert_tencent_cos_bucket_unversioned(
-    bucket=settings.tencent_cos_bucket,
-    region=settings.tencent_cos_region,
-    secret_id=settings.tencent_cos_secret_id,
-    secret_key=settings.tencent_cos_secret_key,
-)
 now = datetime.now(timezone.utc)
 issue_tencent_cos_post_object_credential(
     bucket=settings.tencent_cos_bucket,
@@ -2516,7 +2555,7 @@ action_preflight() {
     if [[ "$RECOVERY_PHASE" != "prepared" ]]; then
       assert_recovery_units_fail_closed
     fi
-    validate_property_video_direct_upload "$RECOVERY_RELEASE"
+    validate_property_video_direct_upload "$RECOVERY_RELEASE" false
     revision="$(migration_db_revision_for_release "$RECOVERY_RELEASE")"
     recovery_required=true
     recovery_token="$(recovery_marker_token)"
@@ -2534,7 +2573,7 @@ action_preflight() {
       deployment_state=UNINITIALIZED
     else
       [[ "$current" != "NONE" ]] || fail "目标服尚未初始化；首次正式发布必须使用 bootstrap"
-      validate_property_video_direct_upload "$current"
+      validate_property_video_direct_upload "$current" false
       revision="$(current_db_revision)"
       initialized="true"
       deployment_state=HEALTHY

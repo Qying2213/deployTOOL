@@ -772,10 +772,12 @@ test('迁移发布先停写与备份，迁移后故障保持服务停止且不�
 	assert.match(helper, /printf 'PUBLIC_HEALTH_URL=%s\\n'/)
 	assert.match(helper, /-H "Host: \$PUBLIC_HEALTH_AUTHORITY" "\$LOCAL_HEALTH_URL"/)
 	assert.ok(
-		helper.indexOf('os.getenv("PROPERTY_VIDEO_DIRECT_UPLOAD_ENABLED", "false")') <
-			helper.indexOf('assert_tencent_cos_bucket_unversioned,'),
-		'preflight must accept an older release when direct upload is disabled'
+		helper.indexOf('upload_tencent_cos_object(') <
+			helper.indexOf('os.getenv("PROPERTY_VIDEO_DIRECT_UPLOAD_ENABLED", "false")'),
+		'multipart COS upload and physical deletion must be verified even when direct upload is disabled'
 	)
+	assert.match(helper, /list_tencent_cos_object_versions/)
+	assert.doesNotMatch(helper, /assert_tencent_cos_bucket_unversioned/)
 	const statusStart = helper.indexOf('action_status()')
 	const statusActivateStart = helper.indexOf('action_activate()', statusStart)
 	const status = helper.slice(statusStart, statusActivateStart)
@@ -843,6 +845,8 @@ test('前后端分离配置模板不保存凭据内容，并声明后端仓库�
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_LOCAL_REDIS_APPROVED=false$/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_ONESHOT_SERVICES=.*file-storage-cleanup/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_TIMERS=.*file-storage-cleanup\.timer/m)
+	assert.match(remoteTemplate, /^LOUMAI_BACKEND_ONESHOT_SERVICES=.*file-storage-cleanup/m)
+	assert.match(remoteTemplate, /^LOUMAI_BACKEND_TIMERS=.*file-storage-cleanup\.timer/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_AUXILIARY_DATABASE_SERVICES=""$/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_VIDEO_SERVICE_USER=loumai-video$/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_IM_SERVICE_USER=loumai-im$/m)
@@ -972,6 +976,18 @@ test('正式服 systemd 合同隔离 UID、固定时区并完整纳管三个 tim
 	assert.match(productionGuide, /install -d -m 0755 -o root -g root \/etc\/loumai/)
 	assert.match(productionGuide, /install -d -m 0750 -o root -g loumai-db-ca \/etc\/loumai\/certs/)
 	assert.match(productionGuide, /数据库 CA 文件设为 `root:loumai-db-ca 0640`/)
+})
+
+test('测试服 systemd 模板纳管文件存储清理并保留本地存储写权限', () => {
+	const unit = (name) => readFileSync(join(TOOL_ROOT, `backend/remote/${name}`), 'utf8')
+	const service = unit('loumai-file-storage-cleanup.service.example')
+	const timer = unit('loumai-file-storage-cleanup.timer.example')
+	assert.match(service, /^User=ubuntu$/m)
+	assert.match(service, /^ExecStart=.*scripts\/run_file_storage_cleanup\.py$/m)
+	assert.match(service, /^ReadWritePaths=\/srv\/loumai\/shared\/uploads$/m)
+	assert.match(timer, /^Unit=loumai-file-storage-cleanup\.service$/m)
+	assert.match(timer, /^Persistent=true$/m)
+	assert.match(timer, /^WantedBy=timers\.target$/m)
 })
 
 test('视频转码发布合同固定 FFmpeg、单独 Worker、资源边界与无查询日志', () => {
