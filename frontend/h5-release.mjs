@@ -792,8 +792,12 @@ function runTests(config, { dryRun = false } = {}) {
 }
 
 function runPackageImportTests() {
+	const packageTestEnvironment = { ...process.env }
+	// 外部正式包由产物门禁校验，不应依赖旁边某个本地前端源码仓库的状态。
+	delete packageTestEnvironment.H5_FRONTEND_REPO
 	run('node', ['--test', join(TOOL_ROOT, 'tests/frontend-h5-release.test.mjs')], {
-		cwd: TOOL_ROOT
+		cwd: TOOL_ROOT,
+		env: packageTestEnvironment
 	})
 }
 

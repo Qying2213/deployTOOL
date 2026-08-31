@@ -465,7 +465,9 @@ test('远端激活器脚本通过 Bash 语法检查', () => {
 	assert.equal(result.status, 0, [result.stdout, result.stderr].filter(Boolean).join('\n'))
 })
 
-test('构建环境只暴露白名单字段且源码不再注入完整 import.meta.env', () => {
+test('构建环境只暴露白名单字段且源码不再注入完整 import.meta.env', {
+	skip: !process.env.H5_FRONTEND_REPO
+}, () => {
 	const sources = [
 		readFileSync(join(FRONTEND_REPO_ROOT, 'config/app.js'), 'utf8'),
 		readFileSync(join(FRONTEND_REPO_ROOT, 'config/environment.js'), 'utf8'),
@@ -475,6 +477,14 @@ test('构建环境只暴露白名单字段且源码不再注入完整 import.met
 	assert.doesNotMatch(sources.join('\n'), /import\.meta\.env/)
 	assert.match(viteConfig, /__LOUMAI_BUILD_ENV__/)
 	assert.doesNotMatch(viteConfig, /VITE_ROOT_DIR/)
+})
+
+test('外部 ZIP 发布不依赖兄弟前端源码，源码构建仍显式启用源码合同', () => {
+	const releaseSource = readFileSync(join(TOOL_ROOT, 'frontend/h5-release.mjs'), 'utf8')
+	const testSource = readFileSync(join(TOOL_ROOT, 'tests/frontend-h5-release.test.mjs'), 'utf8')
+	assert.match(releaseSource, /H5_FRONTEND_REPO: config\.frontendRepoRoot/)
+	assert.match(releaseSource, /delete packageTestEnvironment\.H5_FRONTEND_REPO/)
+	assert.match(testSource, /skip: !process\.env\.H5_FRONTEND_REPO/)
 })
 
 test('本地构建目录拒绝软链接和越界清理', () => {
