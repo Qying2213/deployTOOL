@@ -1,6 +1,8 @@
 # 独立管理后台后端一键发布说明
 
-更新时间：2026-08-21
+本文原有命令默认发布测试服。正式服已新增独立配置、helper、数据库 DML 角色及联合入口，见 [管理后台前后端正式服一键发布](admin-production-release.md)。正式服不要复用本页的测试安装器；必须显式 `--env production`。
+
+更新时间：2026-08-28
 
 ## 1. 当前部署结构
 
@@ -9,6 +11,7 @@
 - systemd：`loumai-company-management.service`
 - 本机监听：`127.0.0.1:8100`
 - 公网前缀：`https://test.yinlizhangyu.com/admin-api`
+- 后台测试页面：`https://admin-test.yinlizhangyu.com`，页面使用同源 `/admin-api/api/v1`；原测试域名入口保留兼容。
 - 发布目录：`/srv/loumai-company-management/releases`
 - 当前版本链接：`/srv/loumai-company-management/current`
 
@@ -16,7 +19,7 @@
 
 ## 2. 一键发布
 
-正式发布：
+发布到测试服：
 
 ```bash
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-backend deploy --yes
@@ -117,11 +120,11 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deplo
 
 ## 7. 前端压缩包边界
 
-本文只处理管理后台后端。尚未收到的管理后台前端 `dist.zip` 不在本发布链中，也不会因为后端发布被自动上线。收到前端包后，需要单独校验其 API Base URL、静态资源路径和路由刷新，再建立独立前端原子发布流程。
+本文只处理管理后台后端；后端发布不会自动更新后台前端。后台前端已于 2026-08-28 通过独立 ZIP 发布链上线，命令、校验和回滚见 [管理后台前端发布说明](admin-frontend-auto-release.md)。不要把前端压缩包混入本后端发布链。
 
-## 8. 当前验收基线
+## 8. 历史验收基线
 
-2026-08-21 已完成：
+2026-08-21 已完成以下验收。当前版本和数据库 profile 以 `admin-backend status` 为准，不应将历史结果当成实时状态：
 
 - 管理后台后端全量 23 项测试通过；
 - 独立发布器 8 项安全合同测试通过；

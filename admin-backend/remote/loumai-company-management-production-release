@@ -1,0 +1,959 @@
+#!/usr/bin/python3
+"""Production-only admin release helper. Install root:root 0755 after review.
+
+No migrations, secret-bearing command arguments, arbitrary shell, or installer
+execution. All business writers share the main backend's release lock.
+"""
+
+import contextlib
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path, PurePosixPath
+from urllib.parse import parse_qs, urlsplit
+
+VERSION = "2"
+ROOT = Path("/srv/loumai-company-management-production")
+CONFIG = Path("/etc/loumai/company-management-production-release.env")
+APP_ENV = Path("/etc/loumai/company-management-production.env")
+DB_ENV = Path("/etc/loumai/company-management-production-database.env")
+MAIN_CONFIG = Path("/etc/loumai/backend-release.env")
+MAIN_ROOT = Path("/srv/loumai-backend")
+HELPER = Path("/usr/local/sbin/loumai-company-management-production-release")
+SERVICE = "loumai-company-management.service"
+RUN_USER = "loumai-admin"
+BUILD_USER = "loumai-build"
+DEPLOY_USER = "loumai-deploy"
+CA = "/etc/loumai/certs/tencentdb-ca.pem"
+ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "LANG": "C.UTF-8",
+    "PYTHONDONTWRITEBYTECODE": "1",
+}
+APP_KEYS = {
+    "APP_ENVIRONMENT",
+    "ADMIN_JWT_SECRET_KEY",
+    "ADMIN_JWT_ALGORITHM",
+    "ADMIN_ACCESS_TOKEN_EXPIRE_MINUTES",
+    "BACKEND_ALLOWED_HOSTS",
+    "BACKEND_CORS_ORIGINS",
+    "API_DOCS_ENABLED",
+    "SCHEMA_CHECK_ENABLED",
+    "FILE_STORAGE_PROVIDER",
+    "TENCENT_COS_SECRET_ID",
+    "TENCENT_COS_SECRET_KEY",
+    "TENCENT_COS_REGION",
+    "TENCENT_COS_BUCKET",
+    "ATTACHMENT_SIGNED_URL_EXPIRES_SECONDS",
+}
+DB_KEYS = {"DATABASE_URL", "LOUMAI_DATABASE_PROFILE", "LOUMAI_DATABASE_NAME"}
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def command(args, *, env=None, cwd=None, input=None, timeout=30, check=True):
+    result = subprocess.run(
+        [str(arg) for arg in args],
+        env=env or ENV,
+        cwd=cwd,
+        input=input,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    # Python validation/library errors can contain URLs. Never echo child output
+    # or configuration values on failure; operators use the protected server log.
+    require(
+        not check or result.returncode == 0,
+        f"command failed: {Path(args[0]).name} (exit={result.returncode})",
+    )
+    return result.stdout.strip() if check else result
+
+
+def secure_directory(path):
+    path = Path(path)
+    for current in (path, *path.parents):
+        info = current.lstat()
+        require(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == 0
+            and not info.st_mode & 0o022,
+            f"directory is not root-controlled: {current}",
+        )
+
+
+def secure_file(path, *, secret=False):
+    path = Path(path)
+    secure_directory(path.parent)
+    info = path.lstat()
+    require(
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == 0
+        and not info.st_mode & 0o022
+        and info.st_nlink == 1,
+        f"file is not root-controlled: {path}",
+    )
+    if secret:
+        require(
+            info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o600,
+            f"secret must be root:root 0600: {path}",
+        )
+
+
+def parse_env(text):
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        require(
+            separator and re.fullmatch(r"[A-Z][A-Z0-9_]*", key) and key not in values,
+            "invalid or duplicate environment key",
+        )
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        require(
+            not any(char in value for char in ("\x00", "\r", "`", "$(")),
+            "unsafe environment value",
+        )
+        values[key] = value
+    return values
+
+
+def read_env(path, *, secret=False):
+    secure_file(path, secret=secret)
+    return parse_env(path.read_text())
+
+
+def list_value(raw):
+    value = (
+        json.loads(raw)
+        if raw.startswith("[")
+        else [item.strip() for item in raw.split(",") if item.strip()]
+    )
+    require(
+        isinstance(value, list) and all(isinstance(item, str) for item in value),
+        "invalid host/origin list",
+    )
+    return value
+
+
+def validate_runtime_values(values, public_url, main):
+    require(
+        set(values) <= APP_KEYS | DB_KEYS,
+        "admin environment contains unexpected credentials or fields",
+    )
+    require(
+        values.get("APP_ENVIRONMENT") == "production"
+        and values.get("API_DOCS_ENABLED") == "false"
+        and values.get("SCHEMA_CHECK_ENABLED") == "true",
+        "production app safety switches are not configured",
+    )
+    public = urlsplit(public_url)
+    require(
+        public.scheme == "https"
+        and public.path == "/admin-api"
+        and not public.query
+        and not public.fragment
+        and not public.username
+        and not public.password
+        and not public.port
+        and re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", public.hostname or "")
+        and not re.search(
+            r"(^|[.-])(test|localhost|example|invalid)([.-]|$)", public.hostname or ""
+        ),
+        "invalid production admin URL",
+    )
+    try:
+        ipaddress.ip_address(public.hostname)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("production admin URL cannot be an IP")
+    origin = f"https://{public.hostname}"
+    require(
+        list_value(values.get("BACKEND_ALLOWED_HOSTS", "")) == [public.hostname],
+        "admin allowed host must match its own domain",
+    )
+    require(
+        list_value(values.get("BACKEND_CORS_ORIGINS", "")) == [origin],
+        "admin CORS must be its own HTTPS origin",
+    )
+    jwt = values.get("ADMIN_JWT_SECRET_KEY", "")
+    require(
+        len(jwt) >= 32 and not re.search(r"replace|change.me|example", jwt, re.I),
+        "independent admin JWT secret is missing/placeholder",
+    )
+    require(
+        values.get("FILE_STORAGE_PROVIDER") == "tencent_cos",
+        "production admin must use Tencent COS",
+    )
+    for key in (
+        "TENCENT_COS_SECRET_ID",
+        "TENCENT_COS_SECRET_KEY",
+        "TENCENT_COS_REGION",
+        "TENCENT_COS_BUCKET",
+    ):
+        require(
+            values.get(key)
+            and not re.search(r"replace|change.me|example", values[key], re.I),
+            f"missing production {key}",
+        )
+    require(
+        values.get("LOUMAI_DATABASE_PROFILE") == "cloud",
+        "production admin requires cloud database",
+    )
+    database = urlsplit(values.get("DATABASE_URL", ""))
+    query = parse_qs(database.query)
+    require(
+        database.scheme == "postgresql+psycopg"
+        and database.username
+        and database.password
+        and database.hostname == main.get("LOUMAI_BACKEND_CLOUD_DATABASE_HOST")
+        and database.port == 5432
+        and database.path == "/" + main.get("LOUMAI_BACKEND_DATABASE_NAME", "")
+        and values.get("LOUMAI_DATABASE_NAME")
+        == main.get("LOUMAI_BACKEND_DATABASE_NAME")
+        and query == {"sslmode": ["verify-full"], "sslrootcert": [CA]},
+        "admin database target or verified TLS differs from production business database",
+    )
+
+
+def trusted_executable(value):
+    path = Path(value)
+    require(
+        path.is_absolute()
+        and path.resolve().is_relative_to(Path("/opt/loumai-runtime")),
+        "runtime must be inside /opt/loumai-runtime",
+    )
+    secure_file(path.resolve())
+    require(os.access(path, os.X_OK), "runtime executable is missing")
+    return str(path)
+
+
+def systemd_value(name):
+    return command(["/usr/bin/systemctl", "show", SERVICE, "-p", name, "--value"])
+
+
+def contract(*, allow_recovery=False):
+    config = read_env(CONFIG)
+    require(
+        set(config)
+        == {
+            "LOUMAI_COMPANY_ENVIRONMENT",
+            "LOUMAI_COMPANY_PUBLIC_URL",
+            "LOUMAI_COMPANY_BASE_PYTHON",
+            "LOUMAI_COMPANY_UV",
+        },
+        "unexpected production helper configuration",
+    )
+    require(
+        config["LOUMAI_COMPANY_ENVIRONMENT"] == "production",
+        "not a production admin helper configuration",
+    )
+    main = read_env(MAIN_CONFIG)
+    require(
+        main.get("LOUMAI_BACKEND_ENVIRONMENT") == "production"
+        and main.get("LOUMAI_BACKEND_REMOTE_ROOT") == str(MAIN_ROOT),
+        "business backend is not production",
+    )
+    require(
+        SERVICE in main.get("LOUMAI_BACKEND_AUXILIARY_DATABASE_SERVICES", "").split(),
+        "admin writer is not registered in the main backend migration fence",
+    )
+    require(
+        allow_recovery or not (MAIN_ROOT / ".migration-recovery-required").exists(),
+        "business database recovery is required; admin start/deploy/rollback is blocked",
+    )
+    require(
+        (MAIN_ROOT / "backend-current").is_symlink(),
+        "initialize the business backend before deploying admin",
+    )
+    for directory in (ROOT, ROOT / "releases", ROOT / "incoming", MAIN_ROOT):
+        secure_directory(directory)
+    secure_file(HELPER)
+    secure_file(Path("/etc/systemd/system") / SERVICE)
+    secure_file(Path(CA))
+    app = read_env(APP_ENV, secret=True)
+    database = read_env(DB_ENV, secret=True)
+    require(
+        set(app) <= APP_KEYS and set(database) == DB_KEYS,
+        "database and admin credentials must be isolated",
+    )
+    environment = {**app, **database}
+    validate_runtime_values(environment, config["LOUMAI_COMPANY_PUBLIC_URL"], main)
+    main_profile = read_env(
+        Path("/etc/loumai/database-profiles/cloud.env"), secret=True
+    )
+    admin_role = urlsplit(environment["DATABASE_URL"]).username
+    require(
+        all(
+            admin_role != urlsplit(main_profile.get(key, "")).username
+            for key in ("DATABASE_URL", "MIGRATION_DATABASE_URL", "BACKUP_DATABASE_URL")
+        ),
+        "admin requires an independent DML database role",
+    )
+    identities = [
+        pwd.getpwnam(user).pw_uid for user in (RUN_USER, BUILD_USER, DEPLOY_USER)
+    ]
+    require(
+        0 not in identities and len(set(identities)) == 3,
+        "admin, build and deploy require separate non-root UIDs",
+    )
+    require(
+        systemd_value("User") == RUN_USER and systemd_value("Group") == RUN_USER,
+        "unexpected admin service UID/GID",
+    )
+    require(
+        systemd_value("FragmentPath") == f"/etc/systemd/system/{SERVICE}"
+        and not systemd_value("DropInPaths"),
+        "unreviewed admin systemd override",
+    )
+    env_files = re.findall(r"/[A-Za-z0-9._/-]+", systemd_value("EnvironmentFiles"))
+    require(
+        env_files == [str(APP_ENV), str(DB_ENV)],
+        "admin systemd must load only its independent runtime credentials",
+    )
+    require(
+        "loumai-db-ca" in systemd_value("SupplementaryGroups").split(),
+        "admin service cannot read database CA",
+    )
+    require(
+        systemd_value("WorkingDirectory") == str(ROOT / "current")
+        and f"{HELPER} run" in systemd_value("ExecStart"),
+        "admin service runner mismatch",
+    )
+    if current_target() == "NONE":
+        require(
+            systemd_value("ActiveState") in {"inactive", "failed"}
+            and systemd_value("MainPID") == "0"
+            and systemd_value("UnitFileState") == "disabled",
+            "first admin release requires a stopped, disabled service",
+        )
+    config["python"] = trusted_executable(config["LOUMAI_COMPANY_BASE_PYTHON"])
+    config["uv"] = trusted_executable(config["LOUMAI_COMPANY_UV"])
+    command(["/usr/sbin/nginx", "-t"])
+    return config, environment
+
+
+def release_path(release_id):
+    require(
+        re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}", release_id),
+        "invalid release ID",
+    )
+    return ROOT / "releases" / release_id / "backend"
+
+
+def current_target():
+    link = ROOT / "current"
+    if not link.exists() and not link.is_symlink():
+        return "NONE"
+    require(link.is_symlink(), "admin current is not a symlink")
+    target = link.resolve(strict=True)
+    require(
+        target == release_path(target.parent.name),
+        "admin current escapes the release root",
+    )
+    return str(target)
+
+
+@contextlib.contextmanager
+def locks():
+    handles = []
+    try:
+        for path in (MAIN_ROOT / ".backend-release.lock", ROOT / ".admin-release.lock"):
+            secure_directory(path.parent)
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            handles.append(descriptor)
+            info = os.fstat(descriptor)
+            require(
+                stat.S_ISREG(info.st_mode)
+                and info.st_uid == 0
+                and not info.st_mode & 0o022,
+                "unsafe release lock",
+            )
+            deadline = time.monotonic() + 120
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    require(
+                        time.monotonic() < deadline,
+                        "another business/admin deployment is running",
+                    )
+                    time.sleep(0.2)
+        yield
+    finally:
+        for descriptor in reversed(handles):
+            os.close(descriptor)
+
+
+def digest(path):
+    result = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            result.update(block)
+    return result.hexdigest()
+
+
+def unpack_archive(archive, destination):
+    with tarfile.open(archive) as bundle:
+        members = []
+        total = 0
+        for item in bundle:
+            members.append(item)
+            total += item.size
+            require(
+                len(members) <= 20000 and total <= 256 * 1024 * 1024,
+                "archive exceeds limits",
+            )
+        seen = set()
+        for item in members:
+            parts = PurePosixPath(item.name).parts
+            require(
+                parts
+                and parts[0] == "backend"
+                and ".." not in parts
+                and not item.name.startswith("/")
+                and "\\" not in item.name
+                and (item.isfile() or item.isdir())
+                and not any(part.startswith(".") for part in parts)
+                and not re.search(
+                    r"\.(env|pem|key|p12|pfx|sql|db|sqlite|bak)$", item.name, re.I
+                ),
+                "archive contains unsafe paths, links or credentials",
+            )
+            require(item.name not in seen, "duplicate archive member")
+            seen.add(item.name)
+        for item in members:
+            target = destination / item.name
+            if item.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("xb") as output, bundle.extractfile(item) as source:
+                    shutil.copyfileobj(source, output)
+                target.chmod(0o644)
+
+
+def verify_release(target, release_id):
+    secure_directory(target)
+    require(target.is_dir() and not target.is_symlink(), "invalid release directory")
+    manifest = json.loads((target / "release.json").read_text())
+    require(
+        manifest.get("environment") == "production"
+        and manifest.get("release_id") == release_id
+        and re.fullmatch(r"[a-f0-9]{40}", manifest.get("commit", "")),
+        "release is not a pinned production admin build",
+    )
+    expected = {}
+    for line in (target / "SHA256SUMS").read_text().splitlines():
+        match = re.fullmatch(r"([a-f0-9]{64})  ([A-Za-z0-9_./-]+)", line)
+        require(match is not None, "invalid checksums manifest")
+        hashed, name = match.groups()
+        require(
+            not name.startswith("/")
+            and not any(part.startswith(".") for part in PurePosixPath(name).parts)
+            and name not in expected,
+            "unsafe/duplicate checksum path",
+        )
+        expected[name] = hashed
+    actual = set()
+    for path in target.rglob("*"):
+        relative = path.relative_to(target)
+        if relative.parts[0] == ".runtime":
+            continue
+        require(not path.is_symlink(), "source symlink is forbidden")
+        if path.is_file() and relative.as_posix() != "SHA256SUMS":
+            actual.add(relative.as_posix())
+    require(actual == set(expected), "checksums do not cover the exact artifact")
+    require(
+        {"app/main.py", "pyproject.toml", "runtime-constraints.txt", "release.json"}
+        <= actual,
+        "incomplete admin release",
+    )
+    for name, hashed in expected.items():
+        require(digest(target / name) == hashed, "release checksum mismatch")
+    constraints = (target / "runtime-constraints.txt").read_text().splitlines()
+    require(
+        constraints
+        and all(
+            re.fullmatch(r"[A-Za-z0-9_.-]+==[A-Za-z0-9_.+!-]+", line)
+            for line in constraints
+        ),
+        "runtime dependencies must be pinned (no URLs/options)",
+    )
+
+
+def run_as(user, args, *, environment=None, cwd=None, input=None, timeout=60):
+    # runuser inherits a deliberately minimal environment; secrets never appear in argv.
+    return command(
+        ["/usr/sbin/runuser", "-u", user, "--", *args],
+        env={**ENV, **(environment or {})},
+        cwd=cwd,
+        input=input,
+        timeout=timeout,
+    )
+
+
+def build_runtime(target, config):
+    runtime = target / ".runtime"
+    runtime.mkdir(mode=0o755)
+    builder = pwd.getpwnam(BUILD_USER)
+    os.chown(runtime, builder.pw_uid, builder.pw_gid)
+    build_env = {
+        "UV_CACHE_DIR": str(runtime / "cache"),
+        "PYTHONPYCACHEPREFIX": str(runtime / "pycache"),
+    }
+    run_as(
+        BUILD_USER,
+        [
+            config["uv"],
+            "--no-config",
+            "venv",
+            "--python",
+            config["python"],
+            str(runtime / "venv"),
+        ],
+        environment=build_env,
+        cwd=target,
+        timeout=180,
+    )
+    run_as(
+        BUILD_USER,
+        [
+            config["uv"],
+            "--no-config",
+            "pip",
+            "sync",
+            "--python",
+            str(runtime / "venv/bin/python"),
+            "runtime-constraints.txt",
+        ],
+        environment=build_env,
+        cwd=target,
+        timeout=600,
+    )
+    run_as(
+        BUILD_USER,
+        [str(runtime / "venv/bin/python"), "-m", "compileall", "-q", "app"],
+        environment=build_env,
+        cwd=target,
+    )
+    for path in [runtime, *runtime.rglob("*")]:
+        os.chown(path, 0, 0, follow_symlinks=False)
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
+
+
+PROBE = '''
+import sys
+try:
+    from app.core.config import get_settings
+    settings = get_settings()
+    if settings.app_environment != 'production' or settings.api_docs_enabled or not settings.schema_check_enabled:
+        raise RuntimeError('unsafe production settings')
+    if settings.file_storage_provider != 'tencent_cos':
+        raise RuntimeError('production requires COS')
+    from sqlalchemy import text
+    from app.db.session import engine
+    from app.db.schema_check import validate_shared_schema
+    validate_shared_schema(engine)
+    with engine.connect() as db:
+        dangerous = db.execute(text("""
+            SELECT EXISTS (SELECT 1 FROM pg_roles r WHERE
+                pg_has_role(current_user, r.oid, 'MEMBER') AND
+                (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls))
+                OR has_database_privilege(current_database(), 'CREATE')
+                OR has_database_privilege(current_database(), 'TEMP')
+                OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname NOT LIKE 'pg_%'
+                    AND n.nspname <> 'information_schema' AND has_schema_privilege(n.oid, 'CREATE'))
+                OR EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                    WHERE n.nspname='public' AND pg_has_role(current_user, c.relowner, 'MEMBER'))
+        """)).scalar_one()
+        if dangerous: raise RuntimeError('DDL/owner credentials are forbidden')
+except Exception:
+    sys.exit(1)
+print('ADMIN_SCHEMA_AND_DML_ROLE=verified')
+'''
+
+
+def probe_release(target, environment):
+    verify_release(target, target.parent.name)
+    require(
+        (target / ".runtime/venv/bin/python").exists(), "release runtime is missing"
+    )
+    output = run_as(
+        RUN_USER,
+        [str(target / ".runtime/venv/bin/python"), "-"],
+        environment=environment,
+        cwd=target,
+        input=PROBE,
+    )
+    require(
+        output == "ADMIN_SCHEMA_AND_DML_ROLE=verified",
+        "admin schema/limited database role probe failed",
+    )
+
+
+def switch_current(target):
+    link = ROOT / "current"
+    if target == "NONE":
+        if link.is_symlink():
+            link.unlink()
+        return
+    next_link = ROOT / f".current-next-{os.getpid()}"
+    require(
+        not next_link.exists() and not next_link.is_symlink(),
+        "temporary current link exists",
+    )
+    next_link.symlink_to(target)
+    os.replace(next_link, link)
+
+
+def verify_process(target, environment, *, compare_credentials=True):
+    require(systemd_value("ActiveState") == "active", "admin service not active")
+    pid = systemd_value("MainPID")
+    require(re.fullmatch(r"[1-9][0-9]*", pid), "invalid admin service PID")
+    require(
+        Path(f"/proc/{pid}/cwd").resolve() == Path(target),
+        "admin is running a different release",
+    )
+    data = Path(f"/proc/{pid}/environ").read_bytes()
+    actual = dict(
+        item.decode().split("=", 1) for item in data.split(b"\0") if b"=" in item
+    )
+    if compare_credentials:
+        require(
+            all(actual.get(key) == value for key, value in environment.items()),
+            "admin runtime credentials differ from configured production credentials",
+        )
+    else:
+        for key in (
+            "APP_ENVIRONMENT",
+            "LOUMAI_DATABASE_PROFILE",
+            "LOUMAI_DATABASE_NAME",
+        ):
+            require(
+                actual.get(key) == environment.get(key),
+                "admin is using a non-production database profile",
+            )
+        selected, running = (
+            urlsplit(values.get("DATABASE_URL", "")) for values in (environment, actual)
+        )
+        require(
+            (
+                selected.scheme,
+                selected.hostname,
+                selected.port,
+                selected.path,
+                selected.query,
+            )
+            == (
+                running.scheme,
+                running.hostname,
+                running.port,
+                running.path,
+                running.query,
+            ),
+            "running admin database differs from production target",
+        )
+    require(
+        not (
+            {"MIGRATION_DATABASE_URL", "BACKUP_DATABASE_URL", "JWT_SECRET_KEY"}
+            & set(actual)
+        ),
+        "admin process inherited business/DDL credentials",
+    )
+
+
+def health(config, environment, target):
+    public = config["LOUMAI_COMPANY_PUBLIC_URL"]
+    host = urlsplit(public).hostname
+    for attempt in range(12):
+        try:
+            for url, local in (
+                ("http://127.0.0.1:8100/health", True),
+                (public + "/health", False),
+                (public + "/ready", False),
+            ):
+                args = [
+                    "/usr/bin/curl",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--max-time",
+                    "5",
+                ]
+                if local:
+                    args += ["-H", f"Host: {host}"]
+                body = json.loads(command([*args, url]))["data"]
+                require(
+                    body.get("status") == ("READY" if url.endswith("/ready") else "UP"),
+                    "unexpected admin health response",
+                )
+                if url.endswith("/ready"):
+                    require(
+                        body.get("schema_compatible") is True,
+                        "admin schema is incompatible",
+                    )
+                else:
+                    require(
+                        body.get("service") == "loumai-company-management",
+                        "health endpoint is not admin",
+                    )
+            code = command(
+                [
+                    "/usr/bin/curl",
+                    "-sS",
+                    "--max-time",
+                    "5",
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    public + "/api/v1/admin-auth/me",
+                ]
+            )
+            require(code == "401", "admin unauthenticated boundary is not 401")
+            verify_process(target, environment)
+            return
+        except (RuntimeError, ValueError, KeyError):
+            if attempt == 11:
+                raise
+            time.sleep(1)
+
+
+def activate_target(target, previous, config, environment):
+    probe_release(target, environment)
+    switch_current(str(target))
+    try:
+        command(["/usr/bin/systemctl", "restart", SERVICE], timeout=90)
+        health(config, environment, str(target))
+        command(["/usr/bin/systemctl", "enable", SERVICE])
+    except Exception:
+        command(["/usr/bin/systemctl", "stop", SERVICE])
+        switch_current(previous)
+        if previous != "NONE":
+            try:
+                probe_release(Path(previous), environment)
+                command(["/usr/bin/systemctl", "restart", SERVICE], timeout=90)
+                health(config, environment, previous)
+            except Exception:
+                command(["/usr/bin/systemctl", "disable", "--now", SERVICE])
+                raise RuntimeError(
+                    "CRITICAL: previous admin release could not be restored; admin disabled, investigate manually"
+                ) from None
+        else:
+            command(["/usr/bin/systemctl", "disable", "--now", SERVICE])
+        raise RuntimeError(
+            "admin activation failed; previous state restored; database was not changed"
+        ) from None
+
+
+def report(config, environment):
+    print(f"HELPER_VERSION={VERSION}\nENVIRONMENT=production\nREMOTE_ROOT={ROOT}")
+    print(
+        f"PUBLIC_URL={config['LOUMAI_COMPANY_PUBLIC_URL']}\nCURRENT={current_target()}\nDATABASE_PROFILE=cloud"
+    )
+    print(f"UNIT={systemd_value('ActiveState')}")
+    if current_target() != "NONE" and systemd_value("ActiveState") == "active":
+        verify_process(current_target(), environment, compare_credentials=False)
+
+
+def serve():
+    require(
+        os.getuid() == pwd.getpwnam(RUN_USER).pw_uid != 0,
+        "run is only available to the admin service UID",
+    )
+    environment = {
+        key: value for key, value in os.environ.items() if key in APP_KEYS | DB_KEYS
+    }
+    require(
+        environment.get("APP_ENVIRONMENT") == "production"
+        and environment.get("LOUMAI_DATABASE_PROFILE") == "cloud",
+        "invalid service runtime environment",
+    )
+    target = current_target()
+    require(target != "NONE", "admin is not initialized")
+    python = str(Path(target) / ".runtime/venv/bin/python")
+    os.chdir(target)
+    # Main-backend migrations also restart this service. Recheck schema and role
+    # on EVERY start, before allowing HTTP traffic, without needing root secrets.
+    require(
+        command(
+            [python, "-"],
+            env={**ENV, **environment},
+            cwd=target,
+            input=PROBE,
+            timeout=60,
+        )
+        == "ADMIN_SCHEMA_AND_DML_ROLE=verified",
+        "admin startup schema/role check failed",
+    )
+    os.execve(
+        python,
+        [
+            python,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8100",
+            "--workers",
+            "1",
+            "--proxy-headers",
+            "--forwarded-allow-ips",
+            "127.0.0.1",
+            "--no-access-log",
+        ],
+        {**ENV, **environment},
+    )
+
+
+def main(argv):
+    if argv == ["run"]:
+        serve()
+        return
+    require(os.geteuid() == 0, "release helper requires root via restricted sudo")
+    os.umask(0o022)
+    if argv == ["version"]:
+        print(VERSION)
+        return
+    if argv == ["fingerprint"]:
+        print(digest(Path(__file__)))
+        return
+    action = argv[0] if argv else ""
+    counts = {
+        "status": 1,
+        "preflight": 1,
+        "contract": 1,
+        "restart": 2,
+        "prepare": 3,
+        "activate": 4,
+        "rollback": 3,
+        "check-release": 3,
+    }
+    require(
+        action in counts and len(argv) == counts[action],
+        "invalid command/argument count",
+    )
+    if action == "contract":
+        # Read-only validation for the main backend while it owns the migration
+        # lock/recovery marker. This action cannot start/stop services or mutate data.
+        contract(allow_recovery=True)
+        print("PRODUCTION_ADMIN_CONTRACT=verified")
+        return
+    if action == "restart":
+        with locks():
+            config, environment = contract()
+            previous = current_target()
+            require(
+                previous != "NONE" and previous == argv[1],
+                "current changed or admin is not initialized",
+            )
+            activate_target(Path(previous), previous, config, environment)
+            print(f"RESTARTED={previous}")
+        return
+    if action in {"status", "preflight"}:
+        config, environment = contract()
+        report(config, environment)
+        return
+    release_id, *arguments = argv[1:]
+    target = release_path(release_id)
+    if action == "check-release":
+        config, environment = contract()
+        require(
+            current_target() == arguments[0] != "NONE",
+            "current changed or not initialized",
+        )
+        probe_release(target, environment)
+        print(f"RELEASE_VALID={target}")
+        return
+    with locks():
+        config, environment = contract()
+        previous = current_target()
+        expected = arguments[-1]
+        require(previous == expected, "current changed; repeat preflight")
+        incoming = ROOT / "incoming" / f"{release_id}.partial"
+        if action == "prepare":
+            require(
+                not incoming.exists()
+                and not incoming.is_symlink()
+                and not target.parent.exists(),
+                "staging/release already exists",
+            )
+            incoming.mkdir(mode=0o700)
+            owner = pwd.getpwnam(DEPLOY_USER)
+            os.chown(incoming, owner.pw_uid, owner.pw_gid)
+            print(f"PREPARED={incoming}")
+            return
+        if action == "rollback":
+            require(
+                previous != "NONE" and previous != str(target),
+                "no current release or already current",
+            )
+            activate_target(target, previous, config, environment)
+            print(f"ROLLED_BACK={target}")
+            return
+        archive_sha = arguments[0]
+        require(re.fullmatch(r"[a-f0-9]{64}", archive_sha), "invalid archive hash")
+        require(
+            not incoming.is_symlink() and incoming.is_dir(), "unsafe staging directory"
+        )
+        require(
+            not target.parent.exists() and not target.parent.is_symlink(),
+            "release already exists",
+        )
+        partial = ROOT / "releases" / f".{release_id}.partial"
+        partial.mkdir(mode=0o755)
+        pinned = partial / "upload.tar"
+        descriptor = os.open(incoming / "backend.tar", os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as source, pinned.open("xb") as output:
+            info = os.fstat(source.fileno())
+            require(
+                stat.S_ISREG(info.st_mode) and info.st_size <= 256 * 1024 * 1024,
+                "invalid uploaded archive",
+            )
+            shutil.copyfileobj(source, output)
+        require(digest(pinned) == archive_sha, "pinned archive hash mismatch")
+        unpack_archive(pinned, partial)
+        pinned.unlink()
+        verify_release(partial / "backend", release_id)
+        # Move before building so venv executable shebangs use their permanent path.
+        partial.rename(target.parent)
+        build_runtime(target, config)
+        activate_target(target, previous, config, environment)
+        shutil.rmtree(incoming)
+        print(f"ACTIVATED={target}\nPREVIOUS={previous}")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Exception as error:
+        # Do not expose library errors containing secrets or database URLs.
+        print(
+            f"ERROR: {error if isinstance(error, RuntimeError) else type(error).__name__}",
+            file=sys.stderr,
+        )
+        sys.exit(1)

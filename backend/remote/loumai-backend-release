@@ -211,6 +211,13 @@ validate_units() {
   [[ " ${TIMERS[*]} " == *" loumai-file-storage-cleanup.timer "* ]] \
     || fail "所有环境都必须纳管 loumai-file-storage-cleanup.timer"
   if [[ "$ENVIRONMENT" == "production" ]]; then
+    # An installed/active production admin writer cannot be silently omitted.
+    if [[ -L /srv/loumai-company-management-production/current ]] \
+      || systemctl is-active --quiet loumai-company-management.service \
+      || systemctl is-enabled --quiet loumai-company-management.service; then
+      [[ " ${AUXILIARY_DATABASE_SERVICES[*]} " == *" loumai-company-management.service "* ]] \
+        || fail "正式管理后台 writer 未纳入数据库停写栅栏"
+    fi
     [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-app-push-dispatcher.service "* ]] \
       || fail "正式服必须纳管 loumai-app-push-dispatcher.service"
     [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-rent-billing.service "* ]] \
@@ -407,6 +414,7 @@ PY
 
 validate_database_service_contract() {
   local unit environment_files direct_environment forbidden_key
+  local -a expected_runtime_files
   [[ -f "$ACTIVE_DATABASE_ENV" && ! -L "$ACTIVE_DATABASE_ENV" ]] \
     || fail "双数据库发布要求活动环境文件：$ACTIVE_DATABASE_ENV"
   for unit in "${SERVICES[@]}" "${AUXILIARY_DATABASE_SERVICES[@]}" "${ONESHOT_SERVICES[@]}"; do
@@ -417,8 +425,21 @@ validate_database_service_contract() {
         [[ "$direct_environment" != *"$forbidden_key="* ]] \
           || fail "$unit 禁止通过 Environment 直接注入数据库字段：$forbidden_key"
       done
+      expected_runtime_files=("${BASE_ENV_FILES[@]}" "$ACTIVE_DATABASE_ENV")
+      if [[ "$unit" == "loumai-company-management.service" ]]; then
+        # Admin owns only its JWT/COS scope and a separate DML database role.
+        # verify_unit_database_target still verifies its effective database/TLS.
+        expected_runtime_files=(/etc/loumai/company-management-production.env /etc/loumai/company-management-production-database.env)
+        [[ "$(systemctl show "$unit" -p User --value)" == "loumai-admin" ]] \
+          || fail "正式管理后台必须使用独立 loumai-admin UID"
+        assert_root_secret_file "${expected_runtime_files[0]}"
+        assert_root_secret_file "${expected_runtime_files[1]}"
+        assert_root_owned_file /usr/local/sbin/loumai-company-management-production-release
+        /usr/local/sbin/loumai-company-management-production-release contract >/dev/null \
+          || fail "正式管理后台独立运行配置不满足安全合同"
+      fi
       /usr/bin/python3 - "$unit" "$environment_files" \
-        "${BASE_ENV_FILES[@]}" "$ACTIVE_DATABASE_ENV" <<'PY'
+        "${expected_runtime_files[@]}" <<'PY'
 import re
 import sys
 

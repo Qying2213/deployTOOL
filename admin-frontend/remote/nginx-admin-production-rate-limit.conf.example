@@ -1,0 +1,2 @@
+# http context, e.g. /etc/nginx/conf.d/loumai-admin-production-rate-limit.conf
+limit_req_zone $binary_remote_addr zone=loumai_admin_production_login:10m rate=5r/m;

@@ -1,0 +1,4 @@
+# Add as a separate /etc/sudoers.d/loumai-admin-production, root:root 0440.
+# Keep existing business-backend/H5 rules. Never grant shell, python, systemctl,
+# arbitrary uploaded installers or unrestricted sudo to the deployment account.
+loumai-deploy ALL=(root) NOPASSWD: /usr/local/sbin/loumai-company-management-production-release *, /usr/local/sbin/loumai-admin-frontend-production-release *

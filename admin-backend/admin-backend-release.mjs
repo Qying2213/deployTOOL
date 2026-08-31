@@ -6,6 +6,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, re
 import { homedir } from 'node:os'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { inspectProductionGit, loadProductionConfig, runProduction } from './production-release.mjs'
 
 export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_CONFIG = join(TOOL_ROOT, 'config/admin-backend.test.local.env')
@@ -33,19 +34,34 @@ export function parseDotEnv(text) {
 
 export function parseArgs(argv) {
   const first = argv[0] || 'help'
-  const out = { command: first === '-h' || first === '--help' ? 'help' : first, config: DEFAULT_CONFIG, dryRun: false, yes: false, skipTests: false, release: '' }
+  const out = { command: first === '-h' || first === '--help' ? 'help' : first, environment: 'test', config: '', dryRun: false, yes: false, skipTests: false, release: '', ackDbSchemaCompatible: false }
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i]
-    if (arg === '--config') out.config = resolve(argv[++i] || fail('--config 缺少路径'))
-    else if (arg === '--release') out.release = argv[++i] || fail('--release 缺少版本号')
+    if (['--config', '--release', '--env'].includes(arg)) {
+      const value = argv[++i]
+      if (!value || value.startsWith('--')) fail(`${arg} 缺少参数`)
+      if (arg === '--config') out.config = resolve(value)
+      if (arg === '--release') out.release = value
+      if (arg === '--env') out.environment = value
+    }
     else if (arg === '--dry-run') out.dryRun = true
     else if (arg === '--yes') out.yes = true
     else if (arg === '--skip-tests') out.skipTests = true
+    else if (arg === '--ack-db-schema-compatible') out.ackDbSchemaCompatible = true
     else if (arg === '-h' || arg === '--help') out.command = 'help'
     else fail(`未知参数：${arg}`)
   }
-  if (!new Set(['build', 'deploy', 'help', 'prepare', 'rollback', 'status']).has(out.command)) fail(`未知命令：${out.command}`)
+  if (!new Set(['build', 'deploy', 'help', 'prepare', 'restart', 'rollback', 'status']).has(out.command)) fail(`未知命令：${out.command}`)
+  if (!['test', 'production'].includes(out.environment)) fail('--env 只能为 test 或 production')
+  if (!out.config) out.config = join(TOOL_ROOT, `config/admin-backend.${out.environment}.local.env`)
+  if (out.command === 'restart' && out.environment !== 'production') fail('受控 restart 当前仅用于 --env production')
   if (out.command === 'rollback' && !out.release) fail('rollback 必须提供 --release')
+  if (out.release && !/^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$/.test(out.release)) fail('release 格式非法')
+  if (out.environment === 'production') {
+    if (out.skipTests) fail('正式服禁止 --skip-tests')
+    if (out.command === 'rollback' && !out.ackDbSchemaCompatible) fail('正式回滚必须提供 --ack-db-schema-compatible')
+    if (['prepare', 'deploy', 'restart', 'rollback'].includes(out.command) && !out.dryRun && !out.yes) fail('正式操作必须提供 --yes 或 --dry-run')
+  }
   return out
 }
 
@@ -58,11 +74,13 @@ function usage() {
   ./loumai-deploy admin-backend deploy --yes
   ./loumai-deploy admin-backend status
   ./loumai-deploy admin-backend rollback --release RELEASE_ID --yes`
+    + `\n\n正式服：以上命令追加 --env production；rollback 另需 --ack-db-schema-compatible。\n正式服 prepare 只生成本机安装包，不自动安装服务器或申请证书。\n受控重启：./loumai-deploy admin-backend restart --env production --yes`
 }
 
 function required(raw, key) { if (!raw[key]) fail(`配置缺少 ${key}`); return raw[key] }
 function expandHome(value) { return value === '~' ? homedir() : value.startsWith('~/') ? join(homedir(), value.slice(2)) : value }
-export function loadConfig(path) {
+export function loadConfig(path, environment = 'test') {
+  if (environment === 'production') return loadProductionConfig(path, parseDotEnv)
   if (!existsSync(path)) fail(`找不到配置：${path}\n请复制 config/admin-backend.test.example.env`)
   const raw = parseDotEnv(readFileSync(path, 'utf8'))
   const config = {
@@ -128,7 +146,7 @@ function releaseId(sourceSha, date = new Date()) { return `${date.toISOString().
 
 function quality(config, skipTests) {
   if (skipTests) return
-  const python = join(config.source, '.venv/bin/python')
+  const python = config.pythonBin || join(config.source, '.venv/bin/python')
   if (!existsSync(python)) fail(`缺少虚拟环境：${python}`)
   run(python, ['-m', 'ruff', 'check', 'app', 'tests', 'scripts'], { cwd: config.source })
   run(python, ['-m', 'ruff', 'format', '--check', 'app', 'tests', 'scripts'], { cwd: config.source })
@@ -150,14 +168,26 @@ function writeChecksums(root) {
 }
 
 export function build(config, { skipTests = false } = {}) {
+  const production = config.environment === 'production'
+  if (production && skipTests) fail('正式服禁止 --skip-tests')
+  const gitState = production ? inspectProductionGit(config) : null
   quality(config, skipTests)
   mkdirSync(DIST, { recursive: true, mode: 0o755 })
   const list = files(config.source); const sourceSha = sourceHash(config.source, list); const id = releaseId(sourceSha)
+  if (production) {
+    const tracked = new Set(run('git', ['ls-tree', '-r', '--name-only', gitState.commit], { cwd: config.source, capture: true }).split('\n'))
+    if (list.some((path) => !tracked.has(relative(config.source, path)))) fail('正式发布不能包含未纳入 Git commit 的源码文件（包括 ignored 文件）')
+  }
   const releaseRoot = join(DIST, id); const backend = join(releaseRoot, 'backend')
-  rmSync(releaseRoot, { recursive: true, force: true }); mkdirSync(backend, { recursive: true, mode: 0o755 })
+  if (existsSync(releaseRoot)) fail('版本目录已存在，请稍后重试；不会覆盖历史产物')
+  mkdirSync(backend, { recursive: true, mode: 0o755 })
+  if (production) for (const path of list) {
+    if (/(^|\/)(\.[^/]+|[^/]+\.(pem|key|p12|pfx|sql|sqlite|db|bak))$/i.test(relative(config.source, path))) fail('正式源码包含隐藏或敏感文件')
+  }
   for (const path of list) { const dest = join(backend, relative(config.source, path)); mkdirSync(dirname(dest), { recursive: true }); cpSync(path, dest) }
-  cpSync(join(TOOL_ROOT, 'admin-backend/runtime-constraints.test.txt'), join(backend, 'runtime-constraints.txt'))
-  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: '1' } }
+  if (production && (sourceHash(backend, files(backend)) !== sourceSha || inspectProductionGit(config).commit !== gitState.commit)) fail('测试或复制期间源码发生变化，拒绝发布')
+  cpSync(config.constraints || join(TOOL_ROOT, 'admin-backend/runtime-constraints.test.txt'), join(backend, 'runtime-constraints.txt'))
+  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, environment: config.environment || 'test', ...(gitState || {}), built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: production ? '2' : '1' } }
   writeFileSync(join(backend, 'release.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   writeChecksums(backend)
   const archive = join(releaseRoot, 'backend.tar')
@@ -211,7 +241,8 @@ function deploy(config, args) {
 function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.command === 'help') { console.log(usage()); return }
-  const config = loadConfig(args.config)
+  const config = loadConfig(args.config, args.environment)
+  if (args.environment === 'production') { runProduction(args, config, build); return }
   if (args.command === 'build') build(config, { skipTests: args.skipTests })
   else if (args.command === 'prepare') { if (!args.yes) fail('prepare 必须提供 --yes'); prepare(config) }
   else if (args.command === 'deploy') deploy(config, args)

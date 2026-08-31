@@ -1,4 +1,4 @@
-# 楼脉业务正式服部署手册
+# 工位有方业务正式服部署手册
 
 本文只覆盖业务 API、IM Worker、视频 Worker、三个定时任务和 H5。它不授权自动连接或修改正式服务器；所有带 `--yes` 的命令都必须在一次性服务器配置、DNS、备份和安全门禁完成后人工执行。
 
@@ -81,7 +81,24 @@ sudo -u loumai-deploy sudo -n /usr/local/sbin/loumai-backend-release version
 sudo -u loumai-deploy sudo -n /usr/local/sbin/loumai-h5-release version
 ```
 
-当前后端 helper 协议版本为 `5`，H5 helper 协议版本为 `4`。本机发布器还会验证 helper 文件的完整 SHA256 指纹，因此仅版本号相同但源码不同也会被拒绝。
+当前后端 helper 协议版本为 `6`，H5 helper 协议版本为 `4`。本机发布器还会验证 helper 文件的完整 SHA256 指纹，因此仅版本号相同但源码不同也会被拒绝。
+
+#### 已初始化正式服只升级 helper（不部署）
+
+遇到“实际 5，要求 6”时，不要重做 bootstrap、关闭版本检查或修改旧 release 的元数据。管理员先核对线上环境、当前 commit、DB revision、配置和业务进程快照，审核新旧 helper 差异；在共享发布锁下备份旧文件，再将候选文件安装到 root 私有暂存目录，校验语法、版本、SHA256 和只读 preflight，最后同文件系统原子替换。失败只恢复 helper，不能借此切换应用或恢复数据库。
+
+2026-08-28 按“修复正式服 helper，但先不部署”的授权完成：
+
+- `/usr/local/sbin/loumai-backend-release` 从 `5` 升至 `6`，保持 `root:root 0755`。新 SHA256：`7f3c260cac8dd0d820b44381e340abe8531b6fc7938e0897d54e325cdf3ba627`，与本机实际 helper 一致。
+- 旧文件保留在服务器 `/var/backups/loumai-backend-helper-production.GwzuDMar/loumai-backend-release`，目录 root 私有；旧 SHA256：`d4e9ed0680abf81a8c3b953d45b3c36e4c85422a41a0924b1a34d9e16b0989e9`。
+- 升级前后均运行 release `20260824T065827Z-60cf6a5500`、commit `60cf6a55000fb171a54e200bc9d2d945f12df222`，云库 revision 保持 `20260822_0086`。没有打包或上传业务产物、切换版本、运行迁移、修改应用配置或重启业务服务；三个常驻进程 PID/启动时间及五份部署/应用/数据库配置文件哈希均未变化。
+- `backend status --env production`、`backend env-audit --env production`、`backend deploy --env production --dry-run` 均退出 0。状态为 `HEALTHY`、`RECOVERY_REQUIRED=false`、`DATABASE_WRITERS=verified`；公网健康检查 HTTP 200，应用和数据库均为 `ok`。
+- 环境审计为 **0 阻断、32 警告、7 提示**。警告包含开发/正式环境差异、地图/ASR 等配置缺失及新旧 Settings 变量差异，未自动复制开发配置、删除旧变量或启用功能。真正上线新业务版本前必须逐项确认，不能把只读预检通过等同于完整上线验收。
+- 本机后端与正式管理后台部署专项测试 **71 项通过**，Bash 语法与差异检查通过；本次没有执行真实业务发布命令。
+
+`status` 末尾旧 release 元数据中的 `tool.backend_release_tool` 仍为 `5`，表示该业务包当时使用的构建工具版本，不是当前安装 helper 的版本。旧 release 保持只读，不应为了显示 `6` 而改写历史记录。
+
+随后在 2026-08-28 16:20（北京时间）根据单独授权完成了正式 env 补齐：新增 57 项、仅调整已有 ASR 开关，原生产凭据与拓扑保留；仍未发布、迁移或重启。最新审计为 0 阻断、22 警告、42 提示。新增地图/ASR/公众号凭据暂与测试环境共用，公众号和厂商推送未启用。备份及验收详情见 [正式服后端环境变量补齐与验收说明](../../managedocx/01-一键发布/正式服后端环境变量补齐与验收说明.md)，上面的 32 警告是只修复 helper 时的历史结果。
 
 ### 2.3 安装服务器配置和密钥
 
@@ -269,8 +286,10 @@ H5：
 - 每次发布前的本机备份不能代替腾讯数据库异地备份。正式 helper 会验证最近 90 天恢复演练证据。
 - 当前正式脚本只支持单 CVM writer 拓扑。扩容到多实例前必须增加全局 drain/维护栅栏。
 
-## 7. 暂不纳入本次正式发布的目标
+## 7. 管理后台与其他独立目标
 
-`admin-backend` 目前只有测试服合同，已从正式后端的强依赖列表移除；不要把测试 helper 或测试环境复制到正式服。官网 `website` 也有独立发布链，不能复用本手册的业务 API/H5 目录。二者需各自完成 production 权限、配置、回滚和测试后再上线。
+管理后台前后端已提供独立正式服发布链，见 [管理后台前后端正式服一键发布](admin-production-release.md)。主业务首次 bootstrap 仍不依赖后台；后台上线前必须安装其正式 unit/helper/独立运行凭据，并将 `loumai-company-management.service` 加入 `LOUMAI_BACKEND_AUXILIARY_DATABASE_SERVICES`。主发布器允许该服务使用专属应用/数据库 EnvironmentFiles，仍验证实际数据库目标和 TLS，并在迁移时协调停写。不能把测试 helper 或测试环境复制到正式服，也不能遗漏已运行的后台 writer。
+
+官网 `website` 仍有独立发布链，不能复用本手册的业务 API/H5 或管理后台目录。
 
 API、视频、IM 和 jobs 已使用不同系统 UID，并通过 `/proc` 隐藏降低横向读取风险；但业务 `Settings` 目前仍是统一配置模型，各角色仍会接收超出自身最小需要的部分应用密钥。helper 默认用 `LOUMAI_BACKEND_MONOLITHIC_SETTINGS_SECRET_SCOPE_APPROVED=false` 阻断正式发布；只有安全负责人明确接受这一临时风险后才能改为 `true`，并应随后在业务代码中拆分 role-specific Settings/credentials。迁移 DDL 凭据由独立 `loumai-migrate` 身份使用，且不会进入任何业务 systemd 进程。

@@ -1,0 +1,47 @@
+[Unit]
+Description=Loumai Production Company Management API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loumai-admin
+Group=loumai-admin
+SupplementaryGroups=loumai-db-ca
+WorkingDirectory=/srv/loumai-company-management-production/current
+EnvironmentFile=/etc/loumai/company-management-production.env
+EnvironmentFile=/etc/loumai/company-management-production-database.env
+ExecStart=/usr/local/sbin/loumai-company-management-production-release run
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=90
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=loumai-company-management
+CPUQuota=100%
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=8192
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

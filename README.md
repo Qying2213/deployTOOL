@@ -1,17 +1,26 @@
-# 楼脉统一部署工具
+# 工位有方统一部署工具
 
 这个仓库只负责发布，不存放业务源码，也不保存测试服密码、Token、数据库连接串或私钥内容。
 
-它统一发布四个独立目标：
+它统一发布五个独立目标：
 
 | 目标 | 源码目录 | 线上内容 |
 | --- | --- | --- |
 | `frontend` | `../qiye-qianduan` | 测试服/正式服 H5 |
 | `backend` | `../loumai-ai` | 测试服/正式服 FastAPI、数据库迁移、IM/视频 Worker、定时任务 |
-| `admin-backend` | `../conpanyManagement` | 独立企业管理后台后端 |
+| `admin-backend` | `../conpanyManagement` | 测试服/正式服独立企业管理后台后端 |
+| `admin-frontend` | 同事交付的后台 ZIP | 独立测试站/正式管理后台站点 |
 | `website` | `../guanwang` | 工位有方官网静态文件 |
 
 日常操作只使用根目录的 `./loumai-deploy`。详细的一次性服务器安装说明放在 `docs/`，不要把安装步骤和日常发布混着执行。
+
+管理后台正式服联合发布入口（首次资源安装完成后）：
+
+```bash
+./loumai-deploy admin deploy --env production --file /Users/qinyang/Desktop/admin-production.zip --yes
+```
+
+`admin` 是前后端顺序发布入口，不是第六个线上服务；`admin prepare --env production --yes` 只生成本机安装包。正式域名、独立数据库角色、证书及主业务停写保护必须先配置。完整说明见 [管理后台前后端正式服发布](docs/admin-production-release.md)。原有未写 `--env production` 的后台命令仍默认测试服。
 
 ## 1. 先记住这四条
 
@@ -108,6 +117,19 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 管理后台发布不会上传 `.env`、私钥、数据库口令或本地虚拟环境。它沿用测试服当前活动数据库 profile，但使用独立的发布目录、Python 运行时和回滚链。
 
 完整安装、发布、检查及回滚说明见 [`docs/admin-backend-auto-release.md`](docs/admin-backend-auto-release.md)。
+
+#### 独立发布管理后台前端 ZIP
+
+先在阿里云添加 `admin-test` 的 A 记录为 `132.232.220.115`（无 AAAA），然后在 Mac 终端执行：
+
+```bash
+./loumai-deploy admin-frontend check-package --file /Users/qinyang/Desktop/gongweiyoufang-admin-20260827-test.zip
+./loumai-deploy admin-frontend deploy-package --file /Users/qinyang/Desktop/gongweiyoufang-admin-20260827-test.zip --dry-run
+./loumai-deploy admin-frontend deploy-package --file /Users/qinyang/Desktop/gongweiyoufang-admin-20260827-test.zip --yes
+./loumai-deploy admin-frontend status
+```
+
+首次发布自动安装独立站点、HTTPS、续期定时器和后台前端专属 helper，后续复用；不改业务 H5、后端配置或数据库。已知旧测试 API 在部署副本内转换为同源 `/admin-api/api/v1`，原 ZIP 保留。只接受可信同事的测试包。详细范围、回滚及当前上线前置条件见 [后台前端发布说明](docs/admin-frontend-auto-release.md)。
 
 ### 2.2 发布测试服 H5
 

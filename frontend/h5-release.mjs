@@ -311,7 +311,7 @@ export function parseArgs(argv = []) {
 
 function usage() {
 	return `
-楼脉 H5 可验证自动发布工具
+工位有方 H5 可验证自动发布工具
 
 用法：
   node frontend/h5-release.mjs build [--env test|production] [--config FILE] [--skip-tests]
@@ -607,7 +607,8 @@ function listFiles(root) {
 			const absolute = join(directory, name)
 			const item = lstatSync(absolute)
 			const relativePath = relative(root, absolute).split(sep).join('/')
-			if (!SAFE_ARTIFACT_PATH.test(relativePath) || relativePath.includes('..')) {
+			if (!SAFE_ARTIFACT_PATH.test(relativePath)
+				|| relativePath.split('/').some((part) => part === '..' || part === '.')) {
 				fail(`产物包含不安全文件名：${relativePath}`)
 			}
 			if (item.isSymbolicLink()) fail(`产物包含软链接：${relativePath}`)
@@ -1153,7 +1154,8 @@ function assertRemoteHelperExact(config) {
 	if (version !== H5_RELEASE_TOOL_VERSION) {
 		fail(`服务器激活器版本不匹配：${version || '(空)'}`)
 	}
-	const expectedFingerprint = sha256File(join(TOOL_ROOT, 'frontend/remote/loumai-h5-release'))
+	const expectedFingerprint = config.remoteHelperFingerprint
+		|| sha256File(join(TOOL_ROOT, 'frontend/remote/loumai-h5-release'))
 	let actualFingerprint = ''
 	try {
 		actualFingerprint = remoteHelper(config, ['fingerprint'], { capture: true }).stdout.trim()
@@ -1165,7 +1167,7 @@ function assertRemoteHelperExact(config) {
 	}
 }
 
-function remotePreflight(config, { dryRun = false } = {}) {
+export function remotePreflight(config, { dryRun = false } = {}) {
 	const expectedRemoteRoot = dirname(config.remoteStagingRoot)
 	if (dryRun) return {
 		CURRENT: 'UNKNOWN',
@@ -1283,7 +1285,7 @@ function postDeployVerify(config, release) {
 	info(`线上校验通过：${release.releaseId}`)
 }
 
-function deployRelease(args, config, release) {
+export function deployRelease(args, config, release) {
 	const preflight = remotePreflight(config)
 	const expectedCurrent = preflight.CURRENT || 'NONE'
 	const upload = createUploadArchive(release.outputDir)
@@ -1388,7 +1390,7 @@ function dryRunPackageDeploy(args, config) {
 	}
 }
 
-function status(config) {
+export function status(config) {
 	const preflight = remotePreflight(config)
 	const result = remoteHelper(config, ['status', config.environment], { capture: true })
 	const values = parseKeyValueOutput(result.stdout)
@@ -1398,7 +1400,7 @@ function status(config) {
 	process.stdout.write(result.stdout)
 }
 
-function rollback(args, config) {
+export function rollback(args, config) {
 	if (!args.releaseId || !SAFE_RELEASE_ID.test(args.releaseId)) {
 		fail('rollback 必须通过 --release 指定合法 release_id')
 	}
