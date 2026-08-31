@@ -187,7 +187,7 @@ export function build(config, { skipTests = false } = {}) {
   for (const path of list) { const dest = join(backend, relative(config.source, path)); mkdirSync(dirname(dest), { recursive: true }); cpSync(path, dest) }
   if (production && (sourceHash(backend, files(backend)) !== sourceSha || inspectProductionGit(config).commit !== gitState.commit)) fail('测试或复制期间源码发生变化，拒绝发布')
   cpSync(config.constraints || join(TOOL_ROOT, 'admin-backend/runtime-constraints.test.txt'), join(backend, 'runtime-constraints.txt'))
-  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, environment: config.environment || 'test', ...(gitState || {}), built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: production ? '3' : '1' } }
+  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, environment: config.environment || 'test', ...(gitState || {}), built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: production ? '4' : '1' } }
   writeFileSync(join(backend, 'release.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   writeChecksums(backend)
   const archive = join(releaseRoot, 'backend.tar')

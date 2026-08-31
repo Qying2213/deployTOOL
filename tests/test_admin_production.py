@@ -6,12 +6,14 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 SOURCE = (
@@ -74,6 +76,27 @@ def artifact(directory, release=RELEASE, environment="production"):
 
 
 class ProductionAdminTest(unittest.TestCase):
+    def test_shared_uv_cache_recovers_partial_first_release_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            old_cache = root / "releases" / RELEASE / "backend" / ".runtime" / "cache"
+            old_cache.mkdir(parents=True)
+            old_cache.chmod(0o755)
+            (old_cache / "downloaded-wheel").write_text("cached")
+            shared_cache = root / "uv-cache"
+            builder = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            with (
+                patch.object(helper, "ROOT", root),
+                patch.object(helper, "UV_CACHE", shared_cache),
+                patch.object(helper, "secure_directory"),
+                patch.object(helper.pwd, "getpwnam", return_value=builder),
+            ):
+                helper.prepare_uv_cache()
+                helper.prepare_uv_cache()
+            self.assertFalse(old_cache.exists())
+            self.assertEqual((shared_cache / "downloaded-wheel").read_text(), "cached")
+            self.assertEqual(shared_cache.stat().st_mode & 0o777, 0o750)
+
     def test_environment_parser_never_executes_shell_and_rejects_duplicates(self):
         self.assertEqual(
             helper.parse_env('A="one two"\nB=three\n'), {"A": "one two", "B": "three"}

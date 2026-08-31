@@ -153,12 +153,16 @@ test('后台正式服务器 helper 通过隔离的 Python 行为测试', () => {
   assert.equal(result.status, 0, result.stderr || result.stdout)
 })
 
-test('后台正式 helper 超时会终止完整子进程组且首次依赖安装允许慢速网络', () => {
+test('后台正式 helper 超时会终止完整子进程组并复用服务器依赖缓存', () => {
   const helper = readFileSync(new URL('../admin-backend/remote/loumai-company-management-production-release', import.meta.url), 'utf8')
   assert.match(helper, /start_new_session=True/)
   assert.match(helper, /os\.killpg\(process\.pid, signal\.SIGTERM\)/)
   assert.match(helper, /os\.killpg\(process\.pid, signal\.SIGKILL\)/)
   assert.match(helper, /timeout=1200/)
+  assert.match(helper, /UV_CACHE = ROOT \/ "uv-cache"/)
+  assert.match(helper, /ROOT\.glob\("releases\/\*\/backend\/\.runtime\/cache"\)/)
+  assert.match(helper, /"UV_CACHE_DIR": str\(UV_CACHE\)/)
+  assert.doesNotMatch(helper, /"UV_CACHE_DIR": str\(runtime \/ "cache"\)/)
 })
 
 test('缺少明确确认时联合命令不会读取配置或连接服务器', () => {
