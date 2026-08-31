@@ -508,29 +508,20 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai \
 
 普通的“本地有、测试服没有”和非敏感开关值不同会详细显示为警告，避免把合理的开发/测试环境差异误当成密钥错误。该命令完全只读，不修改服务器 env，也不重启服务。
 
-如果提示服务器 helper 太旧，在本机先校验脚本，再上传到临时路径：
+如果提示服务器 helper 太旧或指纹不一致，优先使用受控同步命令：
 
 ```bash
 cd /Users/qinyang/Desktop/zuling/deploy--loumai
-bash -n backend/remote/loumai-backend-release
-
-scp -i /Users/qinyang/.ssh/loumai_test_hexhub \
-  backend/remote/loumai-backend-release \
-  ubuntu@132.232.220.115:/tmp/loumai-backend-release.env-audit
+./loumai-deploy backend sync-helper --env test --yes
 ```
 
-然后在服务器安装并清理临时文件：
+本机 `config/backend.test.local.env` 必须先显式设置：
 
-```bash
-sudo install -o root -g root -m 0755 \
-  /tmp/loumai-backend-release.env-audit \
-  /usr/local/sbin/loumai-backend-release
-
-rm -f /tmp/loumai-backend-release.env-audit
-sudo -n /usr/local/sbin/loumai-backend-release version
+```dotenv
+BACKEND_TEST_HELPER_SYNC_ENABLED=true
 ```
 
-更新 helper 不会修改业务 env、切换后端版本或重启服务。安装完成后回到本机重新执行 `env-audit`。
+该命令要求部署工具代码已提交并推送，自动执行测试、随机临时上传、SHA256 校验、发布锁、root 私有备份、候选 preflight、同文件系统原子切换和失败恢复。它不会修改业务 env、切换后端版本、迁移数据库或重启服务。同步完成后重新执行 `env-audit`。正式服禁止使用此命令。
 
 ## 9. 服务管理与日志
 

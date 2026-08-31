@@ -1,0 +1,171 @@
+#!/bin/bash
+
+set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+umask 077
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+valid_absolute_path() {
+  [[ "$1" == /* && "$1" != "/" && "$1" != *".."* && "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]
+}
+
+valid_sha256() {
+  [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+require_output_line() {
+  local output="$1" expected="$2"
+  grep -Fqx -- "$expected" <<< "$output" || fail "候选 helper 预检缺少：$expected"
+}
+
+[[ "$#" -eq 8 ]] || fail "参数数量错误"
+[[ "$(id -u)" == "0" ]] || fail "必须通过受控 sudo 以 root 执行"
+
+readonly EXPECTED_ENVIRONMENT="$1"
+readonly EXPECTED_REMOTE_ROOT="$2"
+readonly EXPECTED_STAGING_ROOT="$3"
+readonly EXPECTED_PUBLIC_HEALTH_URL="$4"
+readonly HELPER_PATH="$5"
+readonly UPLOAD_PATH="$6"
+readonly EXPECTED_SHA256="$7"
+readonly EXPECTED_VERSION="$8"
+readonly CONFIG_FILE="/etc/loumai/backend-release.env"
+
+[[ "$EXPECTED_ENVIRONMENT" == "test" ]] || fail "只允许同步测试服 helper"
+[[ "$HELPER_PATH" == "/usr/local/sbin/loumai-backend-release" ]] \
+  || fail "helper 安装路径不在允许列表"
+valid_absolute_path "$EXPECTED_REMOTE_ROOT" || fail "远端根目录格式非法"
+valid_absolute_path "$EXPECTED_STAGING_ROOT" || fail "staging 目录格式非法"
+[[ "$EXPECTED_STAGING_ROOT" == "$EXPECTED_REMOTE_ROOT/incoming" ]] \
+  || fail "staging 目录与远端根目录不匹配"
+[[ "$EXPECTED_PUBLIC_HEALTH_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._/-]+$ ]] \
+  || fail "公网健康地址格式非法"
+[[ "$EXPECTED_VERSION" =~ ^[0-9]+$ ]] || fail "helper 版本格式非法"
+valid_sha256 "$EXPECTED_SHA256" || fail "helper SHA256 格式非法"
+[[ "$UPLOAD_PATH" =~ ^/tmp/loumai-backend-helper-sync\.[A-Za-z0-9]+/loumai-backend-release$ ]] \
+  || fail "候选 helper 上传路径不受控"
+
+readonly UPLOAD_DIRECTORY="${UPLOAD_PATH%/*}"
+[[ -d "$UPLOAD_DIRECTORY" && ! -L "$UPLOAD_DIRECTORY" ]] || fail "候选上传目录异常"
+[[ -f "$UPLOAD_PATH" && ! -L "$UPLOAD_PATH" ]] || fail "候选 helper 不存在或是软链接"
+[[ "$(stat -c '%h' "$UPLOAD_PATH")" == "1" ]] || fail "候选 helper 不能包含硬链接"
+[[ -z "$(find "$UPLOAD_PATH" -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "候选 helper 不能被组或其他用户写入"
+[[ "$(sha256sum "$UPLOAD_PATH" | awk '{print $1}')" == "$EXPECTED_SHA256" ]] \
+  || fail "候选 helper 上传后 SHA256 不一致"
+
+[[ -d /var/backups && ! -L /var/backups ]] || fail "/var/backups 目录异常"
+[[ "$(stat -c '%u' /var/backups)" == "0" ]] || fail "/var/backups 必须归 root 所有"
+[[ -z "$(find /var/backups -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "/var/backups 不能被组或其他用户写入"
+[[ -f "$HELPER_PATH" && ! -L "$HELPER_PATH" ]] || fail "现有 helper 不存在或是软链接"
+[[ "$(readlink -f "$HELPER_PATH")" == "$HELPER_PATH" ]] || fail "helper 路径包含软链接"
+[[ "$(stat -c '%u:%g' "$HELPER_PATH")" == "0:0" ]] || fail "现有 helper 必须是 root:root"
+[[ -z "$(find "$HELPER_PATH" -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "现有 helper 不能被组或其他用户写入"
+
+[[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || fail "服务器 helper 配置异常"
+[[ "$(stat -c '%u' "$CONFIG_FILE")" == "0" ]] || fail "服务器 helper 配置必须归 root 所有"
+[[ -z "$(find "$CONFIG_FILE" -maxdepth 0 -perm /022 -print -quit)" ]] \
+  || fail "服务器 helper 配置不能被组或其他用户写入"
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
+
+[[ "${LOUMAI_BACKEND_ENVIRONMENT:-}" == "$EXPECTED_ENVIRONMENT" ]] \
+  || fail "服务器环境不是测试服"
+[[ "${LOUMAI_BACKEND_REMOTE_ROOT:-}" == "$EXPECTED_REMOTE_ROOT" ]] \
+  || fail "服务器远端根目录与本机配置不一致"
+[[ "${LOUMAI_BACKEND_STAGING_ROOT:-}" == "$EXPECTED_STAGING_ROOT" ]] \
+  || fail "服务器 staging 目录与本机配置不一致"
+[[ "${LOUMAI_BACKEND_PUBLIC_HEALTH_URL:-}" == "$EXPECTED_PUBLIC_HEALTH_URL" ]] \
+  || fail "服务器公网健康地址与本机配置不一致"
+
+readonly LOCK_FILE="$EXPECTED_REMOTE_ROOT/.backend-release.lock"
+exec 9>"$LOCK_FILE"
+flock -w 120 9 || fail "另一个后端发布或 helper 同步任务正在运行"
+
+BACKUP_DIRECTORY=""
+ROOT_CANDIDATE=""
+SWITCHED=0
+COMPLETED=0
+
+cleanup() {
+  local exit_code="$?" restore_candidate=""
+  set +e
+  if [[ "$SWITCHED" == "1" && "$COMPLETED" != "1" && -n "$BACKUP_DIRECTORY" ]]; then
+    restore_candidate="$(mktemp "${HELPER_PATH}.restore.XXXXXXXX")"
+    if install -m 0755 -o root -g root -- \
+      "$BACKUP_DIRECTORY/loumai-backend-release" "$restore_candidate" \
+      && [[ "$(sha256sum "$restore_candidate" | awk '{print $1}')" == "$OLD_SHA256" ]] \
+      && bash -n "$restore_candidate" \
+      && mv -fT -- "$restore_candidate" "$HELPER_PATH"; then
+      printf 'HELPER_SYNC_RESTORED=%s\n' "$BACKUP_DIRECTORY/loumai-backend-release" >&2
+    else
+      printf 'ERROR: helper 自动恢复失败，备份位于 %s\n' \
+        "$BACKUP_DIRECTORY/loumai-backend-release" >&2
+      exit_code=1
+    fi
+  fi
+  [[ -z "$ROOT_CANDIDATE" ]] || rm -f -- "$ROOT_CANDIDATE"
+  [[ -z "$restore_candidate" ]] || rm -f -- "$restore_candidate"
+  rm -rf -- "$UPLOAD_DIRECTORY"
+  exit "$exit_code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+ROOT_CANDIDATE="$(mktemp "${HELPER_PATH}.candidate.XXXXXXXX")"
+install -m 0755 -o root -g root -- "$UPLOAD_PATH" "$ROOT_CANDIDATE"
+[[ "$(sha256sum "$ROOT_CANDIDATE" | awk '{print $1}')" == "$EXPECTED_SHA256" ]] \
+  || fail "root 私有候选 helper SHA256 不一致"
+bash -n "$ROOT_CANDIDATE"
+[[ "$($ROOT_CANDIDATE version)" == "$EXPECTED_VERSION" ]] || fail "候选 helper 版本不一致"
+[[ "$($ROOT_CANDIDATE fingerprint)" == "$EXPECTED_SHA256" ]] \
+  || fail "候选 helper 自检指纹不一致"
+
+PREFLIGHT_OUTPUT="$($ROOT_CANDIDATE preflight active deploy)"
+require_output_line "$PREFLIGHT_OUTPUT" "ENVIRONMENT=$EXPECTED_ENVIRONMENT"
+require_output_line "$PREFLIGHT_OUTPUT" "REMOTE_ROOT=$EXPECTED_REMOTE_ROOT"
+require_output_line "$PREFLIGHT_OUTPUT" "STAGING_ROOT=$EXPECTED_STAGING_ROOT"
+require_output_line "$PREFLIGHT_OUTPUT" "PUBLIC_HEALTH_URL=$EXPECTED_PUBLIC_HEALTH_URL"
+require_output_line "$PREFLIGHT_OUTPUT" "DEPLOYMENT_STATE=HEALTHY"
+require_output_line "$PREFLIGHT_OUTPUT" "RECOVERY_REQUIRED=false"
+
+readonly OLD_SHA256="$(sha256sum "$HELPER_PATH" | awk '{print $1}')"
+BACKUP_DIRECTORY="$(mktemp -d /var/backups/loumai-backend-helper-test.XXXXXXXX)"
+chmod 0700 "$BACKUP_DIRECTORY"
+chown root:root "$BACKUP_DIRECTORY"
+install -m 0755 -o root -g root -- \
+  "$HELPER_PATH" "$BACKUP_DIRECTORY/loumai-backend-release"
+[[ "$(sha256sum "$BACKUP_DIRECTORY/loumai-backend-release" | awk '{print $1}')" == "$OLD_SHA256" ]] \
+  || fail "旧 helper 备份校验失败"
+
+mv -fT -- "$ROOT_CANDIDATE" "$HELPER_PATH"
+ROOT_CANDIDATE=""
+SWITCHED=1
+
+[[ "$(stat -c '%u:%g:%a' "$HELPER_PATH")" == "0:0:755" ]] \
+  || fail "新 helper 所有者或权限不正确"
+[[ "$($HELPER_PATH version)" == "$EXPECTED_VERSION" ]] || fail "安装后 helper 版本不一致"
+[[ "$($HELPER_PATH fingerprint)" == "$EXPECTED_SHA256" ]] \
+  || fail "安装后 helper 指纹不一致"
+PREFLIGHT_OUTPUT="$($HELPER_PATH preflight active deploy)"
+require_output_line "$PREFLIGHT_OUTPUT" "ENVIRONMENT=$EXPECTED_ENVIRONMENT"
+require_output_line "$PREFLIGHT_OUTPUT" "DEPLOYMENT_STATE=HEALTHY"
+require_output_line "$PREFLIGHT_OUTPUT" "RECOVERY_REQUIRED=false"
+
+COMPLETED=1
+printf 'HELPER_SYNC_STATUS=updated\n'
+printf 'HELPER_SYNC_ENVIRONMENT=%s\n' "$EXPECTED_ENVIRONMENT"
+printf 'HELPER_SYNC_OLD_SHA256=%s\n' "$OLD_SHA256"
+printf 'HELPER_SYNC_NEW_SHA256=%s\n' "$EXPECTED_SHA256"
+printf 'HELPER_SYNC_BACKUP=%s\n' "$BACKUP_DIRECTORY/loumai-backend-release"

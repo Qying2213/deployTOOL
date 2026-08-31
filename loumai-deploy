@@ -68,6 +68,8 @@ case "${TARGET}" in
   ./loumai-deploy backend deploy --yes
   ./loumai-deploy backend deploy-cloud --dry-run
   ./loumai-deploy backend deploy-cloud --yes
+  ./loumai-deploy backend deploy-cloud --sync-helper --yes
+  ./loumai-deploy backend sync-helper --env test --yes
   ./loumai-deploy backend env-audit --env production
   ./loumai-deploy backend bootstrap --env production --dry-run
   ./loumai-deploy backend bootstrap --env production --yes

@@ -39,6 +39,10 @@ export const PRODUCTION_CONSTRAINTS_PATH = join(
 
 const DEFAULT_EXPECTED_BRANCH = 'master'
 const DEFAULT_REMOTE_HELPER = '/usr/local/sbin/loumai-backend-release'
+const HELPER_SYNC_INSTALLER_PATH = join(
+	TOOL_ROOT,
+	'backend/remote/sync-loumai-backend-helper'
+)
 const SUPPORTED_ENVIRONMENTS = new Set(['test', 'production'])
 const SAFE_REMOTE_PATH = /^\/[A-Za-z0-9._/-]+$/
 const SAFE_REMOTE_TARGET = /^[A-Za-z0-9._-]+(?:@[A-Za-z0-9.-]+)?$/
@@ -103,6 +107,7 @@ function run(command, args = [], options = {}) {
 		cwd = TOOL_ROOT,
 		dryRun = false,
 		env = process.env,
+		input,
 		maxBuffer = 256 * 1024 * 1024,
 		quiet = false
 	} = options
@@ -112,8 +117,11 @@ function run(command, args = [], options = {}) {
 		cwd,
 		env: { ...env, ...NON_INTERACTIVE_CHILD_ENV },
 		encoding: 'utf8',
+		input,
 		maxBuffer,
-		stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit']
+		stdio: capture
+			? [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe']
+			: [input === undefined ? 'inherit' : 'pipe', 'inherit', 'inherit']
 	})
 	if (result.error) fail(`命令无法启动：${command}（${result.error.message}）`)
 	if (result.status !== 0) {
@@ -173,6 +181,7 @@ export function parseArgs(argv = []) {
 		help: false,
 		releaseId: '',
 		skipTests: false,
+		syncHelper: false,
 		yes: false
 	}
 	const values = [...argv]
@@ -226,6 +235,9 @@ export function parseArgs(argv = []) {
 			case '--skip-tests':
 				args.skipTests = true
 				break
+			case '--sync-helper':
+				args.syncHelper = true
+				break
 			case '--yes':
 				args.yes = true
 				break
@@ -259,6 +271,8 @@ function usage() {
   node backend/backend-release.mjs recover --env production --yes [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --dry-run [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --yes [--config FILE]
+  node backend/backend-release.mjs deploy-cloud --env test --sync-helper --yes [--config FILE]
+  node backend/backend-release.mjs sync-helper --env test --yes [--config FILE]
   node backend/backend-release.mjs status --env test|production [--database-profile local|cloud|active] [--config FILE]
   node backend/backend-release.mjs rollback --env test|production --release RELEASE_ID --ack-db-schema-compatible --yes [--config FILE]
 
@@ -269,6 +283,8 @@ function usage() {
 	- 全新正式服只允许一次 bootstrap；后续必须使用 deploy，两个命令都强制腾讯云数据库。
 	- 迁移或切换失败后，普通发布会被恢复标记锁定；只能用 recover 携带新的前向修复产物继续。
 	- bootstrap/deploy/deploy-cloud/recover 不允许 --skip-tests；每次从 clean、已同步 upstream 的精确 Git commit 打包。
+	- --sync-helper 只允许测试服真实发布显式使用；先安全备份并原子同步 root helper，再继续原发布流程。
+	- 正式服和 dry-run 禁止自动同步 helper；普通发布仍只校验，不会隐式替换 root 脚本。
   - rollback 只切换应用，不执行 Alembic downgrade，也不恢复数据库。
   - 数据库迁移一旦尝试，远端失败路径保持服务停止，等待人工前向修复或恢复决策。
 `.trim()
@@ -335,6 +351,7 @@ export function loadConfiguration(args, { requireRemote = false } = {}) {
 		constraintsPath,
 		environment: configuredEnvironment,
 		expectedBranch: values.BACKEND_EXPECTED_BRANCH || DEFAULT_EXPECTED_BRANCH,
+		helperSyncEnabled: normalizeBoolean(values.BACKEND_TEST_HELPER_SYNC_ENABLED, false),
 		identityFile: expandHome(values.BACKEND_SSH_IDENTITY_FILE || ''),
 		publicUrl: String(values.BACKEND_PUBLIC_URL || '').replace(/\/+$/, ''),
 		pythonBin,
@@ -650,6 +667,186 @@ function remoteHelper(config, args, { capture = false } = {}) {
 	})
 }
 
+function remoteUserCommand(config, args, { capture = false } = {}) {
+	const command = args.map(shellQuote).join(' ')
+	return run('ssh', [...sshOptions(config), config.target, command], {
+		capture,
+		maxBuffer: 64 * 1024 * 1024
+	})
+}
+
+function remoteRootScript(config, source, args, { capture = false } = {}) {
+	const command = [
+		'/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+		'/bin/bash', '-s', '--', ...args
+	].map(shellQuote).join(' ')
+	const privilegedCommand = config.useSudo ? `sudo -n ${command}` : command
+	return run('ssh', [...sshOptions(config), config.target, privilegedCommand], {
+		capture,
+		input: source,
+		maxBuffer: 64 * 1024 * 1024
+	})
+}
+
+function inspectDeploymentToolGitState() {
+	const branch = git(TOOL_ROOT, ['branch', '--show-current'])
+	const commit = git(TOOL_ROOT, ['rev-parse', 'HEAD'])
+	if (branch !== DEFAULT_EXPECTED_BRANCH) {
+		fail(`同步 helper 前部署工具必须位于 ${DEFAULT_EXPECTED_BRANCH} 分支，当前是 ${branch || '(detached)'}`)
+	}
+	if (!/^[0-9a-f]{40}$/.test(commit)) fail('无法取得部署工具完整 Git commit')
+	if (git(TOOL_ROOT, ['status', '--porcelain'])) {
+		fail('同步 helper 前部署工具工作区必须干净；请先审核、提交并推送部署工具改动')
+	}
+	for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD']) {
+		if (existsSync(resolveGitPath(TOOL_ROOT, marker))) fail(`部署工具 Git 操作尚未结束：${marker}`)
+	}
+	let upstream
+	try {
+		upstream = git(TOOL_ROOT, ['rev-parse', '@{upstream}'])
+	} catch {
+		fail('部署工具当前分支没有 upstream，不能安全同步 root helper')
+	}
+	if (upstream !== commit) fail('部署工具当前提交与 upstream 不一致，请先推送后再同步 root helper')
+	return { branch, commit }
+}
+
+function createRemoteHelperUploadDirectory(config) {
+	const output = remoteUserCommand(config, [
+		'/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin',
+		'/usr/bin/mktemp', '-d', '--', '/tmp/loumai-backend-helper-sync.XXXXXXXX'
+	], { capture: true }).stdout.trim()
+	if (!/^\/tmp\/loumai-backend-helper-sync\.[A-Za-z0-9]+$/.test(output)) {
+		fail('服务器返回了不安全的 helper 临时目录')
+	}
+	return output
+}
+
+function cleanupRemoteHelperUploadDirectory(config, directory) {
+	if (!/^\/tmp\/loumai-backend-helper-sync\.[A-Za-z0-9]+$/.test(directory)) {
+		fail('拒绝清理不安全的 helper 临时目录')
+	}
+	try {
+		remoteUserCommand(config, ['/bin/rm', '-rf', '--', directory], { capture: true })
+	} catch (error) {
+		warn(`helper 临时目录自动清理失败：${error.message}`)
+	}
+}
+
+function uploadHelperCandidate(config, directory) {
+	if (!/^\/tmp\/loumai-backend-helper-sync\.[A-Za-z0-9]+$/.test(directory)) {
+		fail('helper 上传目录不安全')
+	}
+	const source = join(TOOL_ROOT, 'backend/remote/loumai-backend-release')
+	const destination = `${directory}/loumai-backend-release`
+	const args = [
+		'-o', 'BatchMode=yes',
+		'-o', 'StrictHostKeyChecking=yes',
+		'-o', 'ConnectTimeout=10',
+		'-o', 'ServerAliveInterval=15',
+		'-o', 'ServerAliveCountMax=12',
+		'-o', 'TCPKeepAlive=yes',
+		'-P', String(config.sshPort)
+	]
+	if (config.identityFile) args.push('-i', config.identityFile)
+	args.push(source, `${config.target}:${destination}`)
+	run('scp', args)
+	return destination
+}
+
+function verifyRemoteStatusAfterHelperSync(config) {
+	const output = remoteHelper(config, ['status', 'active'], { capture: true }).stdout
+	const values = parseKeyValueOutput(output)
+	if (values.ENVIRONMENT !== 'test') fail('helper 同步后目标服务器不再声明为测试服')
+	if (values.DEPLOYMENT_STATE !== 'HEALTHY') fail('helper 同步后测试服状态不是 HEALTHY')
+	if (values.RECOVERY_REQUIRED !== 'false') fail('helper 同步后测试服出现恢复标记')
+	if (values.DATABASE_WRITERS !== 'verified') fail('helper 同步后数据库写入服务核验失败')
+	process.stdout.write(output)
+}
+
+export function helperSyncInstallerSource() {
+	return readFileSync(HELPER_SYNC_INSTALLER_PATH, 'utf8')
+}
+
+function syncRemoteHelper(config) {
+	if (config.environment !== 'test') fail('helper 自动同步只允许测试服，正式服必须独立审核和安装')
+	if (config.remoteHelper !== DEFAULT_REMOTE_HELPER) {
+		fail(`helper 自动同步只允许固定路径：${DEFAULT_REMOTE_HELPER}`)
+	}
+	const helperSource = join(TOOL_ROOT, 'backend/remote/loumai-backend-release')
+	const expectedFingerprint = sha256File(helperSource)
+	let actualVersion = ''
+	let actualFingerprint = ''
+	try {
+		actualVersion = remoteHelper(config, ['version'], { capture: true }).stdout.trim()
+	} catch (error) {
+		fail(`无法读取测试服现有 helper 版本，拒绝自动安装：${error.message}`)
+	}
+	try {
+		actualFingerprint = remoteHelper(config, ['fingerprint'], { capture: true }).stdout.trim()
+	} catch {
+		actualFingerprint = '(unsupported)'
+	}
+	if (
+		actualVersion === BACKEND_RELEASE_TOOL_VERSION
+		&& actualFingerprint === expectedFingerprint
+	) {
+		info(`测试服 helper 已是目标版本 ${BACKEND_RELEASE_TOOL_VERSION}，无需同步`)
+		return false
+	}
+	if (!config.helperSyncEnabled) {
+		fail('测试服 helper 自动同步未启用；请在本机测试服部署配置中显式设置 BACKEND_TEST_HELPER_SYNC_ENABLED=true')
+	}
+	const toolGitState = inspectDeploymentToolGitState()
+	info(
+		`准备同步测试服 helper：部署工具 commit=${toolGitState.commit}，`
+		+ `远端版本=${actualVersion || '(empty)'}，远端指纹=${actualFingerprint}，`
+		+ `目标指纹=${expectedFingerprint}`
+	)
+	run('/bin/bash', ['-n', HELPER_SYNC_INSTALLER_PATH])
+	run('/bin/bash', ['-n', helperSource])
+	run('npm', ['test'], { cwd: TOOL_ROOT })
+	const verifiedToolGitState = inspectDeploymentToolGitState()
+	if (verifiedToolGitState.commit !== toolGitState.commit) {
+		fail('部署工具测试期间 commit 发生变化，请重新执行 helper 同步')
+	}
+	if (sha256File(helperSource) !== expectedFingerprint) {
+		fail('部署工具测试期间 helper 源码发生变化，请重新执行')
+	}
+	const installerSource = helperSyncInstallerSource()
+
+	let uploadDirectory = ''
+	let installerOutput = ''
+	try {
+		uploadDirectory = createRemoteHelperUploadDirectory(config)
+		const uploadedCandidate = uploadHelperCandidate(config, uploadDirectory)
+		installerOutput = remoteRootScript(config, installerSource, [
+			config.environment,
+			dirname(config.remoteStagingRoot),
+			config.remoteStagingRoot,
+			`${config.publicUrl}/health`,
+			config.remoteHelper,
+			uploadedCandidate,
+			expectedFingerprint,
+			BACKEND_RELEASE_TOOL_VERSION
+		], { capture: true }).stdout
+	} finally {
+		if (uploadDirectory) cleanupRemoteHelperUploadDirectory(config, uploadDirectory)
+	}
+	process.stdout.write(installerOutput)
+	const result = parseKeyValueOutput(installerOutput)
+	if (result.HELPER_SYNC_STATUS !== 'updated') fail('测试服 helper 同步未返回成功状态')
+	if (result.HELPER_SYNC_ENVIRONMENT !== 'test') fail('测试服 helper 同步返回了错误环境')
+	if (result.HELPER_SYNC_NEW_SHA256 !== expectedFingerprint) fail('测试服 helper 同步后的指纹不一致')
+	if (!/^\/var\/backups\/loumai-backend-helper-test\.[A-Za-z0-9]+\/loumai-backend-release$/.test(
+		result.HELPER_SYNC_BACKUP || ''
+	)) fail('测试服 helper 同步未返回安全备份路径')
+	assertRemoteHelperExact(config)
+	verifyRemoteStatusAfterHelperSync(config)
+	info(`测试服 helper 安全同步完成；旧文件备份：${result.HELPER_SYNC_BACKUP}`)
+	return true
+}
+
 function tryRemoteAbort(config, releaseId) {
 	try {
 		remoteHelper(config, ['abort', releaseId])
@@ -667,24 +864,36 @@ function parseKeyValueOutput(text = '') {
 	return result
 }
 
+function helperMismatchRecoveryHint(config) {
+	if (config.environment === 'test') {
+		return '测试服可执行 `./loumai-deploy backend sync-helper --env test --yes`，'
+			+ '或在真实测试发布命令中显式加入 `--sync-helper`。'
+	}
+	return '正式服必须按生产运维文档独立审核、备份并安装 helper，禁止普通发布自动替换。'
+}
+
 function assertRemoteHelperExact(config) {
 	const version = remoteHelper(config, ['version'], { capture: true }).stdout.trim()
 	if (version !== BACKEND_RELEASE_TOOL_VERSION) {
-		fail(`远端 helper 版本不一致：实际 ${version || '(empty)'}，要求 ${BACKEND_RELEASE_TOOL_VERSION}`)
+		fail(
+			`远端 helper 版本不一致：实际 ${version || '(empty)'}，`
+			+ `要求 ${BACKEND_RELEASE_TOOL_VERSION}。${helperMismatchRecoveryHint(config)}`
+		)
 	}
 	const expectedFingerprint = sha256File(join(TOOL_ROOT, 'backend/remote/loumai-backend-release'))
 	let actualFingerprint = ''
 	try {
 		actualFingerprint = remoteHelper(config, ['fingerprint'], { capture: true }).stdout.trim()
 	} catch {
-		fail('远端 helper 不支持源码指纹校验，请先安装当前部署仓库中的 helper')
+		fail(`远端 helper 不支持源码指纹校验。${helperMismatchRecoveryHint(config)}`)
 	}
 	if (actualFingerprint !== expectedFingerprint) {
 		fail(
 			'远端 helper 与本地源码不一致；'
 			+ `本地工作区 SHA256=${expectedFingerprint}，远端 SHA256=${actualFingerprint}。`
-			+ '本地指纹按实际文件计算（包括未提交改动）；请先审核差异、备份并更新目标服务器 helper'
-			+ '（见 docs/backend-auto-release.md），再发布。不要关闭指纹校验。'
+			+ '本地指纹按实际文件计算（包括未提交改动）。'
+			+ helperMismatchRecoveryHint(config)
+			+ '见 docs/backend-auto-release.md；不要关闭指纹校验。'
 		)
 	}
 }
@@ -955,7 +1164,10 @@ export function main(argv = process.argv.slice(2)) {
 		process.stdout.write(`${usage()}\n`)
 		return
 	}
-	if (!['build', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit', 'status', 'rollback'].includes(args.command)) {
+	if (![
+		'build', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit',
+		'status', 'rollback', 'sync-helper'
+	].includes(args.command)) {
 		fail(`未知命令：${args.command}`)
 	}
 	if (args.command !== 'env-audit' && args.all) fail('--all 只能用于 env-audit')
@@ -967,12 +1179,35 @@ export function main(argv = process.argv.slice(2)) {
 			|| args.releaseId
 			|| args.ackDbSchemaCompatible
 			|| args.databaseProfile
+			|| args.syncHelper
 		) {
 			fail('env-audit 是只读命令，不能使用发布、跳过测试或回滚参数')
 		}
 		const config = loadConfiguration(args, { requireRemote: true })
 		auditEnvironment(config, args)
 		return
+	}
+	if (args.command === 'sync-helper') {
+		if (
+			args.dryRun
+			|| args.skipTests
+			|| args.releaseId
+			|| args.ackDbSchemaCompatible
+			|| args.databaseProfile
+			|| args.syncHelper
+		) fail('sync-helper 只能使用 --env test、--config 和 --yes')
+		if (args.environment !== 'test') fail('sync-helper 只允许测试服，正式服必须独立审核安装')
+		if (!args.yes) fail('sync-helper 必须显式提供 --yes')
+		const config = loadConfiguration(args, { requireRemote: true })
+		syncRemoteHelper(config)
+		return
+	}
+	if (args.syncHelper) {
+		if (!['deploy', 'deploy-cloud'].includes(args.command)) {
+			fail('--sync-helper 只能用于测试服 deploy 或 deploy-cloud 真实发布')
+		}
+		if (args.environment !== 'test') fail('--sync-helper 禁止用于正式服')
+		if (args.dryRun) fail('--sync-helper 会修改测试服 root helper，不能与 --dry-run 同时使用')
 	}
 	if (['bootstrap', 'deploy', 'deploy-cloud', 'recover'].includes(args.command) && args.skipTests) {
 		fail(`${args.command} 禁止 --skip-tests`)
@@ -1019,7 +1254,10 @@ export function main(argv = process.argv.slice(2)) {
 		return
 	}
 	// 提前发现安装版本漂移；耗时门禁后 deploy 的 preflight 仍会再次复核。
-	if (args.command !== 'build') assertRemoteHelperExact(config)
+	if (args.command !== 'build') {
+		if (args.syncHelper) syncRemoteHelper(config)
+		else assertRemoteHelperExact(config)
+	}
 	runQualityGates(config, { skipTests: args.skipTests })
 	const verifiedGitState = inspectGitState(config)
 	const verifiedDbHead = inspectMigrationHead(config)

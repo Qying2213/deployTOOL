@@ -49,10 +49,10 @@
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy --yes
 ```
 
-上面这条旧命令继续使用测试服务器本机 PostgreSQL。需要把同一套测试服后端切换为腾讯云 PostgreSQL 时，使用另一条明确命名的命令：
+上面这条旧命令继续使用测试服务器本机 PostgreSQL。需要把同一套测试服后端切换为腾讯云 PostgreSQL 时，使用另一条明确命名的命令。建议显式携带 `--sync-helper`：helper 已一致时不会替换，只有发现不一致才执行安全备份和原子同步。
 
 ```bash
-cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy-cloud --yes
+cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy-cloud --sync-helper --yes
 ```
 
 两个数据库是彼此独立的数据集；发布器只选择目标、备份、迁移和切换服务，不会把本机数据库的数据自动复制到云数据库。云数据库首次配置见[后端自动发布说明的双数据库章节](docs/backend-auto-release.md#测试服双数据库发布)。
@@ -91,7 +91,7 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 ./loumai-deploy backend deploy --dry-run
 ./loumai-deploy backend deploy --yes
 ./loumai-deploy backend deploy-cloud --dry-run
-./loumai-deploy backend deploy-cloud --yes
+./loumai-deploy backend deploy-cloud --sync-helper --yes
 ./loumai-deploy backend status
 ```
 
@@ -420,7 +420,14 @@ git log --oneline --decorate -5
 
 ### `服务器 helper 版本或源码指纹不匹配`
 
-本地发布协议或 helper 源码与服务器安装版本不同。按对应详细文档更新 root-owned helper 后再执行，不要绕过版本或 SHA256 指纹检查。日常 `deploy --yes` 不会自动覆盖服务器 helper，这是为了避免普通代码发布顺带替换 root 脚本。
+本地发布协议或 helper 源码与服务器安装版本不同。不要绕过版本或 SHA256 指纹检查。普通 `deploy --yes` 不会自动覆盖服务器 helper；测试服可先独立同步，或在真实发布中显式同步：
+
+```bash
+./loumai-deploy backend sync-helper --env test --yes
+./loumai-deploy backend deploy-cloud --env test --sync-helper --yes
+```
+
+同步功能要求部署工具 `master` 工作区干净、已与 upstream 一致，并要求本机测试配置显式设置 `BACKEND_TEST_HELPER_SYNC_ENABLED=true`。它会先执行部署工具测试，再在服务器发布锁下验证候选 SHA256 和只读 preflight，备份旧文件并原子切换；安装后异常只恢复 helper，不迁移数据库、不重启服务。正式服不支持该自动同步入口，仍须按生产文档独立审核安装。
 
 ### `pg_dump: Peer authentication failed`
 

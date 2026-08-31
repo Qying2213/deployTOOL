@@ -17,6 +17,7 @@ import {
 	createReleaseId,
 	DEFAULT_CONFIG_PATH,
 	DEFAULT_CONSTRAINTS_PATH,
+	helperSyncInstallerSource,
 	main,
 	parseArgs,
 	parseDotEnv,
@@ -111,6 +112,7 @@ test('发布参数默认保守，并要求回滚数据库兼容确认', () => {
 		help: false,
 		releaseId: '',
 		skipTests: false,
+		syncHelper: false,
 		yes: false
 	})
 	assert.equal(
@@ -127,6 +129,18 @@ test('发布参数默认保守，并要求回滚数据库兼容确认', () => {
 	assert.throws(() => main(['deploy']), /必须显式提供 --yes/)
 	assert.throws(() => main(['deploy-cloud']), /必须显式提供 --yes/)
 	assert.equal(parseArgs(['deploy-cloud', '--dry-run']).command, 'deploy-cloud')
+	assert.equal(parseArgs(['deploy-cloud', '--sync-helper', '--yes']).syncHelper, true)
+	assert.throws(() => main(['sync-helper']), /必须显式提供 --yes/)
+	assert.throws(() => main(['sync-helper', '--env', 'production', '--yes']), /只允许测试服/)
+	assert.throws(
+		() => main(['deploy-cloud', '--sync-helper', '--dry-run']),
+		/不能与 --dry-run 同时使用/
+	)
+	assert.throws(() => main(['status', '--sync-helper']), /只能用于测试服 deploy 或 deploy-cloud/)
+	assert.throws(
+		() => main(['deploy', '--env', 'production', '--sync-helper', '--yes']),
+		/禁止用于正式服/
+	)
 	assert.equal(parseArgs(['status', '--database-profile', 'cloud']).databaseProfile, 'cloud')
 	assert.throws(() => parseArgs(['status', '--database-profile', 'invalid']), /数据库 profile 非法/)
 	assert.throws(() => main(['deploy', '--database-profile', 'cloud', '--yes']), /只能用于 status/)
@@ -142,6 +156,7 @@ test('发布参数默认保守，并要求回滚数据库兼容确认', () => {
 		help: false,
 		releaseId: '',
 		skipTests: false,
+		syncHelper: false,
 		yes: false
 	})
 	assert.throws(() => parseArgs(['env-audit', '--env']), /缺少环境名称/)
@@ -413,9 +428,9 @@ test('本地发布器从干净且已同步的精确 Git commit 打包，并避�
 
 test('后端长时间发布为 SSH 与 SCP 配置保活，避免依赖安装期间空闲断线', () => {
 	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
-	assert.equal((source.match(/'ServerAliveInterval=15'/g) || []).length, 2)
-	assert.equal((source.match(/'ServerAliveCountMax=12'/g) || []).length, 2)
-	assert.equal((source.match(/'TCPKeepAlive=yes'/g) || []).length, 2)
+	assert.equal((source.match(/'ServerAliveInterval=15'/g) || []).length, 3)
+	assert.equal((source.match(/'ServerAliveCountMax=12'/g) || []).length, 3)
+	assert.equal((source.match(/'TCPKeepAlive=yes'/g) || []).length, 3)
 })
 
 test('服务器激活器具备 root 信任边界、验签、并发锁和原子切换', () => {
@@ -798,9 +813,11 @@ test('迁移发布先停写与备份，迁移后故障保持服务停止且不�
 test('真实发布在耗时质量门禁前校验 helper，上传前仍复核，离线 build 不连接服务器', () => {
 	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
 	const mainSource = source.slice(source.indexOf('export function main('))
-	const earlyCheck = mainSource.indexOf("if (args.command !== 'build') assertRemoteHelperExact(config)")
+	const earlyCheck = mainSource.indexOf("if (args.command !== 'build') {")
 	const qualityGates = mainSource.indexOf('runQualityGates(config,')
 	assert.ok(earlyCheck > 0 && earlyCheck < qualityGates)
+	assert.match(mainSource, /if \(args\.syncHelper\) syncRemoteHelper\(config\)/)
+	assert.match(mainSource, /else assertRemoteHelperExact\(config\)/)
 	const deploySource = source.slice(source.indexOf('function deploy('), source.indexOf('function rollback('))
 	assert.ok(deploySource.indexOf('remotePreflight(') < deploySource.indexOf('buildRelease('))
 	const preflightSource = source.slice(source.indexOf('function remotePreflight('), source.indexOf('function showRemoteStatus('))
@@ -808,6 +825,39 @@ test('真实发布在耗时质量门禁前校验 helper，上传前仍复核，�
 	assert.match(source, /本地工作区 SHA256/)
 	assert.match(source, /远端 SHA256/)
 	assert.match(source, /docs\/backend-auto-release\.md/)
+})
+
+test('测试服 helper 同步要求显式授权、受控 root 安装和失败恢复', () => {
+	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
+	const installer = helperSyncInstallerSource()
+	const testConfigTemplate = readFileSync(join(TOOL_ROOT, 'config/backend.test.example.env'), 'utf8')
+	const productionConfigTemplate = readFileSync(
+		join(TOOL_ROOT, 'config/backend.production.example.env'),
+		'utf8'
+	)
+	const syntax = spawnSync('/bin/bash', ['-n'], { input: installer, encoding: 'utf8' })
+	assert.equal(syntax.status, 0, syntax.stderr)
+	assert.match(source, /BACKEND_TEST_HELPER_SYNC_ENABLED/)
+	assert.match(testConfigTemplate, /^BACKEND_TEST_HELPER_SYNC_ENABLED=false$/m)
+	assert.doesNotMatch(productionConfigTemplate, /BACKEND_TEST_HELPER_SYNC_ENABLED/)
+	assert.match(source, /config\.environment !== 'test'/)
+	assert.match(source, /inspectDeploymentToolGitState\(\)/)
+	assert.match(source, /run\('npm', \['test'\]/)
+	assert.match(source, /createRemoteHelperUploadDirectory\(config\)/)
+	assert.match(source, /const installerSource = helperSyncInstallerSource\(\)/)
+	assert.match(source, /remoteRootScript\(config, installerSource/)
+	assert.match(source, /verifyRemoteStatusAfterHelperSync\(config\)/)
+	assert.match(installer, /\[\[ "\$EXPECTED_ENVIRONMENT" == "test" \]\]/)
+	assert.match(installer, /flock -w 120/)
+	assert.match(installer, /sha256sum "\$UPLOAD_PATH"/)
+	assert.match(installer, /bash -n "\$ROOT_CANDIDATE"/)
+	assert.match(installer, /preflight active deploy/)
+	assert.match(installer, /loumai-backend-helper-test\.XXXXXXXX/)
+	assert.match(installer, /mv -fT -- "\$ROOT_CANDIDATE" "\$HELPER_PATH"/)
+	assert.match(installer, /HELPER_SYNC_RESTORED/)
+	assert.match(installer, /HELPER_SYNC_BACKUP=/)
+	assert.doesNotMatch(installer, /systemctl (?:start|stop|restart)/)
+	assert.doesNotMatch(installer, /alembic|pg_restore/)
 })
 
 test('应用回滚要求显式兼容确认，只切应用且继续验证当前数据库祖先关系', () => {

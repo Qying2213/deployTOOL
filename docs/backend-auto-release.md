@@ -206,20 +206,38 @@ shasum -a 256 backend/remote/loumai-backend-release
 sudo -n /usr/local/sbin/loumai-backend-release fingerprint
 ```
 
-日常 `deploy --yes` 不会自动更新这个 root-owned helper。发布器会在任何上传、停服务或迁移之前比较两边指纹；如果本地脚本修改后忘记同步服务器，发布会明确中止。
+普通 `deploy --yes` 不会自动更新这个 root-owned helper。发布器会在任何上传、停服务或迁移之前比较两边指纹；如果本地脚本修改后忘记同步服务器，发布会明确中止。测试服真实发布只有显式提供 `--sync-helper --yes` 才允许先同步 helper，正式服始终禁止通过该入口自动替换。
 
 #### 已初始化测试服只升级 helper
 
 报“远端 helper 与本地源码不一致”时，不要重复执行整套首次安装，也不要用示例 env 覆盖服务器真实配置。指纹比较的是本机 `backend/remote/loumai-backend-release` 的实际文件，包含未提交的改动；协议版本号相同并不代表源码相同。
 
-升级顺序：
+推荐先在 Git 忽略的 `config/backend.test.local.env` 中显式启用一次：
+
+```dotenv
+BACKEND_TEST_HELPER_SYNC_ENABLED=true
+```
+
+然后二选一：
+
+```bash
+# 只同步 helper，不发布业务、不迁移数据库、不重启服务
+./loumai-deploy backend sync-helper --env test --yes
+
+# 一条命令：需要时先同步 helper，随后继续云数据库测试服发布
+./loumai-deploy backend deploy-cloud --env test --sync-helper --yes
+```
+
+若远端指纹已经一致，`--sync-helper` 只报告“无需同步”并继续正常发布，不重复建立备份。发生不一致时，发布器要求部署工具自身位于干净、已推送的 `master`，执行完整部署工具测试和两个 Bash 语法检查，将候选文件上传至随机的用户私有目录；root 安装器重新校验 SHA256、固定安装路径、服务器 `ENVIRONMENT=test`、远端根目录、staging、公网健康地址和候选只读 preflight。它与业务发布共用发布锁，在 `/var/backups/loumai-backend-helper-test.*` 建立 root 私有备份，在 `/usr/local/sbin` 同文件系统原子替换；安装后版本、指纹、preflight 或状态核验失败会恢复旧 helper。整个同步阶段不修改 env、systemd、Nginx、数据库或业务 current。
+
+人工审核或应急升级顺序仍为：
 
 1. 从 `config/backend.test.local.env` 确认 SSH 目标和公有健康地址，运行 `backend status --env test`，必须显示 `ENVIRONMENT=test`，并记录当前 release、数据库 profile 和服务状态。
 2. 审核本机 helper 差异，运行部署工具 `npm test` 和 `bash -n backend/remote/loumai-backend-release`。只为正式服增加的分支也应验证不会改变测试服合同；不丢弃本机已有改动。
 3. 上传到随机临时目录，校验上传文件 SHA256 与本机一致。使用 root 权限检查正式安装路径不是软链接，并在发布锁下将旧 helper 备份到独立的 root 私有目录；不要覆盖旧备份或应用 release。
 4. 在 `/usr/local/sbin` 同文件系统的 root 私有暂存目录中安装候选文件（`root:root 0755`），先验证 Bash 语法、版本、源码指纹以及测试服只读 preflight，再原子替换 `/usr/local/sbin/loumai-backend-release`。失败只恢复 helper 文件，绝不自动回滚数据库。
 5. 再次确认指纹完全一致、原 release 与数据库 profile 未变、服务正常。此步骤只升级 helper，不修改 env、systemd、Nginx，不重启服务，也不运行业务迁移。
-6. 使用原 `./loumai-deploy backend deploy-cloud --env test --dry-run` 与 `--yes` 发布。`deploy-cloud` 沿用云库；不要误用选择服务器本机数据库的 `deploy`。
+6. 使用原 `./loumai-deploy backend deploy-cloud --env test --dry-run` 与 `--yes` 发布，或在真实发布中显式增加 `--sync-helper`。`deploy-cloud` 沿用云库；不要误用选择服务器本机数据库的 `deploy`。
 
 真实发布现在会先核对 helper，再执行 Ruff、影子库迁移和全量测试；全部门禁后、打包上传前仍会重新核对。这样版本不一致能尽早报错，同时保留耗时检查期间发生变更的保护；本地 `build` 不增加 SSH 依赖。报错会同时给出本地与远端 SHA256，不输出密钥或配置值。
 
@@ -631,7 +649,7 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deplo
 新增的云数据库一键发布命令：
 
 ```bash
-cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy-cloud --yes
+cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy-cloud --sync-helper --yes
 ```
 
 对应的只读预演：
