@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SOURCE = (
     Path(__file__).resolve().parents[1]
@@ -319,11 +319,10 @@ class ProductionAdminTest(unittest.TestCase):
         self.assertNotIn("alembic", helper.PROBE)
 
     def test_child_failures_do_not_print_secret_urls(self):
-        result = subprocess.CompletedProcess(
-            ["python"], 1, "secret URL", "DATABASE_URL=secret"
-        )
+        process = Mock(returncode=1)
+        process.communicate.return_value = ("secret URL", "DATABASE_URL=secret")
         with (
-            patch.object(helper.subprocess, "run", return_value=result),
+            patch.object(helper.subprocess, "Popen", return_value=process),
             self.assertRaisesRegex(RuntimeError, "command failed") as raised,
         ):
             helper.command(["python"])

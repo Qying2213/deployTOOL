@@ -74,7 +74,7 @@ export function validateProductionState(output, config) {
 }
 
 function exactHelper(config) {
-  if (ssh(config, ['version']) !== '2' || ssh(config, ['fingerprint']) !== sha(readFileSync(HELPER_SOURCE))) {
+  if (ssh(config, ['version']) !== '3' || ssh(config, ['fingerprint']) !== sha(readFileSync(HELPER_SOURCE))) {
     throw new Error('正式后台 helper 版本/指纹不一致，须由管理员安装评审后的版本')
   }
 }

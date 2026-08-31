@@ -13,6 +13,7 @@ import json
 import os
 import pwd
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -22,7 +23,7 @@ import time
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "2"
+VERSION = "3"
 ROOT = Path("/srv/loumai-company-management-production")
 CONFIG = Path("/etc/loumai/company-management-production-release.env")
 APP_ENV = Path("/etc/loumai/company-management-production.env")
@@ -65,23 +66,35 @@ def require(condition, message):
 
 
 def command(args, *, env=None, cwd=None, input=None, timeout=30, check=True):
-    result = subprocess.run(
+    process = subprocess.Popen(
         [str(arg) for arg in args],
         env=env or ENV,
         cwd=cwd,
-        input=input,
-        capture_output=True,
+        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = process.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+        raise RuntimeError(f"command timed out: {Path(args[0]).name}") from None
     # Python validation/library errors can contain URLs. Never echo child output
     # or configuration values on failure; operators use the protected server log.
     require(
-        not check or result.returncode == 0,
-        f"command failed: {Path(args[0]).name} (exit={result.returncode})",
+        not check or process.returncode == 0,
+        f"command failed: {Path(args[0]).name} (exit={process.returncode})",
     )
-    return result.stdout.strip() if check else result
+    if check:
+        return stdout.strip()
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def secure_directory(path):
@@ -549,7 +562,7 @@ def build_runtime(target, config):
         ],
         environment=build_env,
         cwd=target,
-        timeout=600,
+        timeout=1200,
     )
     run_as(
         BUILD_USER,
