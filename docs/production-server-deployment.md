@@ -107,6 +107,8 @@ sudo -u loumai-deploy sudo -n /usr/local/sbin/loumai-h5-release version
 GRANT TEMPORARY ON DATABASE loumai_production TO loumai_migrate;
 ```
 
+运行账号对业务序列只授予 `USAGE / SELECT`，并显式撤销 `UPDATE`。这既允许列默认值调用 `nextval`（包括 `properties_property_no_seq` 自动生成公开房源编号），又禁止普通业务进程调用 `setval` 重置编号。远端 helper 会同步现有序列和默认权限，并在预检中拒绝仍有序列 `UPDATE` 的运行账号；迁移账号仍由独立 DDL 权限合同管理。
+
 备份证据中的 `BACKUP_POLICY_REFERENCE` 必须使用
 `tencentdb-postgresql/地域/postgres-实例ID/策略ID` 格式，并对应腾讯云控制台中的真实实例与自动备份策略；模板占位值不会通过预检。
 

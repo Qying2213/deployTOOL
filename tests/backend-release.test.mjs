@@ -811,6 +811,16 @@ test('应用回滚要求显式兼容确认，只切应用且继续验证当前�
 	assert.doesNotMatch(rollback, /run_migrations|create_database_backup/)
 })
 
+test('运行账号仅取得序列取号权限且不能重置房源公开编号序列', () => {
+	const helper = remoteHelperContractSource()
+	assert.match(helper, /GRANT USAGE, SELECT ON SEQUENCES TO \{runtime\}/)
+	assert.match(helper, /REVOKE UPDATE ON SEQUENCES FROM \{runtime\}/)
+	assert.match(helper, /GRANT USAGE, SELECT ON SEQUENCE \{qualified\} TO \{runtime\}/)
+	assert.match(helper, /REVOKE UPDATE ON SEQUENCE \{qualified\} FROM \{runtime\}/)
+	assert.match(helper, /has_sequence_privilege\(current_user,c\.oid,'UPDATE'\)/)
+	assert.doesNotMatch(helper, /GRANT USAGE, SELECT, UPDATE ON SEQUENCE/)
+})
+
 test('前后端分离配置模板不保存凭据内容，并声明后端仓库、远端与固定运行时', () => {
 	const localTemplate = readFileSync(join(TOOL_ROOT, 'config/backend.test.example.env'), 'utf8')
 	const productionLocalTemplate = readFileSync(

@@ -1816,11 +1816,19 @@ with engine.connect() as connection:
            AND NOT EXISTS (SELECT 1 FROM pg_depend d
              WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
            AND NOT (has_sequence_privilege(current_user,c.oid,'USAGE')
-                AND has_sequence_privilege(current_user,c.oid,'SELECT')
-                AND has_sequence_privilege(current_user,c.oid,'UPDATE'))
+                AND has_sequence_privilege(current_user,c.oid,'SELECT'))
     """)).scalars().all()
-if unsafe_schemas or unsafe_table_grants or unsafe_alembic_grants:
-    raise SystemExit('runtime database role has unsafe schema/table privileges')
+    unsafe_sequence_grants = connection.execute(text("""
+        SELECT n.nspname || '.' || c.relname FROM pg_class c
+          JOIN pg_namespace n ON n.oid=c.relnamespace
+         WHERE n.nspname NOT IN ('pg_catalog','information_schema')
+           AND n.nspname !~ '^pg_toast' AND c.relkind='S'
+           AND NOT EXISTS (SELECT 1 FROM pg_depend d
+             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+           AND has_sequence_privilege(current_user,c.oid,'UPDATE')
+    """)).scalars().all()
+if unsafe_schemas or unsafe_table_grants or unsafe_alembic_grants or unsafe_sequence_grants:
+    raise SystemExit('runtime database role has unsafe schema/table/sequence privileges')
 if sys.argv[1] == 'safety':
     print('runtime database role safety verified')
     raise SystemExit(0)
@@ -2020,7 +2028,8 @@ with engine.begin() as connection:
     statements = [
         f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {runtime}",
         f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLES FROM {runtime}",
-        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO {runtime}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {runtime}",
+        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE UPDATE ON SEQUENCES FROM {runtime}",
         f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {backup}",
         f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO {backup}",
     ]
@@ -2050,8 +2059,9 @@ with engine.begin() as connection:
             connection.execute(text(f"GRANT SELECT ON TABLE {qualified} TO {backup}"))
         if object_kind == 'S':
             connection.execute(text(
-                f"GRANT USAGE, SELECT, UPDATE ON SEQUENCE {qualified} TO {runtime}"
+                f"GRANT USAGE, SELECT ON SEQUENCE {qualified} TO {runtime}"
             ))
+            connection.execute(text(f"REVOKE UPDATE ON SEQUENCE {qualified} FROM {runtime}"))
             connection.execute(text(f"REVOKE ALL PRIVILEGES ON SEQUENCE {qualified} FROM {backup}"))
             connection.execute(text(f"GRANT SELECT ON SEQUENCE {qualified} TO {backup}"))
     if connection.execute(text("SELECT to_regclass('public.alembic_version')")).scalar_one():
