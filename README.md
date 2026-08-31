@@ -14,6 +14,14 @@
 
 日常操作只使用根目录的 `./loumai-deploy`。详细的一次性服务器安装说明放在 `docs/`，不要把安装步骤和日常发布混着执行。
 
+四个正式服目标完成一次性初始化后，统一入口只有一条：
+
+```bash
+./loumai-deploy production deploy --yes
+```
+
+该命令先完成全量预检，再固定按业务后端、业务前端、管理后台后端、管理后台前端发布，最后逐项验收。正式执行前先运行 `./loumai-deploy production deploy --dry-run`；包路径只写在 Git 忽略的 `config/production.local.env`。详见 [正式服全量一键发布](docs/production-one-command-release.md)。
+
 管理后台正式服联合发布入口（首次资源安装完成后）：
 
 ```bash

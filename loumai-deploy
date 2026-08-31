@@ -6,6 +6,10 @@ TOOL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${1:-}"
 
 case "${TARGET}" in
+  production)
+    shift
+    exec node "${TOOL_ROOT}/production-release.mjs" "$@"
+    ;;
   admin)
     shift
     exec node "${TOOL_ROOT}/admin-release.mjs" "$@"
@@ -35,6 +39,11 @@ case "${TARGET}" in
 工位有方统一部署工具
 
 用法：
+  ./loumai-deploy production preflight
+  ./loumai-deploy production status
+  ./loumai-deploy production deploy --dry-run
+  ./loumai-deploy production deploy --yes
+
   ./loumai-deploy admin prepare --env production --yes
   ./loumai-deploy admin deploy --env production --file /absolute/path/admin-production.zip --dry-run
   ./loumai-deploy admin deploy --env production --file /absolute/path/admin-production.zip --yes
@@ -100,7 +109,7 @@ case "${TARGET}" in
 EOF
     ;;
   *)
-    printf '未知目标：%s（只能是 frontend、backend、admin、admin-backend、admin-frontend 或 website）\n' "${TARGET}" >&2
+    printf '未知目标：%s（只能是 production、frontend、backend、admin、admin-backend、admin-frontend 或 website）\n' "${TARGET}" >&2
     exit 2
     ;;
 esac
