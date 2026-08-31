@@ -246,7 +246,7 @@ export function parseArgs(argv = []) {
 
 function usage() {
 	return `
-楼脉后端可验证发布工具
+工位有方后端可验证发布工具
 
 用法：
   node backend/backend-release.mjs build [--env test|production] [--config FILE] [--skip-tests]
@@ -680,7 +680,12 @@ function assertRemoteHelperExact(config) {
 		fail('远端 helper 不支持源码指纹校验，请先安装当前部署仓库中的 helper')
 	}
 	if (actualFingerprint !== expectedFingerprint) {
-		fail('远端 helper 与本地源码不一致，请先更新服务器 helper 后再发布')
+		fail(
+			'远端 helper 与本地源码不一致；'
+			+ `本地工作区 SHA256=${expectedFingerprint}，远端 SHA256=${actualFingerprint}。`
+			+ '本地指纹按实际文件计算（包括未提交改动）；请先审核差异、备份并更新目标服务器 helper'
+			+ '（见 docs/backend-auto-release.md），再发布。不要关闭指纹校验。'
+		)
 	}
 }
 
@@ -1013,6 +1018,8 @@ export function main(argv = process.argv.slice(2)) {
 		info(`[dry-run] ${databaseProfile} 数据库只读预检通过；未测试、未打包、未上传、未迁移、未切换`)
 		return
 	}
+	// 提前发现安装版本漂移；耗时门禁后 deploy 的 preflight 仍会再次复核。
+	if (args.command !== 'build') assertRemoteHelperExact(config)
 	runQualityGates(config, { skipTests: args.skipTests })
 	const verifiedGitState = inspectGitState(config)
 	const verifiedDbHead = inspectMigrationHead(config)

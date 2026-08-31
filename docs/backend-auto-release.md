@@ -208,6 +208,32 @@ sudo -n /usr/local/sbin/loumai-backend-release fingerprint
 
 日常 `deploy --yes` 不会自动更新这个 root-owned helper。发布器会在任何上传、停服务或迁移之前比较两边指纹；如果本地脚本修改后忘记同步服务器，发布会明确中止。
 
+#### 已初始化测试服只升级 helper
+
+报“远端 helper 与本地源码不一致”时，不要重复执行整套首次安装，也不要用示例 env 覆盖服务器真实配置。指纹比较的是本机 `backend/remote/loumai-backend-release` 的实际文件，包含未提交的改动；协议版本号相同并不代表源码相同。
+
+升级顺序：
+
+1. 从 `config/backend.test.local.env` 确认 SSH 目标和公有健康地址，运行 `backend status --env test`，必须显示 `ENVIRONMENT=test`，并记录当前 release、数据库 profile 和服务状态。
+2. 审核本机 helper 差异，运行部署工具 `npm test` 和 `bash -n backend/remote/loumai-backend-release`。只为正式服增加的分支也应验证不会改变测试服合同；不丢弃本机已有改动。
+3. 上传到随机临时目录，校验上传文件 SHA256 与本机一致。使用 root 权限检查正式安装路径不是软链接，并在发布锁下将旧 helper 备份到独立的 root 私有目录；不要覆盖旧备份或应用 release。
+4. 在 `/usr/local/sbin` 同文件系统的 root 私有暂存目录中安装候选文件（`root:root 0755`），先验证 Bash 语法、版本、源码指纹以及测试服只读 preflight，再原子替换 `/usr/local/sbin/loumai-backend-release`。失败只恢复 helper 文件，绝不自动回滚数据库。
+5. 再次确认指纹完全一致、原 release 与数据库 profile 未变、服务正常。此步骤只升级 helper，不修改 env、systemd、Nginx，不重启服务，也不运行业务迁移。
+6. 使用原 `./loumai-deploy backend deploy-cloud --env test --dry-run` 与 `--yes` 发布。`deploy-cloud` 沿用云库；不要误用选择服务器本机数据库的 `deploy`。
+
+真实发布现在会先核对 helper，再执行 Ruff、影子库迁移和全量测试；全部门禁后、打包上传前仍会重新核对。这样版本不一致能尽早报错，同时保留耗时检查期间发生变更的保护；本地 `build` 不增加 SSH 依赖。报错会同时给出本地与远端 SHA256，不输出密钥或配置值。
+
+#### 2026-08-28 测试服实发记录
+
+- 根因：远端 helper 与部署仓库 HEAD 一致，但本机 helper 还有未提交的正式服安全增强，实际文件指纹不同；并非后端测试失败。已审核差异，仅在测试服备份并原子升级，未关闭指纹门禁。
+- 旧 helper 备份：服务器 `/var/backups/loumai-backend-helper.2JXmIOgx/loumai-backend-release`，目录由 root 私有管理。旧 SHA256：`1c1d75d80524d3e142d6fc1c9855079373f63b2c9e7bbc750ae972fcb8f5f80f`；新 SHA256：`7f3c260cac8dd0d820b44381e340abe8531b6fc7938e0897d54e325cdf3ba627`。升级后本机与服务器一致，版本均为 `6`。
+- 发布命令：`./loumai-deploy backend deploy-cloud --env test --yes`。本轮质量门禁显式使用本机独立 PostgreSQL 影子库；迁移验证和测试结束后均已清理临时数据库，没有清理测试服业务库。
+- 已激活 release：`20260828T074453Z-625c0add3f`；后端 commit：`625c0add3f1740c0dcecbc234d08c3cf47361b59`；数据库继续使用 `cloud`，revision 保持 `20260828_0098`，无业务表结构升级。
+- 验证：Ruff、442 个文件格式检查、影子库升级/降级/再升级通过；后端全量测试 **1532 passed**（1 条测试依赖弃用警告）；后端部署工具专项 **58 passed**；Bash/Node 语法与 `git diff --check` 通过。
+- 公网 `/health` 返回 HTTP 200，应用和数据库均为 `ok`；服务器状态 `HEALTHY`、`RECOVERY_REQUIRED=false`、`DATABASE_WRITERS=verified`。API、视频、IM、管理后台服务均为 `active/running/enabled`，`NRestarts=0`；文件清理 timer 已恢复启用，配套 oneshot 在空闲时为 inactive 属正常现象。
+- 公网 `/api/v1/properties/filter-options` 的三组完整数组及顺序逐项比对通过：房源类型 11、装修 7、轨道交通 18（发布前仅 2）；兼容 `tags` 为 38，区域 23，原 8 个字段保持不变，`Cache-Control: no-store`。重复请求一致，平台库未登录请求仍返回 401；未通过伪造登录态或写入业务数据验收。
+- 边界：本轮未发布前端、未改业务代码或正式服。完整部署工具测试为 **114/115 通过**，唯一未通过项是既有 H5「源码不再注入完整 import.meta.env」检查，读取本机前端验证仓库的源码；未改前端、未豁免该检查，后续发布 H5 前须单独处理，不能将完整工具测试描述为全绿。
+
 应用环境文件由 systemd 和迁移进程读取，可以包含数据库凭据；它们不属于部署工具配置，必须继续由 root 管理且不能被组或其他用户写入：
 
 ```bash
@@ -623,7 +649,7 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deplo
 
 两套数据库是相互独立的数据集。`deploy-cloud` 不会把测试服本地 PostgreSQL 的数据复制到腾讯云 PostgreSQL，也不会自动合并数据；需要迁移旧数据时必须另行制定数据迁移和核对方案。
 
-腾讯云 PostgreSQL 若是尚未创建任何楼脉业务表的全新空库，状态命令会显示 `DB_REVISION=base`。这是受支持的首次发布起点：第一次执行 `deploy-cloud --yes` 时，发布器会先备份空库，再由 Alembic 从 `base` 前向迁移到产物声明的唯一 head，完成结构校验后才切换四个 writer。若数据库已经包含业务表却没有 `public.alembic_version`，发布器会拒绝自动迁移，防止把来历不明的既有结构误判成空库。
+腾讯云 PostgreSQL 若是尚未创建任何工位有方业务表的全新空库，状态命令会显示 `DB_REVISION=base`。这是受支持的首次发布起点：第一次执行 `deploy-cloud --yes` 时，发布器会先备份空库，再由 Alembic 从 `base` 前向迁移到产物声明的唯一 head，完成结构校验后才切换四个 writer。若数据库已经包含业务表却没有 `public.alembic_version`，发布器会拒绝自动迁移，防止把来历不明的既有结构误判成空库。
 
 ### 一次性服务器配置
 
@@ -716,10 +742,10 @@ node backend/backend-release.mjs deploy --yes
 
 正式发布会依次：
 
-1. 锁定 clean/upstream 一致的完整 Git commit 和唯一 Alembic head；
+1. 锁定 clean/upstream 一致的完整 Git commit 和唯一 Alembic head，先核对远端 helper 版本与源码指纹；
 2. 运行 `git diff --check`、Ruff check、Ruff format check；
 3. 运行影子数据库迁移验证和后端全量 pytest；
-4. 用 `git archive` 从锁定 commit 打包 `app / alembic / scripts / pyproject.toml / alembic.ini`；
+4. 再次执行远端只读 preflight（含 helper 指纹复核），用 `git archive` 从锁定 commit 打包 `app / alembic / scripts / pyproject.toml / alembic.ini`；
 5. 加入精确依赖约束、`release.json` 和 `SHA256SUMS`，再生成 `backend.tar`；
 6. 远端在唯一 staging 中验归档哈希、成员路径、源码哈希和版本元数据；
 7. 用 root 固定的 Python 与 uv 为新版本创建独立虚拟环境；

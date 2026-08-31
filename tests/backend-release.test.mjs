@@ -795,6 +795,21 @@ test('迁移发布先停写与备份，迁移后故障保持服务停止且不�
 	assert.match(preflightSource, /values\.PUBLIC_HEALTH_URL !== `\$\{config\.publicUrl\}\/health`/)
 })
 
+test('真实发布在耗时质量门禁前校验 helper，上传前仍复核，离线 build 不连接服务器', () => {
+	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
+	const mainSource = source.slice(source.indexOf('export function main('))
+	const earlyCheck = mainSource.indexOf("if (args.command !== 'build') assertRemoteHelperExact(config)")
+	const qualityGates = mainSource.indexOf('runQualityGates(config,')
+	assert.ok(earlyCheck > 0 && earlyCheck < qualityGates)
+	const deploySource = source.slice(source.indexOf('function deploy('), source.indexOf('function rollback('))
+	assert.ok(deploySource.indexOf('remotePreflight(') < deploySource.indexOf('buildRelease('))
+	const preflightSource = source.slice(source.indexOf('function remotePreflight('), source.indexOf('function showRemoteStatus('))
+	assert.match(preflightSource, /assertRemoteHelperExact\(config\)/)
+	assert.match(source, /本地工作区 SHA256/)
+	assert.match(source, /远端 SHA256/)
+	assert.match(source, /docs\/backend-auto-release\.md/)
+})
+
 test('应用回滚要求显式兼容确认，只切应用且继续验证当前数据库祖先关系', () => {
 	const helper = remoteHelperContractSource()
 	const rollbackStart = helper.indexOf('action_rollback()')
