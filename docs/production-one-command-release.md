@@ -55,7 +55,7 @@ PRODUCTION_ADMIN_PACKAGE=/Users/qinyang/Desktop/admin-production.zip
 
 - 主业务后端正式 helper 已与当前部署工具同步，状态、环境审计和部署预演通过；没有发布代码、迁移数据库或重启服务。
 - 业务 H5 正式目录、helper、Nginx/证书及本机 production 配置已就绪；`CURRENT` 仍为空，等待正式 H5 ZIP。
-- 管理后台后端源码已同步远端；正式域名、证书、服务/helper、本机 production 配置及正式后台 ZIP 尚未完成，因此全量真实发布会保持阻断。
+- 管理后台正式域名已确认为 `https://admin.yinlizhangyu.com`，本机 production 配置和服务器独立账号、隔离目录、helper、sudo 规则、禁用状态的 systemd unit 已就绪。公网 DNS 尚未添加，证书、独立数据库账号、独立 COS 权限和正式后台 ZIP 尚未完成，因此全量真实发布会保持阻断。
 - 本机尚未收到 `/Users/qinyang/Desktop/h5-production.zip` 和 `/Users/qinyang/Desktop/admin-production.zip`；测试包不能改名充当正式包。
 
 2026-08-31 正式后端 helper 同步前已建立远端备份：
