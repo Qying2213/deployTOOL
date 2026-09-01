@@ -23,7 +23,7 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-fronten
 ## 2. 这条命令会做什么
 
 1. 运行管理后台发布专项测试，验证 ZIP 路径、软链接、敏感文件、主入口和资源引用。
-2. 在临时目录生成部署副本，原 ZIP 不变。把包内已知旧测试 API 地址 `https://test.yinlizhangyu.com/admin-api/api/v1` 规范化为同源 `/admin-api/api/v1`；拒绝其他后台 API 目标。
+2. 在临时目录生成部署副本，原 ZIP 不变。把包内已知旧测试 API 地址 `https://test.yinlizhangyu.com/admin-api/api/v1`、测试后台地址 `https://admin-test.yinlizhangyu.com/admin-api/api/v1`，或已确认正式后台地址 `https://admin.yinlizhangyu.com/admin-api/api/v1` 规范化为测试站同源 `/admin-api/api/v1`；拒绝其他后台 API 目标。这样正式构建包用于测试服时不会误请求正式后台。
 3. 删除副本内预压缩的 `.gz/.br`，避免浏览器拿到仍含旧 API 地址的压缩文件；Nginx 动态 gzip。记录原 ZIP SHA256、适配次数及最终文件 SHA256。
 4. 通过严格 SSH 主机指纹校验检查测试服务器、管理后台后端健康和 DNS。
 5. **首次发布**自动建立独立 Nginx 站点，使用 Let’s Encrypt 签发 HTTPS 证书，并安装仅续期该证书的定时器。证书账户邮箱为 `602491730@qq.com`；不要仅依赖邮箱提醒，应检查续期任务状态。

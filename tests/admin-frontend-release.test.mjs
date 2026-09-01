@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
-  API_BASE, LEGACY_API, PUBLIC_URL, REMOTE_ROOT, TOOL_ROOT,
+  API_BASE, LEGACY_API, PRODUCTION_API, PUBLIC_URL, REMOTE_ROOT, TOOL_ROOT,
   adminHelperSource, commandFailureMessage, importPackage, loadConfig, normalizeAdminArtifact, parseArgs,
 } from '../admin-frontend/admin-frontend-release.mjs'
 
@@ -91,6 +91,14 @@ test('旧测试 API 在派生副本中改为同源，并删除失效的 gzip/bro
 
 test('已使用同源 API 的新包可直接导入，无需再次改前端', () => fixture((root) => {
   assert.equal(normalizeAdminArtifact(artifact(root, API_BASE)).rewrites, 0)
+}))
+
+test('正式构建包发布到测试服时只把已确认的正式后台 API 改为测试同源', () => fixture((root) => {
+  const output = artifact(root, PRODUCTION_API)
+  const result = normalizeAdminArtifact(output)
+  assert.equal(result.rewrites, 1)
+  assert.match(readFileSync(join(output, 'assets/index-Hash123.js'), 'utf8'), /"\/admin-api\/api\/v1"/)
+  assert.doesNotMatch(readFileSync(join(output, 'assets/index-Hash123.js'), 'utf8'), /admin\.yinlizhangyu\.com/)
 }))
 
 test('业务 H5、其他 API、SourceMap 和隐藏密钥均被后台产物门禁拒绝', () => {

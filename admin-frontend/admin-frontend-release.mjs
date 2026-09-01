@@ -24,6 +24,7 @@ export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const PUBLIC_URL = 'https://admin-test.yinlizhangyu.com'
 export const REMOTE_ROOT = '/srv/loumai-admin-frontend'
 export const LEGACY_API = 'https://test.yinlizhangyu.com/admin-api/api/v1'
+export const PRODUCTION_API = 'https://admin.yinlizhangyu.com/admin-api/api/v1'
 export const API_BASE = '/admin-api/api/v1'
 const CONFIG = join(TOOL_ROOT, 'config/admin-frontend.test.local.env')
 const REMOTE_HELPER = '/usr/local/sbin/loumai-admin-frontend-release'
@@ -190,7 +191,11 @@ function serverSetup(config, action) {
 
 export function normalizeAdminArtifact(outputDir, config = { environment: 'test', publicUrl: PUBLIC_URL }) {
   const production = config.environment === 'production'
-  const allowedEndpoints = production ? [`${config.publicUrl}${API_BASE}`] : [LEGACY_API, `${PUBLIC_URL}${API_BASE}`]
+  // A production build may be promoted to the test site, but its API must never
+  // remain pointed at production. Only the two pinned, owned origins are rewritten.
+  const allowedEndpoints = production
+    ? [`${config.publicUrl}${API_BASE}`]
+    : [LEGACY_API, `${PUBLIC_URL}${API_BASE}`, PRODUCTION_API]
   const files = validateExternalPackageArtifact(outputDir)
   if (!readFileSync(join(outputDir, 'index.html'), 'utf8').includes('<title>工位有方管理后台</title>')) {
     fail('这不是工位有方管理后台包；拒绝把业务 H5 或其他站点当后台部署')
