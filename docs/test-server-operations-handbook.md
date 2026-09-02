@@ -397,7 +397,7 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 - Git/release 负责“程序支持哪些变量”。
 - `/etc/loumai/backend.env` 负责“测试服使用什么值”。
 - `/etc/loumai/sms.env` 负责短信敏感配置。
-- `loumai-app-push-dispatcher.timer` 每分钟处理预约、离线推送和审核结果短信；测试服发布器必须把它与对应 oneshot service 一并纳管。
+- `loumai-app-push-dispatcher.timer` 每 15 秒处理预约、离线推送和审核结果短信；测试服发布器必须把它与对应 oneshot service 一并纳管。
 
 因此，后端一键发布不会上传本地 `.env`。这是安全设计，不是漏功能。
 

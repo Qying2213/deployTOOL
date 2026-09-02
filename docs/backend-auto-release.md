@@ -206,7 +206,7 @@ rm -f \
   /tmp/loumai-app-push-dispatcher.timer
 ```
 
-测试服发布门禁会核对 cleanup 与 app-push-dispatcher 两组 service/timer 均已安装且 timer 持续启用；这不是仅写在模板里的可选项。前者负责把取消上传和超过 24 小时仍未引用的附件推进到物理删除，后者每分钟处理预约、离线推送和审核结果短信任务。
+测试服发布门禁会核对 cleanup 与 app-push-dispatcher 两组 service/timer 均已安装且 timer 持续启用；这不是仅写在模板里的可选项。前者负责把取消上传和超过 24 小时仍未引用的附件推进到物理删除，后者每 15 秒处理预约、离线推送和审核结果短信任务。
 
 安装后分别核对本机文件和服务器已安装文件的 SHA256；两边必须完全相同：
 

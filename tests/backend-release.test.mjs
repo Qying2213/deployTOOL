@@ -1080,14 +1080,14 @@ test('测试服 systemd 模板纳管文件存储清理并保留本地存储写�
 	assert.match(timer, /^WantedBy=timers\.target$/m)
 })
 
-test('测试服 systemd 模板每分钟执行通知调度并加载短信配置', () => {
+test('测试服 systemd 模板每 15 秒执行通知调度并加载短信配置', () => {
 	const unit = (name) => readFileSync(join(TOOL_ROOT, `backend/remote/${name}`), 'utf8')
 	const service = unit('loumai-app-push-dispatcher.service.example')
 	const timer = unit('loumai-app-push-dispatcher.timer.example')
 	assert.match(service, /^User=ubuntu$/m)
 	assert.match(service, /^EnvironmentFile=\/etc\/loumai\/sms\.env$/m)
 	assert.match(service, /^ExecStart=.*scripts\/run_app_push_dispatcher\.py$/m)
-	assert.match(timer, /^OnCalendar=\*-\*-\* \*:\*:00$/m)
+	assert.match(timer, /^OnCalendar=\*-\*-\* \*:\*:00\/15$/m)
 	assert.doesNotMatch(timer, /^OnUnitActiveSec=/m)
 	assert.match(timer, /^Unit=loumai-app-push-dispatcher\.service$/m)
 	assert.match(timer, /^Persistent=true$/m)
