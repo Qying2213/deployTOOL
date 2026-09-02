@@ -6,7 +6,7 @@ Description=Run Loumai test push and appointment jobs every 15 seconds
 # active(elapsed) after a deployment stops and restarts both the timer and its
 # oneshot service, leaving newly-created notification jobs unprocessed.
 OnCalendar=*-*-* *:*:00/15
-AccuracySec=5s
+AccuracySec=1s
 Persistent=true
 Unit=loumai-app-push-dispatcher.service
 

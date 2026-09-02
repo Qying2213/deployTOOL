@@ -1088,6 +1088,7 @@ test('测试服 systemd 模板每 15 秒执行通知调度并加载短信配置'
 	assert.match(service, /^EnvironmentFile=\/etc\/loumai\/sms\.env$/m)
 	assert.match(service, /^ExecStart=.*scripts\/run_app_push_dispatcher\.py$/m)
 	assert.match(timer, /^OnCalendar=\*-\*-\* \*:\*:00\/15$/m)
+	assert.match(timer, /^AccuracySec=1s$/m)
 	assert.doesNotMatch(timer, /^OnUnitActiveSec=/m)
 	assert.match(timer, /^Unit=loumai-app-push-dispatcher\.service$/m)
 	assert.match(timer, /^Persistent=true$/m)
