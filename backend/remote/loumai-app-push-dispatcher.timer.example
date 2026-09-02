@@ -2,8 +2,10 @@
 Description=Run Loumai test push and appointment jobs every minute
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
+# Use an explicit wall-clock schedule. Relative OnUnitActiveSec may remain in
+# active(elapsed) after a deployment stops and restarts both the timer and its
+# oneshot service, leaving newly-created notification jobs unprocessed.
+OnCalendar=*-*-* *:*:00
 AccuracySec=5s
 Persistent=true
 Unit=loumai-app-push-dispatcher.service
