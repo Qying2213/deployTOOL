@@ -15,6 +15,7 @@ import test from 'node:test'
 
 import {
 	createReleaseId,
+	defaultExpectedBranch,
 	DEFAULT_CONFIG_PATH,
 	DEFAULT_CONSTRAINTS_PATH,
 	helperSyncInstallerSource,
@@ -168,6 +169,11 @@ test('发布参数默认保守，并要求回滚数据库兼容确认', () => {
 	)
 	assert.throws(() => parseArgs(['status', '--env', 'staging']), /不支持的部署环境/)
 	assert.throws(() => main(['env-audit', '--yes']), /只读命令/)
+})
+
+test('测试服默认只取 test 分支，正式服继续取 master 分支', () => {
+	assert.equal(defaultExpectedBranch('test'), 'test')
+	assert.equal(defaultExpectedBranch('production'), 'master')
 })
 
 test('状态查询兼容旧 helper 且不会伪造数据库 profile', () => {
@@ -904,7 +910,9 @@ test('前后端分离配置模板不保存凭据内容，并声明后端仓库�
 		assert.doesNotMatch(template, /(?:PASSWORD|TOKEN|PRIVATE_KEY|ACCESS_KEY)=/)
 	}
 	assert.match(localTemplate, /^BACKEND_ENVIRONMENT=test$/m)
+	assert.match(localTemplate, /^BACKEND_EXPECTED_BRANCH=test$/m)
 	assert.match(productionLocalTemplate, /^BACKEND_ENVIRONMENT=production$/m)
+	assert.match(productionLocalTemplate, /^BACKEND_EXPECTED_BRANCH=master$/m)
 	assert.match(productionLocalTemplate, /^BACKEND_PUBLIC_URL=https:\/\/api\.yinlizhangyu\.com$/m)
 	assert.match(remoteTemplate, /^LOUMAI_BACKEND_ENVIRONMENT=test$/m)
 	assert.match(productionRemoteTemplate, /^LOUMAI_BACKEND_ENVIRONMENT=production$/m)

@@ -49,6 +49,8 @@
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy --yes
 ```
 
+测试服后端固定从 `loumai-ai` 的 `test` 分支发布；正式服固定从 `master` 分支发布。发布器会在打包前校验当前分支、工作区和 `origin/test`，不满足时直接停止。
+
 上面这条旧命令继续使用测试服务器本机 PostgreSQL。需要把同一套测试服后端切换为腾讯云 PostgreSQL 时，使用另一条明确命名的命令。建议显式携带 `--sync-helper`：helper 已一致时不会替换，只有发现不一致才执行安全备份和原子同步。
 
 ```bash
@@ -86,6 +88,11 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 ### 2.1 发布后端
 
 ```bash
+cd /Users/qinyang/Desktop/zuling/loumai-ai
+git switch test
+git pull --ff-only origin test
+
+cd /Users/qinyang/Desktop/zuling/deploy--loumai
 ./loumai-deploy backend env-audit --env test
 ./loumai-deploy backend status
 ./loumai-deploy backend deploy --dry-run

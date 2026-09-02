@@ -297,7 +297,7 @@ git rev-list --left-right --count HEAD...@{upstream}
 必须满足：
 
 1. 没有未提交文件。
-2. 当前分支正确。
+2. 当前分支为 `test`，且测试服发布配置的 `BACKEND_EXPECTED_BRANCH=test`。
 3. Commit 已推送，上下游差异为 `0 0`。
 4. Alembic 只有一个 head。
 5. 代码测试通过。

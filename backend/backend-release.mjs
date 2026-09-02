@@ -37,7 +37,9 @@ export const PRODUCTION_CONSTRAINTS_PATH = join(
 	'backend/runtime-constraints.production.txt'
 )
 
-const DEFAULT_EXPECTED_BRANCH = 'master'
+const DEFAULT_TEST_EXPECTED_BRANCH = 'test'
+const DEFAULT_PRODUCTION_EXPECTED_BRANCH = 'master'
+const DEPLOY_TOOL_EXPECTED_BRANCH = 'master'
 const DEFAULT_REMOTE_HELPER = '/usr/local/sbin/loumai-backend-release'
 const HELPER_SYNC_INSTALLER_PATH = join(
 	TOOL_ROOT,
@@ -158,6 +160,12 @@ export function parseDotEnv(text = '') {
 		result[match[1]] = value
 	})
 	return result
+}
+
+export function defaultExpectedBranch(environment) {
+	return environment === 'production'
+		? DEFAULT_PRODUCTION_EXPECTED_BRANCH
+		: DEFAULT_TEST_EXPECTED_BRANCH
 }
 
 function loadDotEnvFile(path, { required = true } = {}) {
@@ -350,7 +358,7 @@ export function loadConfiguration(args, { requireRemote = false } = {}) {
 	const config = {
 		constraintsPath,
 		environment: configuredEnvironment,
-		expectedBranch: values.BACKEND_EXPECTED_BRANCH || DEFAULT_EXPECTED_BRANCH,
+		expectedBranch: values.BACKEND_EXPECTED_BRANCH || defaultExpectedBranch(args.environment),
 		helperSyncEnabled: normalizeBoolean(values.BACKEND_TEST_HELPER_SYNC_ENABLED, false),
 		identityFile: expandHome(values.BACKEND_SSH_IDENTITY_FILE || ''),
 		publicUrl: String(values.BACKEND_PUBLIC_URL || '').replace(/\/+$/, ''),
@@ -691,8 +699,8 @@ function remoteRootScript(config, source, args, { capture = false } = {}) {
 function inspectDeploymentToolGitState() {
 	const branch = git(TOOL_ROOT, ['branch', '--show-current'])
 	const commit = git(TOOL_ROOT, ['rev-parse', 'HEAD'])
-	if (branch !== DEFAULT_EXPECTED_BRANCH) {
-		fail(`同步 helper 前部署工具必须位于 ${DEFAULT_EXPECTED_BRANCH} 分支，当前是 ${branch || '(detached)'}`)
+	if (branch !== DEPLOY_TOOL_EXPECTED_BRANCH) {
+		fail(`同步 helper 前部署工具必须位于 ${DEPLOY_TOOL_EXPECTED_BRANCH} 分支，当前是 ${branch || '(detached)'}`)
 	}
 	if (!/^[0-9a-f]{40}$/.test(commit)) fail('无法取得部署工具完整 Git commit')
 	if (git(TOOL_ROOT, ['status', '--porcelain'])) {

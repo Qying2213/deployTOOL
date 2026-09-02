@@ -577,7 +577,7 @@ chmod 600 config/backend.test.local.env
 BACKEND_REPO=/Users/qinyang/Desktop/zuling/loumai-ai
 BACKEND_PYTHON_BIN=/Users/qinyang/Desktop/zuling/loumai-ai/.venv311/bin/python
 BACKEND_RUNTIME_CONSTRAINTS=/Users/qinyang/Desktop/zuling/deploy--loumai/backend/runtime-constraints.test.txt
-BACKEND_EXPECTED_BRANCH=master
+BACKEND_EXPECTED_BRANCH=test
 BACKEND_REQUIRE_UPSTREAM_MATCH=true
 
 BACKEND_DEPLOY_TARGET=ubuntu@132.232.220.115
@@ -623,7 +623,7 @@ git rev-parse '@{upstream}'
 
 正式发布要求：
 
-- 当前分支等于 `BACKEND_EXPECTED_BRANCH`；
+- 测试服当前分支必须等于 `BACKEND_EXPECTED_BRANCH=test`；正式服仍为 `master`；
 - 没有未提交或未跟踪文件，也没有进行中的 merge、rebase 或 cherry-pick；
 - `HEAD` 与 `@{upstream}` 完全相同，即代码已经提交并推送；
 - 本地 `.venv311` 可运行 Ruff、Alembic、影子库脚本和 pytest；
