@@ -156,8 +156,8 @@ LOUMAI_BACKEND_DATABASE_NAME=loumai_test_server
 LOUMAI_BACKEND_BACKUP_ROOT=/var/backups/loumai
 # 视频 Worker 一次性安装完成前先保持两项；4.1 节完成后再改为三项。
 LOUMAI_BACKEND_SERVICES="loumai-im-worker.service loumai-api.service"
-LOUMAI_BACKEND_TIMERS="loumai-file-storage-cleanup.timer"
-LOUMAI_BACKEND_ONESHOT_SERVICES="loumai-file-storage-cleanup.service"
+LOUMAI_BACKEND_TIMERS="loumai-file-storage-cleanup.timer loumai-app-push-dispatcher.timer"
+LOUMAI_BACKEND_ONESHOT_SERVICES="loumai-file-storage-cleanup.service loumai-app-push-dispatcher.service"
 LOUMAI_BACKEND_VIDEO_SERVICE=loumai-video-worker.service
 LOUMAI_BACKEND_FFMPEG_BIN=/opt/loumai-runtime/ffmpeg/bin/ffmpeg
 LOUMAI_BACKEND_FFPROBE_BIN=/opt/loumai-runtime/ffmpeg/bin/ffprobe
@@ -182,19 +182,31 @@ sudo install -m 0644 -o root -g root \
 sudo install -m 0644 -o root -g root \
   /tmp/loumai-file-storage-cleanup.timer \
   /etc/systemd/system/loumai-file-storage-cleanup.timer
+sudo install -m 0644 -o root -g root \
+  /tmp/loumai-app-push-dispatcher.service \
+  /etc/systemd/system/loumai-app-push-dispatcher.service
+sudo install -m 0644 -o root -g root \
+  /tmp/loumai-app-push-dispatcher.timer \
+  /etc/systemd/system/loumai-app-push-dispatcher.timer
 sudo systemctl daemon-reload
 sudo systemd-analyze verify \
   /etc/systemd/system/loumai-file-storage-cleanup.service \
-  /etc/systemd/system/loumai-file-storage-cleanup.timer
-sudo systemctl enable --now loumai-file-storage-cleanup.timer
+  /etc/systemd/system/loumai-file-storage-cleanup.timer \
+  /etc/systemd/system/loumai-app-push-dispatcher.service \
+  /etc/systemd/system/loumai-app-push-dispatcher.timer
+sudo systemctl enable --now \
+  loumai-file-storage-cleanup.timer \
+  loumai-app-push-dispatcher.timer
 rm -f \
   /tmp/loumai-backend-release \
   /tmp/backend-release.env \
   /tmp/loumai-file-storage-cleanup.service \
-  /tmp/loumai-file-storage-cleanup.timer
+  /tmp/loumai-file-storage-cleanup.timer \
+  /tmp/loumai-app-push-dispatcher.service \
+  /tmp/loumai-app-push-dispatcher.timer
 ```
 
-测试服发布门禁会核对 cleanup service/timer 已安装且 timer 持续启用；这不是仅写在模板里的可选项。它负责把取消上传和超过 24 小时仍未引用的附件推进到物理删除。
+测试服发布门禁会核对 cleanup 与 app-push-dispatcher 两组 service/timer 均已安装且 timer 持续启用；这不是仅写在模板里的可选项。前者负责把取消上传和超过 24 小时仍未引用的附件推进到物理删除，后者每分钟处理预约、离线推送和审核结果短信任务。
 
 安装后分别核对本机文件和服务器已安装文件的 SHA256；两边必须完全相同：
 

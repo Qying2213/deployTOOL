@@ -1,0 +1,31 @@
+[Unit]
+Description=Loumai Test Push and Appointment Jobs
+After=network-online.target loumai-api.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/srv/loumai-backend/backend-current
+EnvironmentFile=/etc/loumai/backend.env
+EnvironmentFile=/etc/loumai/sms.env
+EnvironmentFile=/etc/loumai/database-active.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python scripts/run_app_push_dispatcher.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=64

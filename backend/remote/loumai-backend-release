@@ -210,6 +210,10 @@ validate_units() {
     || fail "所有环境都必须纳管 loumai-file-storage-cleanup.service"
   [[ " ${TIMERS[*]} " == *" loumai-file-storage-cleanup.timer "* ]] \
     || fail "所有环境都必须纳管 loumai-file-storage-cleanup.timer"
+  [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-app-push-dispatcher.service "* ]] \
+    || fail "所有环境都必须纳管 loumai-app-push-dispatcher.service"
+  [[ " ${TIMERS[*]} " == *" loumai-app-push-dispatcher.timer "* ]] \
+    || fail "所有环境都必须纳管 loumai-app-push-dispatcher.timer"
   if [[ "$ENVIRONMENT" == "production" ]]; then
     # An installed/active production admin writer cannot be silently omitted.
     if [[ -L /srv/loumai-company-management-production/current ]] \
@@ -218,12 +222,8 @@ validate_units() {
       [[ " ${AUXILIARY_DATABASE_SERVICES[*]} " == *" loumai-company-management.service "* ]] \
         || fail "正式管理后台 writer 未纳入数据库停写栅栏"
     fi
-    [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-app-push-dispatcher.service "* ]] \
-      || fail "正式服必须纳管 loumai-app-push-dispatcher.service"
     [[ " ${ONESHOT_SERVICES[*]} " == *" loumai-rent-billing.service "* ]] \
       || fail "正式服必须纳管 loumai-rent-billing.service"
-    [[ " ${TIMERS[*]} " == *" loumai-app-push-dispatcher.timer "* ]] \
-      || fail "正式服必须纳管 loumai-app-push-dispatcher.timer"
     [[ " ${TIMERS[*]} " == *" loumai-rent-billing.timer "* ]] \
       || fail "正式服必须纳管 loumai-rent-billing.timer"
   fi
