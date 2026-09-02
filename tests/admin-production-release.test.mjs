@@ -86,6 +86,7 @@ test('正式后台配置强制 Git 源码、明确分支、独立目标和管理
   assert.equal(config.root, ADMIN_BACKEND_ROOT)
   assert.match(config.constraints, /runtime-constraints.production.txt$/)
   assert.throws(() => backendConfig(writeEnv(root, { ...values, ADMIN_BACKEND_EXPECTED_BRANCH: '' }), 'production'))
+  assert.throws(() => backendConfig(writeEnv(root, { ...values, ADMIN_BACKEND_EXPECTED_BRANCH: 'test' }), 'production'), /固定从 master 分支/)
   assert.throws(() => backendConfig(writeEnv(root, { ...values, DATABASE_URL: 'not-real' }), 'production'))
 }))
 

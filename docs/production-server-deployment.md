@@ -187,7 +187,7 @@ chmod 600 config/backend.production.local.env config/frontend.production.local.e
 
 在忽略的本机文件中填写 `loumai-deploy@正式服地址`、SSH key、源码绝对路径、正式域名和分支。不要填写数据库 URL、口令或 AccessKey。
 
-后端正式源码必须位于 `master`（或经评审后同步修改 `BACKEND_EXPECTED_BRANCH`），工作区干净且 `HEAD` 等于 upstream。
+后端正式源码必须位于 `master`，工作区干净且 `HEAD` 等于 upstream；测试服后端固定使用 `test`。
 
 前端仓库的 `.env.production` 目前仍是测试配置，必须先改成并提交：
 

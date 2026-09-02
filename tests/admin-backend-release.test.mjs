@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { parseArgs, parseDotEnv } from '../admin-backend/admin-backend-release.mjs'
+import { inspectTestGit, parseArgs, parseDotEnv } from '../admin-backend/admin-backend-release.mjs'
 
 const helper = readFileSync(new URL('../admin-backend/remote/loumai-company-management-release', import.meta.url), 'utf8')
 const runner = readFileSync(new URL('../admin-backend/remote/loumai-company-management-run', import.meta.url), 'utf8')
@@ -47,6 +47,15 @@ test('服务器 helper 使用全局锁、CAS、哈希、原子切换和失败恢
 test('构建产物排除 macOS 元数据并禁止 tar 生成 AppleDouble 文件', () => {
   assert.match(localRelease, /entry\.name\.startsWith\('\._'\)/)
   assert.match(localRelease, /COPYFILE_DISABLE: '1'/)
+})
+
+test('测试服后台后端固定校验 test 分支、干净工作区和 upstream', () => {
+  const template = readFileSync(new URL('../config/admin-backend.test.example.env', import.meta.url), 'utf8')
+  assert.match(template, /^ADMIN_BACKEND_EXPECTED_BRANCH=test$/m)
+  assert.equal(typeof inspectTestGit, 'function')
+  assert.match(localRelease, /status', '--porcelain/)
+  assert.match(localRelease, /branch', '--show-current/)
+  assert.match(localRelease, /rev-parse', '@\{upstream\}/)
 })
 
 test('管理后台随活动数据库 profile 且使用独立受控运行时', () => {

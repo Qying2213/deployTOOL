@@ -27,6 +27,7 @@ import {
 	remoteHelperContractSource,
 	shellQuote,
 	TOOL_ROOT,
+	validateExpectedBranch,
 	validateRuntimeConstraints,
 	validateSourceArtifact
 } from '../backend/backend-release.mjs'
@@ -174,6 +175,10 @@ test('发布参数默认保守，并要求回滚数据库兼容确认', () => {
 test('测试服默认只取 test 分支，正式服继续取 master 分支', () => {
 	assert.equal(defaultExpectedBranch('test'), 'test')
 	assert.equal(defaultExpectedBranch('production'), 'master')
+	assert.equal(validateExpectedBranch('test', 'test'), 'test')
+	assert.equal(validateExpectedBranch('production', 'master'), 'master')
+	assert.throws(() => validateExpectedBranch('test', 'master'), /测试服后端固定从 test 分支/)
+	assert.throws(() => validateExpectedBranch('production', 'test'), /正式服后端固定从 master 分支/)
 })
 
 test('状态查询兼容旧 helper 且不会伪造数据库 profile', () => {

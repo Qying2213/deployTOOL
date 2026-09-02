@@ -114,6 +114,8 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 
 #### 独立发布管理后台后端
 
+管理后台后端测试服同样固定从 `conpanyManagement` 的 `test` 分支发布，并要求工作区干净、提交与 `origin/test` 一致。
+
 业务后端切换 local/cloud 数据库时会统一停启并校验管理后台；管理后台代码本身使用独立版本链发布：
 
 ```bash

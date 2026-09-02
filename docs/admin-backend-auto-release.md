@@ -2,7 +2,7 @@
 
 本文原有命令默认发布测试服。正式服已新增独立配置、helper、数据库 DML 角色及联合入口，见 [管理后台前后端正式服一键发布](admin-production-release.md)。正式服不要复用本页的测试安装器；必须显式 `--env production`。
 
-更新时间：2026-08-28
+更新时间：2026-09-02
 
 ## 1. 当前部署结构
 
@@ -18,6 +18,8 @@
 测试服始终只有一套管理后台进程。该进程读取 `/etc/loumai/database-active.env`，跟随业务后端当前的 `local` 或 `cloud` 数据库 profile，不会同时启动一套连本机库、一套连云数据库。
 
 ## 2. 一键发布
+
+测试服只接受 `conpanyManagement` 的 `test` 分支；发布前会校验工作区干净、没有进行中的 Git 操作，并要求 `HEAD` 与 `origin/test` 完全一致。正式服继续固定为 `master`。
 
 发布到测试服：
 

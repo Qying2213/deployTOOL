@@ -33,7 +33,7 @@ export function loadProductionConfig(path, parseDotEnv) {
   const pythonBin = raw.ADMIN_BACKEND_PYTHON_BIN || join(source, '.venv/bin/python')
   if (!existsSync(pythonBin)) throw new Error('管理后台测试 Python 不存在')
   const expectedBranch = raw.ADMIN_BACKEND_EXPECTED_BRANCH || ''
-  if (!expectedBranch || /\s/.test(expectedBranch)) throw new Error('必须明确正式发布分支')
+  if (expectedBranch !== 'master') throw new Error('正式服管理后台后端固定从 master 分支发布')
   return { ...productionSsh(raw, 'ADMIN_BACKEND'), source, pythonBin, expectedBranch,
     environment: 'production', publicUrl: `${origin}/admin-api`, origin,
     root: ADMIN_BACKEND_ROOT, helper: ADMIN_BACKEND_HELPER,

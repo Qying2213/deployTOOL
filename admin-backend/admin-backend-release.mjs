@@ -83,7 +83,11 @@ export function loadConfig(path, environment = 'test') {
   if (environment === 'production') return loadProductionConfig(path, parseDotEnv)
   if (!existsSync(path)) fail(`找不到配置：${path}\n请复制 config/admin-backend.test.example.env`)
   const raw = parseDotEnv(readFileSync(path, 'utf8'))
+  const expectedBranch = raw.ADMIN_BACKEND_EXPECTED_BRANCH || 'test'
+  if (expectedBranch !== 'test') fail('测试服管理后台后端固定从 test 分支发布')
   const config = {
+    environment: 'test',
+    expectedBranch,
     source: realpathSync(expandHome(raw.ADMIN_BACKEND_SOURCE || required(raw, 'ADMIN_BACKEND_REPO'))),
     target: required(raw, 'ADMIN_BACKEND_DEPLOY_TARGET'),
     port: Number(raw.ADMIN_BACKEND_SSH_PORT || 22),
@@ -98,6 +102,22 @@ export function loadConfig(path, environment = 'test') {
   if (!existsSync(config.identity) || !lstatSync(config.identity).isFile()) fail('SSH 私钥不存在')
   if (!existsSync(join(config.source, 'app/main.py')) || !existsSync(join(config.source, 'pyproject.toml'))) fail('管理后台源码目录不完整')
   return config
+}
+
+export function inspectTestGit(config) {
+  const git = (args) => run('git', ['--no-pager', ...args], { cwd: config.source, capture: true })
+  if (git(['status', '--porcelain'])) fail('测试服管理后台源码工作区不干净')
+  const branch = git(['branch', '--show-current'])
+  if (branch !== config.expectedBranch) fail(`测试服管理后台分支必须为 ${config.expectedBranch}`)
+  for (const marker of ['MERGE_HEAD', 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD']) {
+    const path = git(['rev-parse', '--git-path', marker])
+    if (existsSync(path.startsWith('/') ? path : join(config.source, path))) fail('Git 操作尚未完成')
+  }
+  const commit = git(['rev-parse', 'HEAD'])
+  if (!/^[a-f0-9]{40}$/.test(commit) || git(['rev-parse', '@{upstream}']) !== commit) {
+    fail('测试服管理后台提交必须与 upstream 一致')
+  }
+  return { commit, branch }
 }
 
 function run(command, args, options = {}) {
@@ -170,14 +190,13 @@ function writeChecksums(root) {
 export function build(config, { skipTests = false } = {}) {
   const production = config.environment === 'production'
   if (production && skipTests) fail('正式服禁止 --skip-tests')
-  const gitState = production ? inspectProductionGit(config) : null
+  const inspectGit = production ? inspectProductionGit : inspectTestGit
+  const gitState = inspectGit(config)
   quality(config, skipTests)
   mkdirSync(DIST, { recursive: true, mode: 0o755 })
   const list = files(config.source); const sourceSha = sourceHash(config.source, list); const id = releaseId(sourceSha)
-  if (production) {
-    const tracked = new Set(run('git', ['ls-tree', '-r', '--name-only', gitState.commit], { cwd: config.source, capture: true }).split('\n'))
-    if (list.some((path) => !tracked.has(relative(config.source, path)))) fail('正式发布不能包含未纳入 Git commit 的源码文件（包括 ignored 文件）')
-  }
+  const tracked = new Set(run('git', ['ls-tree', '-r', '--name-only', gitState.commit], { cwd: config.source, capture: true }).split('\n'))
+  if (list.some((path) => !tracked.has(relative(config.source, path)))) fail('发布不能包含未纳入 Git commit 的源码文件（包括 ignored 文件）')
   const releaseRoot = join(DIST, id); const backend = join(releaseRoot, 'backend')
   if (existsSync(releaseRoot)) fail('版本目录已存在，请稍后重试；不会覆盖历史产物')
   mkdirSync(backend, { recursive: true, mode: 0o755 })
@@ -185,9 +204,9 @@ export function build(config, { skipTests = false } = {}) {
     if (/(^|\/)(\.[^/]+|[^/]+\.(pem|key|p12|pfx|sql|sqlite|db|bak))$/i.test(relative(config.source, path))) fail('正式源码包含隐藏或敏感文件')
   }
   for (const path of list) { const dest = join(backend, relative(config.source, path)); mkdirSync(dirname(dest), { recursive: true }); cpSync(path, dest) }
-  if (production && (sourceHash(backend, files(backend)) !== sourceSha || inspectProductionGit(config).commit !== gitState.commit)) fail('测试或复制期间源码发生变化，拒绝发布')
+  if (sourceHash(backend, files(backend)) !== sourceSha || inspectGit(config).commit !== gitState.commit) fail('测试或复制期间源码发生变化，拒绝发布')
   cpSync(config.constraints || join(TOOL_ROOT, 'admin-backend/runtime-constraints.test.txt'), join(backend, 'runtime-constraints.txt'))
-  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, environment: config.environment || 'test', ...(gitState || {}), built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: production ? '4' : '1' } }
+  const manifest = { schema_version: 1, release_id: id, source_sha256: sourceSha, environment: config.environment, ...gitState, built_at: new Date().toISOString(), source_file_count: list.length, tool: { admin_backend_release_tool: production ? '4' : '1' } }
   writeFileSync(join(backend, 'release.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   writeChecksums(backend)
   const archive = join(releaseRoot, 'backend.tar')

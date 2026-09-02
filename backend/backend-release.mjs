@@ -168,6 +168,14 @@ export function defaultExpectedBranch(environment) {
 		: DEFAULT_TEST_EXPECTED_BRANCH
 }
 
+export function validateExpectedBranch(environment, branch) {
+	const expected = defaultExpectedBranch(environment)
+	if (branch !== expected) {
+		fail(`${environment === 'production' ? '正式服' : '测试服'}后端固定从 ${expected} 分支发布`)
+	}
+	return branch
+}
+
 function loadDotEnvFile(path, { required = true } = {}) {
 	if (!existsSync(path)) {
 		if (required) fail(`找不到配置文件：${path}`)
@@ -358,7 +366,10 @@ export function loadConfiguration(args, { requireRemote = false } = {}) {
 	const config = {
 		constraintsPath,
 		environment: configuredEnvironment,
-		expectedBranch: values.BACKEND_EXPECTED_BRANCH || defaultExpectedBranch(args.environment),
+		expectedBranch: validateExpectedBranch(
+			args.environment,
+			values.BACKEND_EXPECTED_BRANCH || defaultExpectedBranch(args.environment)
+		),
 		helperSyncEnabled: normalizeBoolean(values.BACKEND_TEST_HELPER_SYNC_ENABLED, false),
 		identityFile: expandHome(values.BACKEND_SSH_IDENTITY_FILE || ''),
 		publicUrl: String(values.BACKEND_PUBLIC_URL || '').replace(/\/+$/, ''),
