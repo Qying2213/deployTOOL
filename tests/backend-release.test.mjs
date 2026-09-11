@@ -1059,6 +1059,9 @@ test('正式服 systemd 合同隔离 UID、固定时区并完整纳管三个 tim
 		assert.match(timer, new RegExp(`^Unit=${base.replaceAll('-', '\\-')}\\.service$`, 'm'))
 		assert.match(timer, /^WantedBy=timers\.target$/m)
 	}
+	const dispatcherTimer = unit('loumai-app-push-dispatcher.production.timer.example')
+	assert.match(dispatcherTimer, /^OnCalendar=\*-\*-\* \*:\*:00$/m)
+	assert.doesNotMatch(dispatcherTimer, /^OnUnitActiveSec=/m)
 	assert.match(productionGuide, /groupadd --system loumai-db-ca/)
 	for (const user of ['loumai-api', 'loumai-video', 'loumai-im', 'loumai-jobs', 'loumai-migrate', 'loumai-backup']) {
 		assert.match(productionGuide, new RegExp(`usermod --append --groups loumai-db-ca ${user}`))

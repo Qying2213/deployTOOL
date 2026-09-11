@@ -159,6 +159,8 @@ PROPERTY_VIDEO_DIRECT_UPLOAD_ENABLED=false
 - `loumai-rent-billing.service/.timer`
 - `loumai-file-storage-cleanup.service/.timer`
 
+通知调度 timer 使用每分钟一次的显式 `OnCalendar`。发布过程会同时停止并重启 timer 与 oneshot service；不能改回相对的 `OnUnitActiveSec`，否则 timer 可能停留在 `active (elapsed)` 且没有下一次执行时间。
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl disable --now \
