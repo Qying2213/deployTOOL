@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readExpiryPlan, observeNotificationAcceptance } from './notification-health.mjs'
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -218,6 +219,10 @@ export function parseArgs(argv = []) {
 				configPathExplicit = true
 				break
 			}
+			case '--notification-expiry-plan':
+				args.notificationExpiryPlan = values.shift()
+				if (!args.notificationExpiryPlan || args.notificationExpiryPlan.startsWith('-')) fail('--notification-expiry-plan 缺少 JSON 文件')
+				break
 			case '--dry-run':
 				args.dryRun = true
 				break
@@ -289,6 +294,8 @@ function usage() {
   node backend/backend-release.mjs deploy-cloud --env test --yes [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --sync-helper --yes [--config FILE]
   node backend/backend-release.mjs sync-helper --env test --yes [--config FILE]
+  node backend/backend-release.mjs notification-status --env test|production [--config FILE]
+  node backend/backend-release.mjs deploy --env test|production --notification-expiry-plan PLAN.json --yes
   node backend/backend-release.mjs status --env test|production [--database-profile local|cloud|active] [--config FILE]
   node backend/backend-release.mjs rollback --env test|production --release RELEASE_ID --ack-db-schema-compatible --yes [--config FILE]
 
@@ -1008,6 +1015,26 @@ function showRemoteStatus(config, databaseProfile = 'active') {
 	fail(`远端 helper 版本不一致：实际 ${version || '(empty)'}，要求 ${BACKEND_RELEASE_TOOL_VERSION}`)
 }
 
+function notificationSnapshot(config) {
+    const output = remoteHelper(config, ['notification-status'], { capture: true }).stdout
+    const values = parseKeyValueOutput(output)
+    if (values.ENVIRONMENT !== config.environment) fail('通知健康目标环境不匹配')
+    process.stdout.write(output)
+    return values
+}
+
+function verifyNotificationAcceptance(config) {
+    info('核心服务已恢复；最多被动观察 19 次通知调度完成记录，间隔 10 秒，不主动触发发送')
+    const result = observeNotificationAcceptance({
+        sample: () => notificationSnapshot(config),
+        sleep: milliseconds => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+    })
+    if (result.RELEASE_ACCEPTANCE !== 'PASSED') {
+        warn('核心版本已激活，通知专项验收未通过或待完成；服务保持运行，不自动回滚或停写')
+        process.exitCode = 2
+    }
+}
+
 function uploadArchive(config, releaseId, archivePath, stageDir) {
 	const expectedStage = `${config.remoteStagingRoot}/${releaseId}.partial`
 	if (stageDir !== expectedStage) fail(`远端 staging 路径异常：${stageDir}`)
@@ -1025,7 +1052,7 @@ function uploadArchive(config, releaseId, archivePath, stageDir) {
 	run('scp', args)
 }
 
-function deploy(config, gitState, artifactDbHead, databaseProfile, { mode = 'deploy' } = {}) {
+function deploy(config, gitState, artifactDbHead, databaseProfile, { mode = 'deploy', notificationPlan = 'NONE' } = {}) {
 	const preflight = remotePreflight(config, databaseProfile, { mode })
 	const artifact = buildRelease(config, gitState, artifactDbHead)
 	let prepared = false
@@ -1050,10 +1077,12 @@ function deploy(config, gitState, artifactDbHead, databaseProfile, { mode = 'dep
 			preflight.DB_REVISION,
 			databaseProfile,
 			mode,
-			preflight.RECOVERY_TOKEN
+			preflight.RECOVERY_TOKEN,
+			...(notificationPlan === 'NONE' ? [] : [notificationPlan])
 		])
 		prepared = false
-		info(`发布完成：${artifact.releaseId}`)
+		info(`核心版本激活完成：${artifact.releaseId}`)
+		verifyNotificationAcceptance(config)
 	} finally {
 		if (prepared) tryRemoteAbort(config, artifact.releaseId)
 	}
@@ -1069,6 +1098,7 @@ function rollback(config, args) {
 		preflight.DB_REVISION,
 		'ACK_DB_SCHEMA_COMPATIBLE'
 	])
+	verifyNotificationAcceptance(config)
 }
 
 function inspectLocalSettings(config) {
@@ -1185,10 +1215,13 @@ export function main(argv = process.argv.slice(2)) {
 	}
 	if (![
 		'build', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit',
-		'status', 'rollback', 'sync-helper'
+		'status', 'notification-status', 'rollback', 'sync-helper'
 	].includes(args.command)) {
 		fail(`未知命令：${args.command}`)
 	}
+	if (args.notificationExpiryPlan && !['deploy', 'deploy-cloud', 'recover'].includes(args.command)) fail('通知清理计划只用于真实部署，不用于状态或回退')
+	if (args.notificationExpiryPlan && args.dryRun) fail('dry-run 不应用清理计划；请先单独预览')
+	const notificationPlan = readExpiryPlan(args.notificationExpiryPlan, args.environment)
 	if (args.command !== 'env-audit' && args.all) fail('--all 只能用于 env-audit')
 	if (args.command === 'env-audit') {
 		if (
@@ -1249,6 +1282,11 @@ export function main(argv = process.argv.slice(2)) {
 		fail(`正式 ${args.command} 必须显式提供 --yes`)
 	}
 	const config = loadConfiguration(args, { requireRemote: args.command !== 'build' })
+	if (args.command === 'notification-status') {
+		const result = notificationSnapshot(config)
+		if (result.RELEASE_ACCEPTANCE !== 'PASSED') process.exitCode = 2
+		return
+	}
 	if (args.command === 'status') {
 		showRemoteStatus(config, args.databaseProfile || 'active')
 		return
@@ -1287,7 +1325,7 @@ export function main(argv = process.argv.slice(2)) {
 		buildRelease(config, gitState, artifactDbHead)
 		return
 	}
-	deploy(config, gitState, artifactDbHead, databaseProfile, { mode: operationMode })
+	deploy(config, gitState, artifactDbHead, databaseProfile, { mode: operationMode, notificationPlan })
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
