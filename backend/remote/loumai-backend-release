@@ -2978,10 +2978,19 @@ def command(args):
                           text=True, capture_output=True, check=True, timeout=8).stdout
 
 def unit(name):
-    keys = ['ActiveState','SubState','UnitFileState','Result','NextElapseUSecRealtime',
-            'InactiveExitTimestampMonotonic','LastTriggerUSecMonotonic']
+    keys = ['ActiveState','SubState','UnitFileState','Result','NextElapseUSecRealtime']
     output = command(['systemctl','show',name] + ['--property='+key for key in keys])
     return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+
+def monotonic_value(suffix, interface, name):
+    # systemctl renders monotonic usec as "1month 1d ...", not an integer.
+    # Read the typed D-Bus uint64 instead of parsing locale-dependent durations.
+    path = '/org/freedesktop/systemd1/unit/loumai_2dapp_2dpush_2ddispatcher_2e' + suffix
+    raw = command(['busctl','get-property','org.freedesktop.systemd1',path,
+                   'org.freedesktop.systemd1.' + interface,name]).split()
+    if len(raw) != 2 or raw[0] != 't':
+        raise ValueError('unexpected monotonic type')
+    return int(raw[1])
 
 try:
     timer = unit('loumai-app-push-dispatcher.timer')
@@ -3012,8 +3021,8 @@ try:
           'enabled':timer.get('UnitFileState')}, 'service':{'active':service.get('ActiveState'),
           'sub':service.get('SubState'),'result':service.get('Result')},
           'next_seconds':next_seconds,
-          'running_seconds':elapsed(service.get('InactiveExitTimestampMonotonic')),
-          'since_trigger_seconds':elapsed(timer.get('LastTriggerUSecMonotonic')),
+          'running_seconds':elapsed(monotonic_value('service','Unit','InactiveExitTimestampMonotonic')),
+          'since_trigger_seconds':elapsed(monotonic_value('timer','Timer','LastTriggerUSecMonotonic')),
           'activation_age_seconds':max(0, time.time() - os.lstat(sys.argv[1]).st_mtime),
           'runs':runs}))
 except (subprocess.SubprocessError, OSError, ValueError):

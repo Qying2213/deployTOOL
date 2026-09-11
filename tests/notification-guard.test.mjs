@@ -100,6 +100,31 @@ test('cleanup does not claim completion with locked leftovers', () => {
   assert.equal(shell(code, { REPORT: JSON.stringify({ remaining_complete: true, remaining_expired: 1 }) }).status, 1)
 })
 
+test('host collector reads typed monotonic clocks and never leaks journal messages', () => {
+  const source = helper.slice(helper.indexOf('notification_status_for_release()'))
+    .split("<<'PY'\n")[1].split('\nPY\n')[0]
+  const harness = `import json, subprocess, sys\nfrom unittest.mock import patch\nfrom types import SimpleNamespace\n
+def fake(args, **kwargs):
+    if args[0] == 'systemctl':
+        value = 'ActiveState=active\\nUnitFileState=enabled\\nNextElapseUSecRealtime=Fri 2026-09-11 03:45:00 UTC\\n' if args[2].endswith('timer') else 'ActiveState=inactive\\nSubState=dead\\nResult=success\\nInactiveExitTimestampMonotonic=1month 1d 13h 50min 53s\\n'
+    elif args[0] == 'date': value = '1789098300'
+    elif args[0] == 'busctl': value = 't 20000000'
+    elif args[0] == 'journalctl': value = json.dumps({'MESSAGE': 'PRIVATE_MESSAGE_NOT_FOR_OUTPUT'})
+    else: raise AssertionError(args)
+    return SimpleNamespace(stdout=value)
+with patch('subprocess.run', fake), patch('os.lstat', return_value=SimpleNamespace(st_mtime=1789098290)), patch('time.time', return_value=1789098290), patch('time.monotonic', return_value=25):
+    sys.argv = ['probe', '/fake-current']
+    exec(${JSON.stringify(source)})
+`
+  const result = spawnSync('python3', ['-c', harness], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  const report = JSON.parse(result.stdout)
+  assert.equal(report.available, true)
+  assert.equal(report.running_seconds, 5)
+  assert.equal(report.next_seconds, 10)
+  assert.doesNotMatch(result.stdout, /PRIVATE_MESSAGE/)
+})
+
 test('deployment ordering keeps cleanup backed up and notification health outside recovery trap', () => {
   const activate = helper.slice(helper.indexOf('action_activate()'), helper.indexOf('action_rollback()'))
   const body = activate.slice(activate.indexOf('trap activation_failure'))
