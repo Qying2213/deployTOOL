@@ -498,4 +498,4 @@ git diff --check
 ```
 
 
-- [P1-NOTIF-07-R2 通知积压保护、受控清理与只读验收](docs/notification-backlog-guard.md)：本地实现、服务器未启用；通知验收与核心发布状态分离，无新增 env。
+- [P1-NOTIF-07-R2 通知积压保护、受控清理与只读验收](docs/notification-backlog-guard.md)：已在测试服及正式服启用并通过通知专项验收；与核心发布状态分离，无新增 env，独立告警待接入。
