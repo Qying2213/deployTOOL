@@ -2904,12 +2904,152 @@ action_status() {
       || fail "当前版本 release.json 不存在或异常"
     cat -- "$current/release.json"
   fi
+  if [[ "$requested_profile" == "active" ]]; then
+    notification_status_for_release "$current" || printf 'NOTIFICATION_HEALTH=UNKNOWN\nRELEASE_ACCEPTANCE=PENDING\n'
+  fi
+}
+
+# Notification checks deliberately do not participate in DEPLOYMENT_STATE.
+notification_guard_supported() {
+  [[ -f "$1/app/modules/notifications/delivery_freshness.py" \
+    && -f "$1/scripts/expire_stale_notification_deliveries.py" \
+    && -f "$1/scripts/check_notification_health.py" ]]
+}
+
+assert_notification_guard_retained() {
+  local current="$1" target="$2"
+  if notification_guard_supported "$current" && ! notification_guard_supported "$target"; then
+    fail "目标版本缺少通知时效保护；请制作保留防护的兼容修复版本，禁止退回旧消费者"
+  fi
+}
+
+notification_release_preflight() {
+  local backend="$1" plan="$2" output
+  if ! notification_guard_supported "$backend"; then
+    [[ "$plan" == "NONE" ]] || fail "目标后端不支持通知维护计划"
+    printf 'NOTIFICATION_GUARD=UNSUPPORTED\n'
+    return 0
+  fi
+  local args=(--dry-run)
+  if [[ "$plan" != "NONE" ]]; then args=(--validate-plan --plan-base64 "$plan"); fi
+  output="$(run_in_release "$backend" timeout 20 "$backend/.venv/bin/python" \
+    scripts/expire_stale_notification_deliveries.py "${args[@]}")" \
+    || fail "通知预览或计划校验失败；未开始停写"
+  printf 'NOTIFICATION_EXPIRY_PREVIEW=%s\n' "$output"
+  /usr/bin/python3 - "$output" "$plan" "$ENVIRONMENT" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+if r.get('environment') != sys.argv[3] or not r.get('complete'):
+    raise SystemExit('通知预览目标不符或不完整，禁止继续发布')
+if r.get('invalid') or r.get('uncovered_old'):
+    raise SystemExit('存在异常时间或未覆盖历史通知，需另行核对，未修改队列')
+if r.get('expired', 0) and sys.argv[2] == 'NONE':
+    raise SystemExit('需要审批的通知清理计划：按预览填写 environment/target/cutoff/policy_version/max_records 后重新发布')
+PY
+}
+
+notification_release_cleanup() {
+  local backend="$1" plan="$2" backup_reference="$3" output
+  [[ "$plan" != "NONE" ]] || return 0
+  output="$(run_in_release "$backend" timeout 25 "$backend/.venv/bin/python" \
+    scripts/expire_stale_notification_deliveries.py --apply --plan-base64 "$plan" \
+    --backup-reference "$backup_reference")" || return 1
+  printf 'NOTIFICATION_EXPIRY_RESULT=%s\n' "$output"
+  /usr/bin/python3 - "$output" <<'PY'
+import json, sys
+r = json.loads(sys.argv[1])
+if not r.get('remaining_complete') or r.get('remaining_expired') != 0:
+    raise SystemExit('批准 cutoff 内仍有锁定或未处理通知，不能宣告清理完成')
+PY
+}
+
+notification_status_for_release() (
+  # Subshell + explicit fallbacks: no failure can reach the activation recovery trap.
+  local backend="$1" state output
+  if ! notification_guard_supported "$backend"; then
+    printf 'NOTIFICATION_GUARD=UNSUPPORTED\nNOTIFICATION_HEALTH=UNSUPPORTED\nRELEASE_ACCEPTANCE=PENDING\n'
+    exit 0
+  fi
+  state="$(/usr/bin/python3 - "$CURRENT_LINK" <<'PY'
+import json, os, subprocess, sys, time
+
+def command(args):
+    return subprocess.run(args, env={**os.environ, 'TZ':'UTC', 'LC_ALL':'C'},
+                          text=True, capture_output=True, check=True, timeout=8).stdout
+
+def unit(name):
+    keys = ['ActiveState','SubState','UnitFileState','Result','NextElapseUSecRealtime',
+            'InactiveExitTimestampMonotonic','LastTriggerUSecMonotonic']
+    output = command(['systemctl','show',name] + ['--property='+key for key in keys])
+    return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+
+try:
+    timer = unit('loumai-app-push-dispatcher.timer')
+    service = unit('loumai-app-push-dispatcher.service')
+    next_raw = timer.get('NextElapseUSecRealtime', '')
+    next_seconds = None
+    if next_raw and next_raw != 'n/a':
+        next_seconds = int(command(['date','-u','-d',next_raw,'+%s']).strip()) - time.time()
+    monotonic = time.monotonic()
+    def elapsed(raw):
+        return monotonic - int(raw)/1000000 if raw and int(raw) > 0 else None
+    output = command(['journalctl','--unit=loumai-app-push-dispatcher.service',
+                      '--since=-10min','--lines=100','--output=json','--no-pager'])
+    runs = []
+    for line in output.splitlines():
+        try:
+            entry = json.loads(line)
+            guard = json.loads(entry.get('MESSAGE','')).get('notification_guard')
+            if isinstance(guard, dict):
+                # Only explicit health metadata leaves root journal reader.
+                run = {key:guard.get(key) for key in ['version','run_id','release_path',
+                       'started_at','completed_at','errors']}
+                run['invocation_id'] = entry.get('_SYSTEMD_INVOCATION_ID')
+                runs.append(run)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    print(json.dumps({'available':True, 'timer':{'active':timer.get('ActiveState'),
+          'enabled':timer.get('UnitFileState')}, 'service':{'active':service.get('ActiveState'),
+          'sub':service.get('SubState'),'result':service.get('Result')},
+          'next_seconds':next_seconds,
+          'running_seconds':elapsed(service.get('InactiveExitTimestampMonotonic')),
+          'since_trigger_seconds':elapsed(timer.get('LastTriggerUSecMonotonic')),
+          'activation_age_seconds':max(0, time.time() - os.lstat(sys.argv[1]).st_mtime),
+          'runs':runs}))
+except (subprocess.SubprocessError, OSError, ValueError):
+    print('{"available":false}')
+PY
+)" || state='{"available":false}'
+  output="$(run_in_release "$backend" timeout 25 "$backend/.venv/bin/python" \
+    scripts/check_notification_health.py --host-state "$state" 2>/dev/null)" || true
+  /usr/bin/python3 - "$output" <<'PY'
+import json, sys
+try:
+    r = json.loads(sys.argv[1])
+    if r.get('health') not in ['WAITING','RUNNING','STARTING','DEGRADED','UNKNOWN']:
+        raise ValueError()
+except (ValueError, TypeError, AttributeError):
+    r = {'guard':'UNKNOWN', 'health':'UNKNOWN', 'acceptance':'PENDING', 'reasons':['probe_failed']}
+print('NOTIFICATION_GUARD=' + r.get('guard','UNKNOWN'))
+print('NOTIFICATION_HEALTH=' + r['health'])
+print('RELEASE_ACCEPTANCE=' + r.get('acceptance','PENDING'))
+print('NOTIFICATION_REPORT=' + json.dumps(r, sort_keys=True))
+PY
+)
+
+action_notification_status() {
+  select_database_profile active
+  validate_server_contract
+  local current
+  current="$(current_target)"
+  printf 'ENVIRONMENT=%s\n' "$ENVIRONMENT"
+  notification_status_for_release "$current" || printf 'NOTIFICATION_HEALTH=UNKNOWN\nRELEASE_ACCEPTANCE=PENDING\n'
 }
 
 action_activate() {
   local release_id="$1" expected_commit="$2" artifact_db_head="$3" expected_checksums="$4"
   local expected_archive="$5" expected_current="$6" expected_db_revision="$7" requested_profile="$8"
-  local mode="$9" expected_recovery_token="${10}"
+  local mode="$9" expected_recovery_token="${10}" notification_plan="${11:-NONE}"
   local stage_dir partial_root release_root backend actual_current actual_db observed_db archive_sha checksums_sha final_db
   local migration_required=0 initial_activation=0 initial_flag=false recovery_activation=0
   local marker_previous_current marker_token
@@ -2975,6 +3115,7 @@ action_activate() {
   ACTIVATION_PERSISTENT_DISABLED=0
   ACTIVATION_RECOVERY_TOKEN="$marker_token"
   ACTIVATION_ENABLE_ATTEMPTED=0
+  ACTIVATION_NOTIFICATION_CLEANUP_STARTED=0
 
   activation_failure() {
     local exit_code=$? restored=0
@@ -2989,7 +3130,9 @@ action_activate() {
       || "${ACTIVATION_PERSISTENT_DISABLED:-0}" == "1" \
       || "${ACTIVATION_WRITERS_STOPPED:-0}" == "1" ]]; then
       if [[ "${ACTIVATION_RECOVERY:-0}" == "0" \
-        && "${ACTIVATION_MIGRATION_ATTEMPTED:-0}" == "0" ]]; then
+        && "${ACTIVATION_MIGRATION_ATTEMPTED:-0}" == "0" ]] \
+        && { [[ "${ACTIVATION_NOTIFICATION_CLEANUP_STARTED:-0}" == "0" ]] \
+             || notification_guard_supported "$ACTIVATION_PREVIOUS_CURRENT"; }; then
         if stop_all_units && (
           if [[ "${ACTIVATION_SWITCHED:-0}" == "1" ]]; then
             restore_current "$ACTIVATION_PREVIOUS_CURRENT"
@@ -3086,6 +3229,18 @@ action_activate() {
   ACTIVATION_PARTIAL_CREATED=0
   backend="$release_root/backend"
   [[ "$artifact_db_head" == "$actual_db" ]] || migration_required=1
+  assert_notification_guard_retained "$actual_current" "$backend"
+  if [[ "$actual_db" != "bootstrap" ]]; then
+    # Existing guarded release matches the pre-migration schema. Only first install
+    # uses the candidate (this guard introduces no schema changes).
+    if notification_guard_supported "$actual_current"; then
+      notification_release_preflight "$actual_current" "$notification_plan"
+    else
+      notification_release_preflight "$backend" "$notification_plan"
+    fi
+  else
+    [[ "$notification_plan" == "NONE" ]] || fail "空库首次初始化不能携带通知清理计划"
+  fi
 
   marker_previous_current="$actual_current"
   write_recovery_marker "$release_id" "$backend" "$marker_previous_current" \
@@ -3111,8 +3266,10 @@ action_activate() {
   apply_database_role_grants "$backend"
   validate_runtime_database_privileges "$backend"
   validate_backup_database_privileges "$backend"
-  if [[ "$migration_required" == "1" ]]; then
+  if [[ "$migration_required" == "1" || "$notification_plan" != "NONE" ]]; then
     create_database_backup "$release_id"
+  fi
+  if [[ "$migration_required" == "1" ]]; then
     write_recovery_marker "$release_id" "$backend" "$marker_previous_current" \
       "$initial_flag" migrating "$actual_db" "$marker_token"
     marker_token="$(recovery_marker_token)"
@@ -3124,6 +3281,11 @@ action_activate() {
       || fail "迁移后 DB revision 不正确"
     validate_runtime_database_privileges "$backend"
     validate_backup_database_privileges "$backend"
+  fi
+  if [[ "$notification_plan" != "NONE" ]]; then
+    ACTIVATION_NOTIFICATION_CLEANUP_STARTED=1
+    notification_release_cleanup "$backend" "$notification_plan" "$release_id" \
+      || fail "通知清理未完成，禁止恢复到无保护的旧消费者；使用保留防护的前向修复版本"
   fi
   switch_current "$backend"
   ACTIVATION_SWITCHED=1
@@ -3145,6 +3307,7 @@ action_activate() {
     || rm -f -- "$ACTIVATION_PREVIOUS_DATABASE_ENV"
   rm -rf -- "$stage_dir" || printf 'WARNING: staging 清理失败：%s\n' "$stage_dir" >&2
   printf 'ACTIVATED=%s\nDB_REVISION=%s\n' "$backend" "$final_db"
+  notification_status_for_release "$backend" || printf 'NOTIFICATION_HEALTH=UNKNOWN\nRELEASE_ACCEPTANCE=PENDING\n'
 }
 
 action_rollback() {
@@ -3175,6 +3338,8 @@ action_rollback() {
   validate_runtime_database_privileges "$target" safety
   validate_backup_database_privileges "$target" safety
   validate_property_video_direct_upload "$target"
+  assert_notification_guard_retained "$actual_current" "$target"
+  notification_release_preflight "$actual_current" NONE
 
   ROLLBACK_PREVIOUS_CURRENT="$actual_current"
   ROLLBACK_WRITERS_STOPPED=0
@@ -3251,6 +3416,7 @@ action_rollback() {
   ROLLBACK_MARKER_WRITTEN=0
   trap - EXIT INT TERM HUP
   printf 'ROLLED_BACK=%s\nDB_REVISION=%s\n' "$target" "$final_db"
+  notification_status_for_release "$target" || printf 'NOTIFICATION_HEALTH=UNKNOWN\nRELEASE_ACCEPTANCE=PENDING\n'
 }
 
 case "${1:-}" in
@@ -3282,15 +3448,19 @@ case "${1:-}" in
     [[ "$#" -eq 2 ]] || fail "status 参数数量错误"
     action_status "$2"
     ;;
+  notification-status)
+    [[ "$#" -eq 1 ]] || fail "notification-status 参数数量错误"
+    action_notification_status
+    ;;
   activate)
-    [[ "$#" -eq 11 ]] || fail "activate 参数数量错误"
-    action_activate "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+    [[ "$#" -eq 11 || "$#" -eq 12 ]] || fail "activate 参数数量错误"
+    action_activate "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-NONE}"
     ;;
   rollback)
     [[ "$#" -eq 5 ]] || fail "rollback 参数数量错误"
     action_rollback "$2" "$3" "$4" "$5"
     ;;
   *)
-    fail "用法：loumai-backend-release version|fingerprint|preflight|env-audit|prepare|abort|status|activate|rollback（发布模式：bootstrap|deploy|recover）"
+    fail "用法：loumai-backend-release version|fingerprint|preflight|env-audit|prepare|abort|status|notification-status|activate|rollback（发布模式：bootstrap|deploy|recover）"
     ;;
 esac

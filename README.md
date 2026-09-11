@@ -496,3 +496,6 @@ node --check admin-backend/admin-backend-release.mjs
 node --check website/site-release.mjs
 git diff --check
 ```
+
+
+- [P1-NOTIF-07-R2 通知积压保护、受控清理与只读验收](docs/notification-backlog-guard.md)：本地实现、服务器未启用；通知验收与核心发布状态分离，无新增 env。

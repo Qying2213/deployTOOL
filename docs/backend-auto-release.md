@@ -871,3 +871,8 @@ CRITICAL: 数据库迁移已经尝试；所有 writer 保持停止。
 - SSH 主机指纹或私钥错误：先用相同用户、端口和 identity 手工执行 BatchMode SSH 验证。
 
 历史版本、虚拟环境和数据库备份不会由发布命令自动删除。磁盘清理由单独、经过保留策略审批的维护任务完成，不能在发布失败处理中顺手清理证据。
+
+
+## P1-NOTIF-07-R2 通知专项验收（本地实现，待发布）
+
+配套主后端通知时效保护及新 helper 后，使用 `./loumai-deploy backend notification-status --env test` 只读诊断。通知输出与 DEPLOYMENT_STATE 分离；核心激活成功但通知未验收返回 2，不自动回滚或停 API。过期数据清理需要独立批准的预览计划和真实备份，旧后端 UNSUPPORTED 不阻塞 helper 兼容升级。详见 [通知积压保护部署说明](notification-backlog-guard.md)，不要直接在真实队列运行 dispatcher 进行试验。
