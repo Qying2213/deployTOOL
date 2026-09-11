@@ -2,8 +2,9 @@
 Description=Run Loumai push and appointment jobs every minute
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=1min
+# Use a wall-clock schedule so stopping and restarting the timer together with
+# its oneshot service during a release cannot leave it active(elapsed).
+OnCalendar=*-*-* *:*:00
 AccuracySec=5s
 Persistent=true
 Unit=loumai-app-push-dispatcher.service
