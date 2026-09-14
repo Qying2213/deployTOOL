@@ -116,6 +116,8 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 
 管理后台后端测试服同样固定从 `conpanyManagement` 的 `test` 分支发布，并要求工作区干净、提交与 `origin/test` 一致。
 
+管理后台后端的 `deploy --dry-run` 只执行快速只读预检，不重复运行全量 pytest；`deploy --yes` 在预检后执行一次完整业务门禁。日常发布不会重新安装 helper、systemd 和 Nginx，只有首次安装或提示 helper 指纹不一致时才执行 `prepare --yes`。
+
 业务后端切换 local/cloud 数据库时会统一停启并校验管理后台；管理后台代码本身使用独立版本链发布：
 
 ```bash
@@ -210,8 +212,8 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 | --- | --- | --- |
 | `status` | 否 | 查询当前版本、数据库版本和服务状态 |
 | `build` | 否 | 在本机从确定 Git commit 构建并校验产物 |
-| `deploy --dry-run` | 否 | 做只读预检；前后端不构建，官网会在本机真实构建 |
-| `deploy --yes` | 是 | 构建、验签、上传、原子切换并验收 |
+| `deploy --dry-run` | 否 | 做快速只读预检；后端不重复运行全量业务测试，前端不构建，官网会在本机真实构建 |
+| `deploy --yes` | 是 | 运行一次完整发布门禁，构建、验签、上传、原子切换并验收 |
 | `backend bootstrap --env production --yes` | 是 | 仅用于全新正式服的首个受控版本、数据库迁移和开机自启初始化 |
 | `frontend deploy-package --file ... --yes` | 是 | 安全导入已有 H5 ZIP、验签、原子切换并验收 |
 | `rollback --dry-run` | 否 | 检查目标 release、哈希和当前版本条件 |

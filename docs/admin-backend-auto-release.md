@@ -2,7 +2,7 @@
 
 本文原有命令默认发布测试服。正式服已新增独立配置、helper、数据库 DML 角色及联合入口，见 [管理后台前后端正式服一键发布](admin-production-release.md)。正式服不要复用本页的测试安装器；必须显式 `--env production`。
 
-更新时间：2026-09-02
+更新时间：2026-09-14
 
 ## 1. 当前部署结构
 
@@ -33,13 +33,17 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-backend
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-backend deploy --dry-run
 ```
 
+`--dry-run` 是快速只读预检：校验发布分支、干净工作区、upstream、Git diff、服务器 helper 版本与 SHA256 指纹，以及服务器 preflight；它不再重复运行全量业务测试。正式 `--yes` 会在相同安全预检通过后运行一次完整 Ruff、格式和 pytest 门禁，再打包、上传和原子切换。
+
+日常 `deploy --yes` 不再重复安装 helper、systemd 或 Nginx。只有首次安装，或者发布器明确提示 helper 版本/指纹不一致时，才单独执行一次 `prepare --yes`。这样避免每次代码发布都提前重启现有管理后台进程。
+
 查看当前版本、数据库 profile 和服务状态：
 
 ```bash
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-backend status
 ```
 
-首次安装或升级服务器 helper、systemd、Nginx 登录限流：
+首次安装或升级服务器 helper、systemd、Nginx 登录限流，以及修复 helper 指纹不一致：
 
 ```bash
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy admin-backend prepare --yes
