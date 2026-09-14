@@ -12,6 +12,7 @@ export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_CONFIG = join(TOOL_ROOT, 'config/admin-backend.test.local.env')
 const DIST = join(TOOL_ROOT, 'dist/admin-backend-releases')
 const REMOTE = join(TOOL_ROOT, 'admin-backend/remote')
+const TEST_HELPER_SOURCE = join(REMOTE, 'loumai-company-management-release')
 
 function fail(message) { throw new Error(message) }
 function info(message) { process.stdout.write(`[admin-backend-release] ${message}\n`) }
@@ -164,6 +165,49 @@ function sourceHash(root, list) {
 function sha(path) { return createHash('sha256').update(readFileSync(path)).digest('hex') }
 function releaseId(sourceSha, date = new Date()) { return `${date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}-${sourceSha.slice(0, 10)}` }
 
+export function parseSha256sumOutput(output, expectedPath) {
+  const lines = String(output).trim().split(/\r?\n/)
+  if (lines.length !== 1) fail('服务器 helper 指纹输出格式错误')
+  const match = lines[0].match(/^([a-f0-9]{64})\s+\*?(\/[^\r\n]+)$/)
+  if (!match || match[2] !== expectedPath) fail('服务器 helper 指纹输出格式错误')
+  return match[1]
+}
+
+function localTestHelperIdentity() {
+  const content = readFileSync(TEST_HELPER_SOURCE, 'utf8')
+  const match = content.match(/^readonly HELPER_VERSION="([0-9]+)"$/m)
+  if (!match) fail('无法读取本地测试服 helper 版本')
+  return { version: match[1], fingerprint: sha(TEST_HELPER_SOURCE) }
+}
+
+function remoteFileSha(config, path) {
+  const output = run('ssh', [
+    ...sshArgs(config),
+    config.target,
+    ['/usr/bin/sha256sum', '--', path].map(quote).join(' '),
+  ], { capture: true })
+  return parseSha256sumOutput(output, path)
+}
+
+function assertRemoteHelperExact(config) {
+  const expected = localTestHelperIdentity()
+  let actualVersion
+  let actualFingerprint
+  try {
+    actualVersion = remote(config, ['version'], { capture: true })
+    actualFingerprint = remoteFileSha(config, config.helper)
+  } catch (error) {
+    fail(`无法验证测试服 helper；请先执行 admin-backend prepare --env test --yes\n${error.message}`)
+  }
+  if (actualVersion !== expected.version || actualFingerprint !== expected.fingerprint) {
+    fail(
+      `测试服 helper 版本或指纹不一致；请先执行 admin-backend prepare --env test --yes`
+      + `\n期望 version=${expected.version}, sha256=${expected.fingerprint}`
+      + `\n实际 version=${actualVersion || '(empty)'}, sha256=${actualFingerprint || '(empty)'}`,
+    )
+  }
+}
+
 function quality(config, skipTests) {
   if (skipTests) return
   const python = config.pythonBin || join(config.source, '.venv/bin/python')
@@ -233,22 +277,31 @@ function prepare(config) {
   run('ssh', [...sshArgs(config), config.target, `install -d -m 0700 ${quote(remotePath)}`])
   run('scp', [...scpArgs(config), '-r', `${bundle}/.`, `${config.target}:${remotePath}/`])
   run('ssh', [...sshArgs(config), config.target, `if sudo -n ${quote(`${remotePath}/install-company-management-release`)} ${quote(remotePath)}; then rm -rf ${quote(remotePath)}; else rc=$?; rm -rf ${quote(remotePath)}; exit $rc; fi`])
-  remote(config, ['version'], { capture: true })
+  assertRemoteHelperExact(config)
   remote(config, ['preflight'])
 }
 
-function current(config) {
-  const output = remote(config, ['status'], { capture: true })
+function current(config, command = 'status') {
+  const output = remote(config, [command], { capture: true })
   const match = output.match(/^CURRENT=(.*)$/m)
   return { output, target: match ? match[1].trim() : '' }
 }
 
 function deploy(config, args) {
   if (args.skipTests) fail('真实部署禁止 --skip-tests')
-  if (args.dryRun) { remote(config, ['preflight']); quality(config, false); info('dry-run 通过，未上传或切换版本'); return }
+  if (args.dryRun) {
+    const before = inspectTestGit(config)
+    assertRemoteHelperExact(config)
+    remote(config, ['preflight'])
+    run('git', ['--no-pager', 'diff', '--check'], { cwd: config.source })
+    if (inspectTestGit(config).commit !== before.commit) fail('dry-run 期间源码 commit 发生变化，请重新执行')
+    info('dry-run 通过：Git/upstream、helper 指纹、服务器 preflight 和 diff 已检查；未运行全量业务测试、未打包、未上传或切换版本')
+    return
+  }
   if (!args.yes) fail('真实部署必须提供 --yes')
-  prepare(config)
-  const artifact = build(config); const before = current(config).target
+  assertRemoteHelperExact(config)
+  remote(config, ['preflight'])
+  const artifact = build(config); const before = current(config, 'preflight').target
   remote(config, ['prepare', artifact.id, before])
   const destination = `${config.target}:${config.root}/incoming/${artifact.id}.partial/backend.tar`
   run('scp', [...scpArgs(config), artifact.archive, destination])

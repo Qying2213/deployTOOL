@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { inspectTestGit, parseArgs, parseDotEnv } from '../admin-backend/admin-backend-release.mjs'
+import { inspectTestGit, parseArgs, parseDotEnv, parseSha256sumOutput } from '../admin-backend/admin-backend-release.mjs'
 
 const helper = readFileSync(new URL('../admin-backend/remote/loumai-company-management-release', import.meta.url), 'utf8')
 const runner = readFileSync(new URL('../admin-backend/remote/loumai-company-management-run', import.meta.url), 'utf8')
@@ -72,6 +72,27 @@ test('安装失败会恢复旧配置且本地调用不会掩盖失败', () => {
   assert.match(installer, /BACKUP=/)
   assert.match(localRelease, /else rc=\$\?; rm -rf .*; exit \$rc/)
   assert.match(localRelease, /remote\(config, \['preflight'\]\)/)
+})
+
+test('日常发布不重复安装 helper，dry-run 不重复运行全量业务测试', () => {
+  const deployBody = localRelease.match(/function deploy\(config, args\) \{[\s\S]*?\n\}/)?.[0] || ''
+  assert.match(deployBody, /assertRemoteHelperExact\(config\)/)
+  assert.match(deployBody, /remote\(config, \['preflight'\]\)/)
+  assert.match(deployBody, /diff', '--check/)
+  assert.doesNotMatch(deployBody, /prepare\(config\)/)
+  assert.doesNotMatch(deployBody, /quality\(config, false\)/)
+  assert.match(deployBody, /const artifact = build\(config\)/)
+  assert.match(deployBody, /current\(config, 'preflight'\)/)
+})
+
+test('远端 helper 指纹必须是指定路径的单条 sha256sum 输出', () => {
+  const path = '/usr/local/sbin/loumai-company-management-release'
+  const hash = 'a'.repeat(64)
+  assert.equal(parseSha256sumOutput(`${hash}  ${path}\n`, path), hash)
+  assert.equal(parseSha256sumOutput(`${hash} *${path}\n`, path), hash)
+  assert.throws(() => parseSha256sumOutput(`${hash}  /tmp/wrong\n`, path), /格式错误/)
+  assert.throws(() => parseSha256sumOutput(`${hash}  ${path}\nextra`, path), /格式错误/)
+  assert.throws(() => parseSha256sumOutput(`not-a-hash  ${path}\n`, path), /格式错误/)
 })
 
 test('systemd 有资源限制和安全沙箱', () => {
