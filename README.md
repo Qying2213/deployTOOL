@@ -43,7 +43,19 @@
 
 如果你已经确认代码已提交并推送，可以直接复制下面两条单行命令。它们分别把后端和 H5 真实构建、上传并切换到测试服。
 
-后端一键发布：
+主项目后端最新 `origin/test` 发布到测试服云 PostgreSQL，推荐使用下面这个固定脚本。它会自动定位本地 `test` worktree、快进同步远端、执行状态检查、环境审计、`dry-run`、真实发布和公网健康检查，避免把多行 Shell 粘贴到终端后进入 `dquote>`：
+
+```bash
+/Users/qinyang/Desktop/zuling/deploy--loumai/deploy-test-backend
+```
+
+只做只读预检，不真实发布：
+
+```bash
+/Users/qinyang/Desktop/zuling/deploy--loumai/deploy-test-backend --dry-run-only
+```
+
+原始后端发布入口仍可按需单独使用：
 
 ```bash
 cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy backend deploy --yes
