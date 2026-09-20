@@ -288,8 +288,8 @@ function usage() {
   node backend/backend-release.mjs deploy --env test|production --yes [--config FILE]
   node backend/backend-release.mjs bootstrap --env production --dry-run [--config FILE]
   node backend/backend-release.mjs bootstrap --env production --yes [--config FILE]
-  node backend/backend-release.mjs recover --env production --dry-run [--config FILE]
-  node backend/backend-release.mjs recover --env production --yes [--config FILE]
+  node backend/backend-release.mjs recover --env test|production --dry-run [--config FILE]
+  node backend/backend-release.mjs recover --env test|production --yes [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --dry-run [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --yes [--config FILE]
   node backend/backend-release.mjs deploy-cloud --env test --sync-helper --yes [--config FILE]
@@ -784,9 +784,21 @@ function verifyRemoteStatusAfterHelperSync(config) {
 	const output = remoteHelper(config, ['status', 'active'], { capture: true }).stdout
 	const values = parseKeyValueOutput(output)
 	if (values.ENVIRONMENT !== 'test') fail('helper 同步后目标服务器不再声明为测试服')
-	if (values.DEPLOYMENT_STATE !== 'HEALTHY') fail('helper 同步后测试服状态不是 HEALTHY')
-	if (values.RECOVERY_REQUIRED !== 'false') fail('helper 同步后测试服出现恢复标记')
-	if (values.DATABASE_WRITERS !== 'verified') fail('helper 同步后数据库写入服务核验失败')
+	if (values.DEPLOYMENT_STATE === 'HEALTHY') {
+		if (values.RECOVERY_REQUIRED !== 'false') fail('健康状态与恢复标记不一致')
+		if (values.DATABASE_WRITERS !== 'verified') fail('helper 同步后数据库写入服务核验失败')
+	} else if (values.DEPLOYMENT_STATE === 'RECOVERY_REQUIRED') {
+		if (values.RECOVERY_REQUIRED !== 'true') fail('恢复状态缺少恢复标记')
+		if (!/^[0-9a-f]{64}$/.test(values.RECOVERY_TOKEN || '')) fail('恢复状态缺少合法恢复令牌')
+		if (!['prepared', 'stopped', 'migrating'].includes(values.RECOVERY_PHASE || '')) {
+			fail('恢复状态缺少合法恢复阶段')
+		}
+		if (!['recovery_prepared', 'recovery_fail_closed'].includes(values.DATABASE_WRITERS || '')) {
+			fail('恢复状态未保持数据库写入保护')
+		}
+	} else {
+		fail('helper 同步后测试服状态非法')
+	}
 	process.stdout.write(output)
 }
 
@@ -943,7 +955,6 @@ function remotePreflight(config, databaseProfile = 'active', { mode = 'deploy' }
 	if (!['true', 'false'].includes(values.INITIALIZED || '')) fail('远端未返回合法 INITIALIZED')
 	if (values.OPERATION_MODE !== mode) fail('远端 preflight 操作模式不一致')
 	if (mode === 'recover') {
-		if (config.environment !== 'production') fail('recover 只允许用于正式服')
 		if (values.DEPLOYMENT_STATE !== 'RECOVERY_REQUIRED' || values.RECOVERY_REQUIRED !== 'true') {
 			fail('目标服不处于受控恢复状态，不能执行 recover')
 		}
@@ -1267,9 +1278,6 @@ export function main(argv = process.argv.slice(2)) {
 	if (args.command === 'bootstrap' && args.environment !== 'production') {
 		fail('bootstrap 只用于全新正式服，必须提供 --env production')
 	}
-	if (args.command === 'recover' && args.environment !== 'production') {
-		fail('recover 只用于正式服故障前向修复，必须提供 --env production')
-	}
 	if (args.databaseProfile && !['status'].includes(args.command)) {
 		fail('--database-profile 只能用于 status；发布请使用 deploy 或 deploy-cloud')
 	}
@@ -1298,9 +1306,11 @@ export function main(argv = process.argv.slice(2)) {
 	const gitState = inspectGitState(config)
 	const artifactDbHead = inspectMigrationHead(config)
 	info(`锁定后端 commit=${gitState.commit}，alembic_head=${artifactDbHead}`)
-	const databaseProfile = args.environment === 'production' || args.command === 'deploy-cloud'
-		? 'cloud'
-		: 'local'
+	const databaseProfile = args.command === 'recover'
+		? 'active'
+		: args.environment === 'production' || args.command === 'deploy-cloud'
+			? 'cloud'
+			: 'local'
 	const operationMode = args.command === 'bootstrap'
 		? 'bootstrap'
 		: args.command === 'recover' ? 'recover' : 'deploy'

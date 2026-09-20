@@ -2549,7 +2549,6 @@ assert_operation_marker_state() {
   local mode="$1" expected_token="$2" active_profile actual_token
   valid_operation_mode "$mode" || fail "发布操作模式非法：$mode"
   if [[ "$mode" == "recover" ]]; then
-    [[ "$ENVIRONMENT" == "production" ]] || fail "recover 只允许用于正式服"
     load_recovery_marker
     actual_token="$(recovery_marker_token)"
     [[ "$expected_token" == "$actual_token" ]] || fail "恢复标记已变化，请重新执行 recover"
@@ -2576,7 +2575,6 @@ action_preflight() {
   validate_server_contract
   current="$(current_target)"
   if [[ "$mode" == "recover" ]]; then
-    [[ "$ENVIRONMENT" == "production" ]] || fail "recover 只允许用于正式服"
     load_recovery_marker
     [[ "$SELECTED_DATABASE_PROFILE" == "$RECOVERY_DATABASE_PROFILE" ]] \
       || fail "recover 数据库 profile 与恢复标记不一致"

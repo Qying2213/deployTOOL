@@ -850,11 +850,20 @@ CRITICAL: 数据库迁移已经尝试；所有 writer 保持停止。
 1. 保存完整发布输出、`journalctl -u loumai-api.service` 和目标 release；
 2. 查看输出中的 `CRITICAL_BACKUP`，用 `pg_restore --list` 再次确认备份可读取；
 3. 对比当前 `alembic_version`、新版本 head 和 schema 校验错误；
-4. 优先编写前向修复并在维护窗口验证；
+4. 优先编写前向修复并在维护窗口验证；如果只是同一数据库迁移后的配套服务兼容问题，先发布兼容版本，再使用下述受控恢复命令；
 5. 只有负责人明确接受数据丢失范围时，才由 DBA 单独执行备份恢复；
 6. 修复并验证健康后，再恢复 API、Worker 和 timers。
 
 发布工具不会替操作者猜测数据库是否能安全倒退。
+
+测试服和正式服都通过带恢复令牌的 `recover` 继续前向恢复；命令自动沿用当前活动数据库 profile，不允许切换到另一数据库：
+
+```bash
+./loumai-deploy backend recover --env test --dry-run
+./loumai-deploy backend recover --env test --yes
+```
+
+测试服 helper 若需要在恢复状态下同步，必须先提交并推送经过测试的部署工具改动，再执行 `sync-helper --env test --yes`。同步过程只替换并校验 helper，不启动服务、不迁移数据库，也不会清除恢复标记；后续 `recover` 仍必须重新校验恢复令牌、停写状态、当前数据库 revision、完整质量门禁和联合健康检查。
 
 ## 常见报错
 
