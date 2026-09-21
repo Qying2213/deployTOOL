@@ -12,6 +12,14 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai
 ./loumai-deploy production deploy --yes
 ```
 
+与测试服总入口对应：
+
+```bash
+./loumai-deploy test deploy --yes
+```
+
+两个总入口都只覆盖主后端、业务 H5、管理后台后端和管理后台前端。微信小程序由前端同事独立发布，不在这两个命令中。
+
 真实命令固定按以下顺序执行：
 
 1. 业务后端；

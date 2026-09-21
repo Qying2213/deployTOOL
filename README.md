@@ -14,13 +14,16 @@
 
 日常操作只使用根目录的 `./loumai-deploy`。详细的一次性服务器安装说明放在 `docs/`，不要把安装步骤和日常发布混着执行。
 
-四个正式服目标完成一次性初始化后，统一入口只有一条：
+日常发布只保留两个总入口：
 
 ```bash
+./loumai-deploy test deploy --yes
 ./loumai-deploy production deploy --yes
 ```
 
-该命令先完成全量预检，再固定按业务后端、业务前端、管理后台后端、管理后台前端发布，最后逐项验收。正式执行前先运行 `./loumai-deploy production deploy --dry-run`；包路径只写在 Git 忽略的 `config/production.local.env`。详见 [正式服全量一键发布](docs/production-one-command-release.md)。
+两条命令均发布主后端、业务 H5、管理后台后端和管理后台前端，先完成全量预检，再逐项发布和验收。**微信小程序不在任何总入口中，不会被构建或上传。**
+
+真实执行前将 `--yes` 换成 `--dry-run`。两个前端 ZIP 路径分别写在 Git 忽略的 `config/test.local.env` 和 `config/production.local.env`。详见[测试服四目标一键发布](docs/test-one-command-release.md)与[正式服全量一键发布](docs/production-one-command-release.md)。
 
 管理后台正式服联合发布入口（首次资源安装完成后）：
 
@@ -41,9 +44,18 @@
 
 ### 2.0 真正一键发布
 
-如果你已经确认代码已提交并推送，可以直接复制下面两条单行命令。它们分别把后端和 H5 真实构建、上传并切换到测试服。
+如果已确认代码已提交并推送，且两个前端 ZIP 路径已写入对应本机配置，日常只使用：
 
-主项目后端最新 `origin/test` 发布到测试服云 PostgreSQL，推荐使用下面这个固定脚本。它会自动定位本地 `test` worktree、快进同步远端、执行状态检查、环境审计、`dry-run`、真实发布和公网健康检查，避免把多行 Shell 粘贴到终端后进入 `dquote>`：
+```bash
+./loumai-deploy test deploy --yes
+./loumai-deploy production deploy --yes
+```
+
+第一条发测试服，第二条发正式服。两条都只包含主后端、业务 H5、管理后台后端和管理后台前端；微信小程序由前端同事发布。
+
+下面的单组件命令只用于排错、回滚或明确只发某一组件。
+
+主项目后端最新 `origin/test` 单独发布到测试服云 PostgreSQL，使用下面的固定脚本。它会自动定位本地 `test` worktree、快进同步远端、执行状态检查、环境审计、`dry-run`、真实发布和公网健康检查：
 
 ```bash
 /Users/qinyang/Desktop/zuling/deploy--loumai/deploy-test-backend
