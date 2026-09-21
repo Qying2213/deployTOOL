@@ -32,5 +32,8 @@ test("script fixes the target to test and keeps status, audit, dry-run and healt
   assert.match(source, /deploy-cloud --env test --dry-run/);
   assert.match(source, /deploy-cloud --env test --yes/);
   assert.match(source, /test\.yinlizhangyu\.com\/health/);
+  assert.match(source, /run_phase "主后端真实发布"/);
+  assert.match(source, /总耗时 %s 秒/);
+  assert.match(source, /失败前总耗时/);
   assert.doesNotMatch(source, /--env production/);
 });

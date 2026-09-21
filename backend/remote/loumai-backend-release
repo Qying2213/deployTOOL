@@ -6,7 +6,7 @@ export GIT_PAGER=cat PAGER=cat SYSTEMD_PAGER=cat SYSTEMD_COLORS=0
 unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME
 umask 022
 
-readonly HELPER_VERSION="6"
+readonly HELPER_VERSION="7"
 readonly CONFIG_FILE="/etc/loumai/backend-release.env"
 
 # These two installation checks must work before the server configuration exists.
@@ -1580,23 +1580,29 @@ install_runtime() {
     UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" pip install \
       --python "$backend/.venv/bin/python" \
-      --constraint "$backend/runtime-constraints.txt" \
-      setuptools
+      --no-deps \
+      --requirement "$backend/runtime-constraints.txt"
   run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
     HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
     UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" pip install \
       --python "$backend/.venv/bin/python" \
+      --no-deps \
       --no-build-isolation \
-      --constraint "$backend/runtime-constraints.txt" \
       "$build_source"
+  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
+    "$UV_BIN" pip check --python "$backend/.venv/bin/python"
   run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
     HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
     UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
     "$UV_BIN" pip freeze --python "$backend/.venv/bin/python" \
       > "$backend/installed-requirements.txt"
+  printf 'RUNTIME_INSTALL_MODE=PINNED_NO_DEPS\n'
   rm -rf -- "$build_dir"
   chown -hR root:root "$backend/.venv"
   chmod -R a+rX,go-w "$backend/.venv"

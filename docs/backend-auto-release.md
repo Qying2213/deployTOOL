@@ -778,7 +778,7 @@ node backend/backend-release.mjs deploy --yes
 4. 再次执行远端只读 preflight（含 helper 指纹复核），用 `git archive` 从锁定 commit 打包 `app / alembic / scripts / pyproject.toml / alembic.ini`；
 5. 加入精确依赖约束、`release.json` 和 `SHA256SUMS`，再生成 `backend.tar`；
 6. 远端在唯一 staging 中验归档哈希、成员路径、源码哈希和版本元数据；
-7. 用 root 固定的 Python 与 uv 为新版本创建独立虚拟环境；
+7. 用 root 固定的 Python 与 uv 为新版本创建独立虚拟环境，按精确锁定清单无递归求解安装，再执行 `uv pip check`；
 8. 以 compare-and-swap 方式确认应用指向和数据库 revision 没被并发任务改动；
 9. 在上传前检查备份目录；安全的 `root` 目录会自动规范为 `postgres:postgres`、`0700`，并由 `postgres` 用户创建临时文件验证实际可写；
 10. 停止所有已配置 writer；若需要迁移，先执行可读取验证的 PostgreSQL custom-format 备份；
@@ -801,7 +801,7 @@ node backend/backend-release.mjs build
 node backend/backend-release.mjs build --skip-tests
 ```
 
-带 `--skip-tests` 的 build 仍要求 Git 干净且同步，但只执行 `git diff --check`。它不上传，正式 `deploy` 也不会复用该产物；正式发布始终重新跑完整门禁和打包。
+带 `--skip-tests` 的 build 仍要求 Git 干净且同步，但只执行 `git diff --check`。它不上传，正式 `deploy` 也不会复用该产物。测试服首次真实发布仍完整执行门禁；仅当 commit、Alembic head、精确依赖清单和 Python 环境指纹全部一致时，失败重试可在 6 小时内复用原子回执；正式服仍每次重新跑完整门禁。详细边界见[主后端测试服发布耗时优化说明](main-backend-release-performance.md)。
 
 ## 应用代码回滚
 
@@ -863,7 +863,7 @@ CRITICAL: 数据库迁移已经尝试；所有 writer 保持停止。
 ./loumai-deploy backend recover --env test --yes
 ```
 
-测试服 helper 若需要在恢复状态下同步，必须先提交并推送经过测试的部署工具改动，再执行 `sync-helper --env test --yes`。同步过程只替换并校验 helper，不启动服务、不迁移数据库，也不会清除恢复标记；后续 `recover` 仍必须重新校验恢复令牌、停写状态、当前数据库 revision、完整质量门禁和联合健康检查。
+测试服 helper 若需要在恢复状态下同步，必须先提交并推送经过测试的部署工具改动，再执行 `sync-helper --env test --yes`。同步过程只替换并校验 helper，不启动服务、不迁移数据库，也不会清除恢复标记；后续 `recover` 仍必须重新校验恢复令牌、停写状态、当前数据库 revision 和联合健康检查。质量门禁只有在测试服 6 小时精确回执全部匹配时才复用；否则仍重新完整执行。
 
 ## 常见报错
 

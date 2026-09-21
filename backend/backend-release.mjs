@@ -28,7 +28,9 @@ import {
 	renderEnvironmentAudit
 } from './env-audit.mjs'
 
-export const BACKEND_RELEASE_TOOL_VERSION = '6'
+export const BACKEND_RELEASE_TOOL_VERSION = '7'
+export const BACKEND_QUALITY_GATE_CONTRACT_VERSION = 1
+export const TEST_QUALITY_GATE_RECEIPT_TTL_MS = 6 * 60 * 60 * 1000
 export const TOOL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const DEFAULT_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.test.local.env')
 export const PRODUCTION_CONFIG_PATH = join(TOOL_ROOT, 'config/backend.production.local.env')
@@ -87,6 +89,23 @@ function info(message) {
 
 function warn(message) {
 	process.stderr.write(`[backend-release] 警告：${message}\n`)
+}
+
+function elapsedSeconds(startedAt) {
+	return (Number(process.hrtime.bigint() - startedAt) / 1_000_000_000).toFixed(2)
+}
+
+function timedPhase(label, action) {
+	const startedAt = process.hrtime.bigint()
+	info(`[阶段开始] ${label}`)
+	try {
+		const result = action()
+		info(`[阶段完成] ${label}：${elapsedSeconds(startedAt)} 秒`)
+		return result
+	} catch (error) {
+		warn(`[阶段失败] ${label}：${elapsedSeconds(startedAt)} 秒`)
+		throw error
+	}
 }
 
 function expandHome(value = '') {
@@ -306,6 +325,7 @@ function usage() {
 	- 全新正式服只允许一次 bootstrap；后续必须使用 deploy，两个命令都强制腾讯云数据库。
 	- 迁移或切换失败后，普通发布会被恢复标记锁定；只能用 recover 携带新的前向修复产物继续。
 	- bootstrap/deploy/deploy-cloud/recover 不允许 --skip-tests；每次从 clean、已同步 upstream 的精确 Git commit 打包。
+	- 测试服同一提交的失败重试仅可复用 6 小时精确门禁回执；正式服永不复用。
 	- --sync-helper 只允许测试服真实发布显式使用；先安全备份并原子同步 root helper，再继续原发布流程。
 	- 正式服和 dry-run 禁止自动同步 helper；普通发布仍只校验，不会隐式替换 root 脚本。
   - rollback 只切换应用，不执行 Alembic downgrade，也不恢复数据库。
@@ -469,23 +489,59 @@ export function inspectMigrationHead(config) {
 }
 
 function runQualityGates(config, { skipTests = false } = {}) {
-	run('git', ['--no-pager', 'diff', '--check'], { cwd: config.repoRoot })
+	timedPhase('Git 差异格式检查', () => {
+		run('git', ['--no-pager', 'diff', '--check'], { cwd: config.repoRoot })
+	})
 	if (skipTests) {
 		warn('仅 build 跳过 Ruff、迁移影子库和 pytest；该产物不能由 deploy 默认发布')
 		return
 	}
-	run(config.pythonBin, ['-m', 'ruff', 'check', 'app', 'alembic', 'scripts'], {
-		cwd: config.repoRoot
+	timedPhase('Ruff 代码检查', () => {
+		run(config.pythonBin, ['-m', 'ruff', 'check', 'app', 'alembic', 'scripts'], {
+			cwd: config.repoRoot
+		})
 	})
-	run(config.pythonBin, ['-m', 'ruff', 'format', '--check', 'app', 'alembic', 'scripts'], {
-		cwd: config.repoRoot
+	timedPhase('Ruff 格式检查', () => {
+		run(config.pythonBin, ['-m', 'ruff', 'format', '--check', 'app', 'alembic', 'scripts'], {
+			cwd: config.repoRoot
+		})
 	})
-	run(config.pythonBin, ['scripts/verify_migrations_in_shadow_db.py'], {
-		cwd: config.repoRoot
+	timedPhase('Alembic 影子库升降级校验', () => {
+		run(config.pythonBin, ['scripts/verify_migrations_in_shadow_db.py'], {
+			cwd: config.repoRoot
+		})
 	})
-	run(config.pythonBin, ['scripts/run_tests_in_shadow_db.py', 'app/tests', '-q'], {
-		cwd: config.repoRoot
+	timedPhase('pytest 独立数据库全量测试', () => {
+		run(config.pythonBin, ['scripts/run_tests_in_shadow_db.py', 'app/tests', '-q'], {
+			cwd: config.repoRoot
+		})
 	})
+}
+
+function runQualityGatesForRelease(config, args, gitState, artifactDbHead) {
+	const mayReuse = config.environment === 'test'
+		&& ['deploy', 'deploy-cloud', 'recover'].includes(args.command)
+		&& !args.dryRun
+		&& !args.skipTests
+	if (!mayReuse) {
+		runQualityGates(config, { skipTests: args.skipTests })
+		return { expectation: null, reused: false }
+	}
+	const expectation = buildQualityGateExpectation(config, gitState, artifactDbHead)
+	const cached = readReusableQualityGateReceipt(expectation)
+	if (!cached.reusable) {
+		info(`测试服将执行完整质量门禁：${cached.reason}`)
+		runQualityGates(config)
+		return { expectation, reused: false }
+	}
+	info(
+		`复用测试服精确门禁回执：commit=${expectation.commit}，`
+		+ `alembic_head=${expectation.artifactDbHead}，有效至 ${cached.receipt.valid_until}`
+	)
+	timedPhase('复用回执后 Git 差异格式复核', () => {
+		run('git', ['--no-pager', 'diff', '--check'], { cwd: config.repoRoot })
+	})
+	return { expectation, reused: true }
 }
 
 function compactTimestamp(date = new Date()) {
@@ -520,6 +576,188 @@ function listFiles(root) {
 
 function sha256File(path) {
 	return createHash('sha256').update(readFileSync(path)).digest('hex')
+}
+
+function sha256Text(value) {
+	return createHash('sha256').update(String(value)).digest('hex')
+}
+
+function qualityGateExpectationError(expectation) {
+	if (!expectation || typeof expectation !== 'object' || Array.isArray(expectation)) {
+		return '门禁期望不是对象'
+	}
+	if (expectation.environment !== 'test' || expectation.branch !== 'test') {
+		return '质量门禁回执只允许测试服 test 分支'
+	}
+	if (!/^[0-9a-f]{40}$/.test(expectation.commit || '')) return 'commit 非法'
+	if (!SAFE_REVISION.test(expectation.artifactDbHead || '')) return 'Alembic head 非法'
+	for (const key of [
+		'constraintsSha256',
+		'pythonEnvironmentSha256',
+		'qualityGateEnvironmentSha256'
+	]) {
+		if (!/^[0-9a-f]{64}$/.test(expectation[key] || '')) return `${key} 非法`
+	}
+	return ''
+}
+
+export function createQualityGateReceipt(expectation, now = new Date()) {
+	const expectationError = qualityGateExpectationError(expectation)
+	if (expectationError) fail(expectationError)
+	const createdAt = new Date(now)
+	if (Number.isNaN(createdAt.getTime())) fail('质量门禁回执时间非法')
+	return {
+		schema_version: 1,
+		scope: 'BACKEND_FULL_QUALITY_GATE',
+		gate_contract_version: BACKEND_QUALITY_GATE_CONTRACT_VERSION,
+		environment: expectation.environment,
+		branch: expectation.branch,
+		commit: expectation.commit,
+		artifact_db_head: expectation.artifactDbHead,
+		constraints_sha256: expectation.constraintsSha256,
+		python_environment_sha256: expectation.pythonEnvironmentSha256,
+		quality_gate_environment_sha256: expectation.qualityGateEnvironmentSha256,
+		created_at: createdAt.toISOString(),
+		valid_until: new Date(createdAt.getTime() + TEST_QUALITY_GATE_RECEIPT_TTL_MS).toISOString()
+	}
+}
+
+export function validateQualityGateReceipt(receipt, expectation, now = new Date()) {
+	const expectationError = qualityGateExpectationError(expectation)
+	if (expectationError) return { valid: false, reason: expectationError }
+	if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) {
+		return { valid: false, reason: '回执不是 JSON 对象' }
+	}
+	const requiredMatches = {
+		schema_version: 1,
+		scope: 'BACKEND_FULL_QUALITY_GATE',
+		gate_contract_version: BACKEND_QUALITY_GATE_CONTRACT_VERSION,
+		environment: expectation.environment,
+		branch: expectation.branch,
+		commit: expectation.commit,
+		artifact_db_head: expectation.artifactDbHead,
+		constraints_sha256: expectation.constraintsSha256,
+		python_environment_sha256: expectation.pythonEnvironmentSha256,
+		quality_gate_environment_sha256: expectation.qualityGateEnvironmentSha256
+	}
+	for (const [key, expected] of Object.entries(requiredMatches)) {
+		if (receipt[key] !== expected) return { valid: false, reason: `${key} 不匹配` }
+	}
+	const currentAt = new Date(now).getTime()
+	const createdAt = Date.parse(receipt.created_at)
+	const validUntil = Date.parse(receipt.valid_until)
+	if (![currentAt, createdAt, validUntil].every(Number.isFinite)) {
+		return { valid: false, reason: '回执时间非法' }
+	}
+	if (createdAt > currentAt + 5 * 60 * 1000) {
+		return { valid: false, reason: '回执创建时间超前' }
+	}
+	if (validUntil - createdAt !== TEST_QUALITY_GATE_RECEIPT_TTL_MS) {
+		return { valid: false, reason: '回执有效期不符合固定策略' }
+	}
+	if (currentAt >= validUntil) return { valid: false, reason: '回执已过期' }
+	return { valid: true, reason: '精确匹配' }
+}
+
+function inspectPythonEnvironmentFingerprint(config) {
+	const source = [
+		'import importlib.metadata as metadata',
+		'import json',
+		'import sys',
+		'packages=sorted(f"{(dist.metadata.get(\'Name\') or \'\').lower()}=={dist.version}" for dist in metadata.distributions())',
+		'print(json.dumps({"executable":sys.executable,"packages":packages,"version":sys.version},sort_keys=True,separators=(",",":")))'
+	].join(';')
+	return sha256Text(runText(config.pythonBin, ['-c', source], {
+		cwd: config.repoRoot,
+		quiet: true
+	}))
+}
+
+function inspectQualityGateEnvironmentFingerprint(config) {
+	const relevantEnvironment = Object.entries(process.env)
+		.filter(([key]) => (
+			/^(?:APP_|BACKEND_|COS_|DATABASE_|LOUMAI_|MIGRATION_|PROPERTY_|REDIS_|SMS_|TENCENT_|VIDEO_)/
+				.test(key)
+		))
+		.sort(([left], [right]) => left.localeCompare(right))
+	const dotenvPath = join(config.repoRoot, '.env')
+	return sha256Text(JSON.stringify({
+		dotenv_sha256: existsSync(dotenvPath) ? sha256File(dotenvPath) : 'MISSING',
+		environment: relevantEnvironment
+	}))
+}
+
+function buildQualityGateExpectation(config, gitState, artifactDbHead) {
+	return {
+		environment: config.environment,
+		branch: gitState.branch,
+		commit: gitState.commit,
+		artifactDbHead,
+		constraintsSha256: sha256File(config.constraintsPath),
+		pythonEnvironmentSha256: inspectPythonEnvironmentFingerprint(config),
+		qualityGateEnvironmentSha256: inspectQualityGateEnvironmentFingerprint(config)
+	}
+}
+
+function ensureQualityGateReceiptRoot() {
+	const distRoot = join(TOOL_ROOT, 'dist')
+	const receiptRoot = join(distRoot, 'backend-gate-receipts')
+	if (!existsSync(distRoot)) mkdirSync(distRoot, { mode: 0o755 })
+	if (!existsSync(receiptRoot)) mkdirSync(receiptRoot, { mode: 0o700 })
+	for (const directory of [TOOL_ROOT, distRoot, receiptRoot]) {
+		const entry = lstatSync(directory)
+		if (!entry.isDirectory() || entry.isSymbolicLink() || realpathSync(directory) !== directory) {
+			fail(`质量门禁回执目录必须是真实目录：${directory}`)
+		}
+	}
+	if ((statSync(receiptRoot).mode & 0o022) !== 0) {
+		fail(`质量门禁回执目录不能被组或其他用户写入：${receiptRoot}`)
+	}
+	return receiptRoot
+}
+
+function qualityGateReceiptPath(expectation) {
+	if (!/^[0-9a-f]{40}$/.test(expectation.commit) || !SAFE_REVISION.test(expectation.artifactDbHead)) {
+		fail('质量门禁回执键非法')
+	}
+	return join(
+		ensureQualityGateReceiptRoot(),
+		`${expectation.commit}-${expectation.artifactDbHead}.json`
+	)
+}
+
+function readReusableQualityGateReceipt(expectation) {
+	const path = qualityGateReceiptPath(expectation)
+	if (!existsSync(path)) return { path, reason: '未找到回执', reusable: false }
+	const entry = lstatSync(path)
+	if (!entry.isFile() || entry.isSymbolicLink()) fail(`质量门禁回执必须是普通文件：${path}`)
+	if ((entry.mode & 0o022) !== 0) fail(`质量门禁回执不能被组或其他用户写入：${path}`)
+	let receipt
+	try {
+		receipt = JSON.parse(readFileSync(path, 'utf8'))
+	} catch (error) {
+		return { path, reason: `回执无法解析：${error.message}`, reusable: false }
+	}
+	const validation = validateQualityGateReceipt(receipt, expectation)
+	return { path, reason: validation.reason, receipt, reusable: validation.valid }
+}
+
+function writeQualityGateReceipt(expectation) {
+	const path = qualityGateReceiptPath(expectation)
+	const temporary = `${path}.${process.pid}.${Date.now()}.partial`
+	const receipt = createQualityGateReceipt(expectation)
+	try {
+		writeFileSync(temporary, `${JSON.stringify(receipt, null, 2)}\n`, {
+			encoding: 'utf8',
+			flag: 'wx',
+			mode: 0o600
+		})
+		renameSync(temporary, path)
+	} finally {
+		if (existsSync(temporary)) rmSync(temporary, { force: true })
+	}
+	info(`已保存测试服精确门禁回执（有效 6 小时）：${path}`)
+	return receipt
 }
 
 export function validateRuntimeConstraints(path) {
@@ -1064,36 +1302,42 @@ function uploadArchive(config, releaseId, archivePath, stageDir) {
 }
 
 function deploy(config, gitState, artifactDbHead, databaseProfile, { mode = 'deploy', notificationPlan = 'NONE' } = {}) {
-	const preflight = remotePreflight(config, databaseProfile, { mode })
-	const artifact = buildRelease(config, gitState, artifactDbHead)
+	const preflight = timedPhase('服务器发布前只读预检', () => (
+		remotePreflight(config, databaseProfile, { mode })
+	))
+	const artifact = timedPhase('构建并验签发布产物', () => (
+		buildRelease(config, gitState, artifactDbHead)
+	))
 	let prepared = false
 	try {
-		const prepareOutput = remoteHelper(config, [
+		const prepareOutput = timedPhase('创建服务器隔离 staging', () => remoteHelper(config, [
 			'prepare', artifact.releaseId, databaseProfile, mode, preflight.RECOVERY_TOKEN
-		], {
-			capture: true
-		}).stdout
+		], { capture: true }).stdout)
 		process.stdout.write(prepareOutput)
 		const stageDir = parseKeyValueOutput(prepareOutput).STAGE_DIR
 		prepared = true
-		uploadArchive(config, artifact.releaseId, artifact.archivePath, stageDir)
-		remoteHelper(config, [
-			'activate',
-			artifact.releaseId,
-			gitState.commit,
-			artifact.artifactDbHead,
-			artifact.checksumsSha256,
-			artifact.archiveSha256,
-			preflight.CURRENT,
-			preflight.DB_REVISION,
-			databaseProfile,
-			mode,
-			preflight.RECOVERY_TOKEN,
-			...(notificationPlan === 'NONE' ? [] : [notificationPlan])
-		])
+		timedPhase('上传发布产物', () => {
+			uploadArchive(config, artifact.releaseId, artifact.archivePath, stageDir)
+		})
+		timedPhase('安装依赖、迁移并激活新版本', () => {
+			remoteHelper(config, [
+				'activate',
+				artifact.releaseId,
+				gitState.commit,
+				artifact.artifactDbHead,
+				artifact.checksumsSha256,
+				artifact.archiveSha256,
+				preflight.CURRENT,
+				preflight.DB_REVISION,
+				databaseProfile,
+				mode,
+				preflight.RECOVERY_TOKEN,
+				...(notificationPlan === 'NONE' ? [] : [notificationPlan])
+			])
+		})
 		prepared = false
 		info(`核心版本激活完成：${artifact.releaseId}`)
-		verifyNotificationAcceptance(config)
+		timedPhase('通知调度验收', () => verifyNotificationAcceptance(config))
 	} finally {
 		if (prepared) tryRemoteAbort(config, artifact.releaseId)
 	}
@@ -1325,11 +1569,22 @@ export function main(argv = process.argv.slice(2)) {
 		if (args.syncHelper) syncRemoteHelper(config)
 		else assertRemoteHelperExact(config)
 	}
-	runQualityGates(config, { skipTests: args.skipTests })
+	const qualityGate = runQualityGatesForRelease(config, args, gitState, artifactDbHead)
 	const verifiedGitState = inspectGitState(config)
 	const verifiedDbHead = inspectMigrationHead(config)
 	if (verifiedGitState.commit !== gitState.commit || verifiedDbHead !== artifactDbHead) {
 		fail('质量检查期间源码 commit 或 Alembic head 发生变化，请重新执行')
+	}
+	if (qualityGate.expectation) {
+		const verifiedExpectation = buildQualityGateExpectation(
+			config,
+			verifiedGitState,
+			verifiedDbHead
+		)
+		if (JSON.stringify(verifiedExpectation) !== JSON.stringify(qualityGate.expectation)) {
+			fail('质量检查期间依赖约束、Python 或本地门禁环境发生变化，请重新执行')
+		}
+		if (!qualityGate.reused) writeQualityGateReceipt(verifiedExpectation)
 	}
 	if (args.command === 'build') {
 		buildRelease(config, gitState, artifactDbHead)
@@ -1339,9 +1594,12 @@ export function main(argv = process.argv.slice(2)) {
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+	const startedAt = process.hrtime.bigint()
 	try {
 		main()
+		info(`[总耗时] ${elapsedSeconds(startedAt)} 秒`)
 	} catch (error) {
+		warn(`[总耗时] ${elapsedSeconds(startedAt)} 秒`)
 		process.stderr.write(`[backend-release] ERROR: ${error.message}\n`)
 		process.exitCode = 1
 	}

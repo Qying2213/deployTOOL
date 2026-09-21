@@ -44,6 +44,7 @@ PROJECT_ROOT="${LOUMAI_PROJECT_ROOT:-$(dirname "$SCRIPT_ROOT")}"
 SOURCE_REPO="${LOUMAI_SOURCE_REPO:-$PROJECT_ROOT/loumai-ai}"
 DEPLOY_REPO="$SCRIPT_ROOT"
 BACKEND_PYTHON="${LOUMAI_BACKEND_PYTHON:-$SOURCE_REPO/.venv311/bin/python}"
+TOTAL_STARTED_AT="$SECONDS"
 
 fail() {
   printf '错误：%s\n' "$1" >&2
@@ -54,7 +55,17 @@ on_error() {
   local exit_code=$?
   printf '\n发布脚本在第 %s 行停止（退出码 %s）。\n' "$1" "$exit_code" >&2
   printf '失败命令：%s\n' "$2" >&2
+  printf '失败前总耗时：%s 秒\n' "$((SECONDS - TOTAL_STARTED_AT))" >&2
   exit "$exit_code"
+}
+
+run_phase() {
+  local label="$1" started_at
+  shift
+  started_at="$SECONDS"
+  printf '\n[阶段开始] %s\n' "$label"
+  "$@"
+  printf '[阶段完成] %s：%s 秒\n' "$label" "$((SECONDS - started_at))"
 }
 
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
@@ -71,7 +82,7 @@ if [ -n "$(git -C "$DEPLOY_REPO" status --porcelain)" ]; then
   fail "部署工具仓库存在未提交修改，停止发布。"
 fi
 
-git -C "$SOURCE_REPO" fetch origin --prune
+run_phase "同步 origin 引用" git -C "$SOURCE_REPO" fetch origin --prune
 
 TEST_WORKTREE="$(git -C "$SOURCE_REPO" worktree list --porcelain | awk '
   BEGIN { RS=""; FS="\n" }
@@ -93,7 +104,7 @@ if [ -n "$(git -C "$TEST_WORKTREE" status --porcelain)" ]; then
   fail "test 工作树存在未提交修改，停止发布。"
 fi
 
-git -C "$TEST_WORKTREE" pull --ff-only origin test
+run_phase "快进同步 test 工作树" git -C "$TEST_WORKTREE" pull --ff-only origin test
 
 LOCAL_COMMIT="$(git -C "$TEST_WORKTREE" rev-parse HEAD)"
 REMOTE_COMMIT="$(git -C "$TEST_WORKTREE" rev-parse origin/test)"
@@ -109,20 +120,28 @@ export BACKEND_PYTHON_BIN="$BACKEND_PYTHON"
 
 cd "$DEPLOY_REPO"
 
-./loumai-deploy backend status --env test --database-profile active
-./loumai-deploy backend env-audit --env test
-./loumai-deploy backend deploy-cloud --env test --dry-run
+run_phase "测试服当前状态检查" \
+  ./loumai-deploy backend status --env test --database-profile active
+run_phase "本地与测试服环境审计" \
+  ./loumai-deploy backend env-audit --env test
+run_phase "云数据库只读发布预检" \
+  ./loumai-deploy backend deploy-cloud --env test --dry-run
 
 if [ "$MODE" = "dry-run" ]; then
-  printf '\n测试服主项目后端只读预检完成；没有执行真实发布。\n'
+  printf '\n测试服主项目后端只读预检完成；没有执行真实发布，总耗时 %s 秒。\n' \
+    "$((SECONDS - TOTAL_STARTED_AT))"
   exit 0
 fi
 
-./loumai-deploy backend deploy-cloud --env test --yes
-./loumai-deploy backend status --env test --database-profile active
+run_phase "主后端真实发布" \
+  ./loumai-deploy backend deploy-cloud --env test --yes
+run_phase "发布后状态复核" \
+  ./loumai-deploy backend status --env test --database-profile active
 
-curl --fail --silent --show-error \
-  --retry 3 --retry-delay 2 --retry-connrefused \
-  https://test.yinlizhangyu.com/health
+run_phase "公网健康检查" \
+  curl --fail --silent --show-error \
+    --retry 3 --retry-delay 2 --retry-connrefused \
+    https://test.yinlizhangyu.com/health
 
-printf '\n测试服主项目后端发布及健康检查完成。\n'
+printf '\n测试服主项目后端发布及健康检查完成，总耗时 %s 秒。\n' \
+  "$((SECONDS - TOTAL_STARTED_AT))"

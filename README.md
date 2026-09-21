@@ -87,6 +87,8 @@ cd /Users/qinyang/Desktop/zuling/deploy--loumai && ./loumai-deploy frontend depl
 
 一键命令内部仍会执行 Git、测试、产物、哈希和服务器状态门禁；任何检查失败都会停止，不会强行上线。后端源码仓库里的本地 `.env` 不会随命令上传。启用 P1-MEDIA-02 前，必须先按[后端自动发布说明](docs/backend-auto-release.md#41-p1-media-02-视频-worker-一次性安装)一次性安装固定 FFmpeg、视频 Worker 和日志脱敏配置；该系统依赖不由日常一键命令下载。
 
+主后端发布现在会输出每个阶段及总耗时；精确依赖以无递归求解方式安装并执行一致性检查。测试服同一 commit、Alembic head、依赖清单和 Python 环境的失败重试，可在 6 小时内复用精确门禁回执；正式服永不复用。详见[主后端发布耗时优化说明](docs/main-backend-release-performance.md)。
+
 > `website` 发布的是 `yinlizhangyu.com` 正式官网，不是测试服。官网首次初始化完成前，不能把 `website deploy --yes` 当作测试服一键发布命令使用。
 
 如果需要先查看状态或预演，再使用下面的分步命令。
@@ -306,7 +308,7 @@ ssh -o BatchMode=yes -i /Users/qinyang/.ssh/loumai_test_hexhub ubuntu@132.232.22
 
 ### 5.1 为什么依赖安装有时较慢
 
-每个后端 release 都创建独立 `.venv`，避免新旧版本共享环境导致无法回滚。下载包会保存在服务器的永久 `uv` 缓存；第一次较慢，后续通常复用缓存。不要在安装过程中断网、关闭终端或手工删除 partial 目录。
+每个后端 release 都创建独立 `.venv`，避免新旧版本共享环境导致无法回滚。下载包会保存在服务器的永久 `uv` 缓存；精确版本清单使用 `--no-deps` 避免再次递归求解，安装后再由 `uv pip check` 验证依赖完整性。不要在安装过程中断网、关闭终端或手工删除 partial 目录。
 
 ### 5.2 `.env` 为什么不会一起发布
 

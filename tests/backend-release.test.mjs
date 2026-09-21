@@ -14,6 +14,9 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
 import {
+	BACKEND_RELEASE_TOOL_VERSION,
+	BACKEND_QUALITY_GATE_CONTRACT_VERSION,
+	createQualityGateReceipt,
 	createReleaseId,
 	defaultExpectedBranch,
 	DEFAULT_CONFIG_PATH,
@@ -26,8 +29,10 @@ import {
 	PRODUCTION_CONSTRAINTS_PATH,
 	remoteHelperContractSource,
 	shellQuote,
+	TEST_QUALITY_GATE_RECEIPT_TTL_MS,
 	TOOL_ROOT,
 	validateExpectedBranch,
+	validateQualityGateReceipt,
 	validateRuntimeConstraints,
 	validateSourceArtifact
 } from '../backend/backend-release.mjs'
@@ -367,6 +372,66 @@ test('release id、shell 引用和默认路径保持确定', () => {
 	)
 })
 
+test('测试服质量门禁回执精确绑定提交、迁移、依赖与时效', () => {
+	const now = new Date('2026-09-21T02:00:00.000Z')
+	const expectation = {
+		environment: 'test',
+		branch: 'test',
+		commit: 'a'.repeat(40),
+		artifactDbHead: '20260918_0119',
+		constraintsSha256: 'b'.repeat(64),
+		pythonEnvironmentSha256: 'c'.repeat(64),
+		qualityGateEnvironmentSha256: 'f'.repeat(64)
+	}
+	const receipt = createQualityGateReceipt(expectation, now)
+	assert.equal(receipt.gate_contract_version, BACKEND_QUALITY_GATE_CONTRACT_VERSION)
+	assert.equal(
+		Date.parse(receipt.valid_until) - Date.parse(receipt.created_at),
+		TEST_QUALITY_GATE_RECEIPT_TTL_MS
+	)
+	assert.deepEqual(validateQualityGateReceipt(receipt, expectation, now), {
+		valid: true,
+		reason: '精确匹配'
+	})
+	assert.match(
+		validateQualityGateReceipt(receipt, { ...expectation, commit: 'd'.repeat(40) }, now).reason,
+		/commit 不匹配/
+	)
+	assert.match(
+		validateQualityGateReceipt(
+			receipt,
+			{ ...expectation, pythonEnvironmentSha256: 'e'.repeat(64) },
+			now
+		).reason,
+		/Python|python_environment_sha256/
+	)
+	assert.match(
+		validateQualityGateReceipt(
+			receipt,
+			{ ...expectation, qualityGateEnvironmentSha256: '0'.repeat(64) },
+			now
+		).reason,
+		/quality_gate_environment_sha256/
+	)
+	assert.match(
+		validateQualityGateReceipt(receipt, expectation, new Date(receipt.valid_until)).reason,
+		/已过期/
+	)
+	const productionExpectation = { ...expectation, environment: 'production', branch: 'master' }
+	assert.throws(
+		() => createQualityGateReceipt(productionExpectation, now),
+		/只允许测试服 test 分支/
+	)
+	assert.match(
+		validateQualityGateReceipt(receipt, productionExpectation, now).reason,
+		/只允许测试服 test 分支/
+	)
+	assert.throws(
+		() => createQualityGateReceipt({ ...expectation, constraintsSha256: '' }, now),
+		/constraintsSha256 非法/
+	)
+})
+
 test('运行时依赖必须逐项精确锁版本，且不能重复或引用 URL', () => {
 	const root = mkdtempSync(join(tmpdir(), 'loumai-backend-constraints-test-'))
 	try {
@@ -435,7 +500,9 @@ test('本地发布器从干净且已同步的精确 Git commit 打包，并避�
 	const rollbackStart = source.indexOf('function rollback(', deployStart)
 	assert.ok(deployStart > 0 && rollbackStart > deployStart)
 	assert.doesNotMatch(source.slice(deployStart, rollbackStart), /runQualityGates/)
-	assert.equal((source.match(/runQualityGates\(config/g) || []).length, 2)
+	assert.equal((source.match(/function runQualityGates\(/g) || []).length, 1)
+	assert.match(source, /config\.environment === 'test'[\s\S]*readReusableQualityGateReceipt/)
+	assert.match(source, /qualityGate\.expectation[\s\S]*buildQualityGateExpectation/)
 })
 
 test('后端长时间发布为 SSH 与 SCP 配置保活，避免依赖安装期间空闲断线', () => {
@@ -448,6 +515,7 @@ test('后端长时间发布为 SSH 与 SCP 配置保活，避免依赖安装期�
 test('服务器激活器具备 root 信任边界、验签、并发锁和原子切换', () => {
 	const helper = remoteHelperContractSource()
 	assert.match(helper, /^#!\/bin\/bash/)
+	assert.match(helper, new RegExp(`readonly HELPER_VERSION="${BACKEND_RELEASE_TOOL_VERSION}"`))
 	assert.match(helper, /set -euo pipefail/)
 	assert.match(helper, /export PATH="\/usr\/sbin:\/usr\/bin:\/sbin:\/bin"/)
 	assert.match(helper, /unset BASH_ENV ENV CDPATH TAR_OPTIONS PYTHONPATH PYTHONHOME/)
@@ -481,7 +549,7 @@ test('服务器激活器具备 root 信任边界、验签、并发锁和原子�
 	assert.match(helper, /run_as_clean "\$BUILD_USER"/)
 	assert.equal(
 		(helper.match(/\/usr\/bin\/env -i --chdir="\$build_home"/g) || []).length,
-		4,
+		5,
 		'所有 uv 子进程都必须从构建用户可访问的 HOME 启动',
 	)
 	assert.match(helper, /正式服部署用户与服务用户必须使用不同 UID/)
@@ -505,7 +573,32 @@ test('服务器激活器具备 root 信任边界、验签、并发锁和原子�
 	assert.match(helper, /restore drill must be successful within the last 90 days/)
 	assert.match(helper, /sslmode=verify-full/)
 	assert.match(helper, /production connection is not using TLS/)
-	assert.match(helper, /--constraint "\$backend\/runtime-constraints\.txt" \\\n\s+setuptools/)
+	assert.match(helper, /--no-deps \\\n\s+--requirement "\$backend\/runtime-constraints\.txt"/)
+	assert.match(helper, /--no-deps \\\n\s+--no-build-isolation/)
+	assert.match(helper, /pip check --python "\$backend\/\.venv\/bin\/python"/)
+	assert.match(helper, /RUNTIME_INSTALL_MODE=PINNED_NO_DEPS/)
+	const installRuntime = helper.slice(
+		helper.indexOf('install_runtime()'),
+		helper.indexOf('assert_database_target_for_runner()', helper.indexOf('install_runtime()')),
+	)
+	assert.ok(
+		installRuntime.indexOf('--requirement "$backend/runtime-constraints.txt"')
+			< installRuntime.indexOf('--no-build-isolation'),
+		'必须先安装锁定依赖，再安装应用包',
+	)
+	assert.ok(
+		installRuntime.indexOf('--no-build-isolation') < installRuntime.indexOf('pip check --python'),
+		'应用包安装后必须校验完整依赖',
+	)
+	const activate = helper.slice(
+		helper.indexOf('action_activate()'),
+		helper.indexOf('action_abort()', helper.indexOf('action_activate()')),
+	)
+	assert.ok(
+		activate.indexOf('install_runtime "$backend" "$expected_checksums"')
+			< activate.indexOf('stop_writers'),
+		'依赖安装与校验必须发生在停止 writer 之前',
+	)
 	assert.match(helper, /def environment_string_list\(name: str\) -> list\[str\]:/)
 	assert.match(helper, /allowed_hosts = environment_string_list\("BACKEND_ALLOWED_HOSTS"\)/)
 	assert.match(helper, /origins = environment_string_list\("BACKEND_CORS_ORIGINS"\)/)
@@ -826,7 +919,7 @@ test('真实发布在耗时质量门禁前校验 helper，上传前仍复核，�
 	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
 	const mainSource = source.slice(source.indexOf('export function main('))
 	const earlyCheck = mainSource.indexOf("if (args.command !== 'build') {")
-	const qualityGates = mainSource.indexOf('runQualityGates(config,')
+	const qualityGates = mainSource.indexOf('runQualityGatesForRelease(config,')
 	assert.ok(earlyCheck > 0 && earlyCheck < qualityGates)
 	assert.match(mainSource, /if \(args\.syncHelper\) syncRemoteHelper\(config\)/)
 	assert.match(mainSource, /else assertRemoteHelperExact\(config\)/)
