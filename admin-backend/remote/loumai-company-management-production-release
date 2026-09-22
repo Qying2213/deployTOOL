@@ -23,7 +23,7 @@ import time
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "4"
+VERSION = "5"
 ROOT = Path("/srv/loumai-company-management-production")
 UV_CACHE = ROOT / "uv-cache"
 CONFIG = Path("/etc/loumai/company-management-production-release.env")
@@ -31,6 +31,7 @@ APP_ENV = Path("/etc/loumai/company-management-production.env")
 DB_ENV = Path("/etc/loumai/company-management-production-database.env")
 MAIN_CONFIG = Path("/etc/loumai/backend-release.env")
 MAIN_ROOT = Path("/srv/loumai-backend")
+MAIN_HELPER = Path("/usr/local/sbin/loumai-backend-release")
 HELPER = Path("/usr/local/sbin/loumai-company-management-production-release")
 SERVICE = "loumai-company-management.service"
 RUN_USER = "loumai-admin"
@@ -364,6 +365,31 @@ def contract(*, allow_recovery=False):
     config["uv"] = trusted_executable(config["LOUMAI_COMPANY_UV"])
     command(["/usr/sbin/nginx", "-t"])
     return config, environment
+
+
+def require_recovery_fail_closed():
+    """Allow staging only while the main release fence has stopped every writer."""
+    marker = MAIN_ROOT / ".migration-recovery-required"
+    secure_file(marker, secret=True)
+    secure_file(MAIN_HELPER)
+    status = command([MAIN_HELPER, "status", "active"], timeout=90)
+    values = dict(
+        line.split("=", 1)
+        for line in status.splitlines()
+        if re.fullmatch(r"[A-Z_]+=[^\r\n]*", line)
+    )
+    require(
+        values.get("RECOVERY_REQUIRED") == "true"
+        and values.get("DEPLOYMENT_STATE") == "RECOVERY_REQUIRED"
+        and values.get("DATABASE_WRITERS") == "recovery_fail_closed",
+        "business recovery is not in a verified fail-closed state",
+    )
+    require(
+        systemd_value("ActiveState") in {"inactive", "failed"}
+        and systemd_value("MainPID") == "0"
+        and systemd_value("UnitFileState") == "disabled",
+        "admin writer must remain stopped and disabled during recovery staging",
+    )
 
 
 def release_path(release_id):
@@ -897,7 +923,9 @@ def main(argv):
         "contract": 1,
         "restart": 2,
         "prepare": 3,
+        "prepare-recovery": 3,
         "activate": 4,
+        "stage-recovery": 4,
         "rollback": 3,
         "check-release": 3,
     }
@@ -937,13 +965,16 @@ def main(argv):
         probe_release(target, environment)
         print(f"RELEASE_VALID={target}")
         return
+    recovery_staging = action in {"prepare-recovery", "stage-recovery"}
     with locks():
-        config, environment = contract()
+        config, environment = contract(allow_recovery=recovery_staging)
+        if recovery_staging:
+            require_recovery_fail_closed()
         previous = current_target()
         expected = arguments[-1]
         require(previous == expected, "current changed; repeat preflight")
         incoming = ROOT / "incoming" / f"{release_id}.partial"
-        if action == "prepare":
+        if action in {"prepare", "prepare-recovery"}:
             require(
                 not incoming.exists()
                 and not incoming.is_symlink()
@@ -990,6 +1021,19 @@ def main(argv):
         # Move before building so venv executable shebangs use their permanent path.
         partial.rename(target.parent)
         build_runtime(target, config)
+        if action == "stage-recovery":
+            try:
+                probe_release(target, environment)
+                require_recovery_fail_closed()
+                switch_current(str(target))
+                require_recovery_fail_closed()
+                shutil.rmtree(incoming)
+                print(f"STAGED_FOR_RECOVERY={target}\nPREVIOUS={previous}")
+                return
+            except Exception:
+                if current_target() == str(target):
+                    switch_current(previous)
+                raise
         activate_target(target, previous, config, environment)
         shutil.rmtree(incoming)
         print(f"ACTIVATED={target}\nPREVIOUS={previous}")

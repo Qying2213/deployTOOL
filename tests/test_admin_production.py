@@ -328,6 +328,63 @@ class ProductionAdminTest(unittest.TestCase):
                 helper.main(["preflight"])
             report.assert_not_called()
 
+    def test_recovery_staging_requires_verified_fail_closed_writers(self):
+        healthy = "\n".join(
+            (
+                "RECOVERY_REQUIRED=true",
+                "DEPLOYMENT_STATE=RECOVERY_REQUIRED",
+                "DATABASE_WRITERS=recovery_fail_closed",
+            )
+        )
+        with (
+            patch.object(helper, "secure_file"),
+            patch.object(helper, "command", return_value=healthy),
+            patch.object(
+                helper,
+                "systemd_value",
+                side_effect=lambda name: {
+                    "ActiveState": "inactive",
+                    "MainPID": "0",
+                    "UnitFileState": "disabled",
+                }[name],
+            ),
+        ):
+            helper.require_recovery_fail_closed()
+        with (
+            patch.object(helper, "secure_file"),
+            patch.object(
+                helper,
+                "command",
+                return_value=healthy.replace("recovery_fail_closed", "verified"),
+            ),
+            patch.object(helper, "systemd_value", return_value="inactive"),
+            self.assertRaisesRegex(RuntimeError, "fail-closed"),
+        ):
+            helper.require_recovery_fail_closed()
+
+    def test_prepare_recovery_allows_only_fail_closed_staging(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(helper, "ROOT", Path(directory).resolve()),
+            patch.object(helper.os, "geteuid", return_value=0),
+            patch.object(helper, "locks", return_value=contextlib.nullcontext()),
+            patch.object(helper, "contract", return_value=({}, {})) as contract,
+            patch.object(helper, "require_recovery_fail_closed") as fail_closed,
+            patch.object(
+                helper.pwd,
+                "getpwnam",
+                return_value=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            (Path(directory) / "incoming").mkdir()
+            helper.main(["prepare-recovery", RELEASE, "NONE"])
+            contract.assert_called_once_with(allow_recovery=True)
+            fail_closed.assert_called_once_with()
+            self.assertTrue(
+                (Path(directory) / "incoming" / f"{RELEASE}.partial").is_dir()
+            )
+
     def test_runtime_probe_checks_memberships_ddl_temp_and_schema(self):
         for marker in (
             "pg_has_role",
