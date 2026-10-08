@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import os
 import tarfile
 import tempfile
 import unittest
@@ -126,6 +127,20 @@ class PublicWebsiteReleaseTest(unittest.TestCase):
                 self.assertTrue((target / "site/index.html").is_file())
                 with self.assertRaises(AssertionError):
                     remote.unpack_release(source)
+
+    def test_release_directory_is_traversable_under_root_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "releases").mkdir()
+            source = root / "artifact.tar.gz"
+            archive(source)
+            previous = os.umask(0o077)
+            try:
+                with patch.object(remote, "ROOT", root):
+                    target = remote.unpack_release(source)
+                self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+            finally:
+                os.umask(previous)
 
     def test_archive_rejects_bad_headers_before_writing(self):
         for name, kind in (

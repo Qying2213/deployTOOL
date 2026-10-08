@@ -305,6 +305,8 @@ def unpack_release(archive):
         target = ROOT / "releases" / release_id
         assert not target.exists(), "Release already exists"
         target.mkdir(mode=0o755)
+        # root 的 umask=077 会把 mkdir 的755收紧成700；非特权服务须可遍历。
+        target.chmod(0o755)
         package.extractall(target, filter="data")
     return target
 
