@@ -54,6 +54,15 @@ def archive(path, values=None, extra=None):
 
 
 class PublicWebsiteReleaseTest(unittest.TestCase):
+    def test_old_python_is_rejected_before_gate_or_server_calls(self):
+        with (
+            patch.object(local.tarfile, "data_filter", None),
+            patch.object(local.subprocess, "run") as call,
+        ):
+            with self.assertRaises(AssertionError):
+                local.stage({})
+            call.assert_not_called()
+
     def test_sources_must_be_matching_clean_and_pushed(self):
         with patch.object(
             local, "run", side_effect=[local.BRANCH, "", "a" * 40, "a" * 40]

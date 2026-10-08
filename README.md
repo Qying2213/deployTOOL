@@ -19,7 +19,7 @@
 
 本命令只针对 `yinlizhangyu.com`／`www`；不运行 `backend deploy`，不迁移数据库，也不发布 App、小程序、管理后台或 IM／视频 Worker。源码和部署工具使用同名分支 `feat/P1-WEB-01-public-property-website`，三个工作区须干净、提交已推送；不自动合并 `test/master`。
 
-本机非敏感配置按 `config/public-website.production.example.env` 填写，存入 Git 忽略的 `config/public-website.production.local.env`，权限600。真实只读连接和媒体凭据只从服务器既有配置提取，不上传业务 `.env`，不在日志显示。独立入口 `app.public_website_main:app` 只挂载7个公开查询／媒体路径及健康检查；实际生产账号必须无写入／CREATE／管理权限，TLS必须verify-full。
+本机需Python3.11.9或以上（入口默认`python3.11`，不是macOS系统Python3.9）。非敏感配置按 `config/public-website.production.example.env` 填写，存入 Git 忽略的 `config/public-website.production.local.env`，权限600。真实只读连接和媒体凭据只从服务器既有配置提取，不上传业务 `.env`，不在日志显示。独立入口 `app.public_website_main:app` 只挂载7个公开查询／媒体路径及健康检查；实际生产账号必须无写入／CREATE／管理权限，TLS必须verify-full。
 
 首次迁移顺序：
 

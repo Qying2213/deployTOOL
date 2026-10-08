@@ -136,6 +136,9 @@ def validate_site(folder):
 
 
 def stage(config):
+    assert callable(getattr(tarfile, "data_filter", None)), (
+        "Python 3.11.9+ is required for safe archive extraction"
+    )
     backend = Path(config["WEBSITE_BACKEND_REPO"])
     frontend = Path(config["WEBSITE_FRONTEND_REPO"])
     backend_commit = repository_commit(backend)

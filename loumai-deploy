@@ -36,7 +36,7 @@ case "${TARGET}" in
     ;;
   public-website)
     shift
-    exec "${PYTHON_BIN:-python3}" "${TOOL_ROOT}/public-website/release.py" "$@"
+    exec "${PYTHON_BIN:-python3.11}" "${TOOL_ROOT}/public-website/release.py" "$@"
     ;;
   help|-h|--help|"")
     cat <<'EOF'
