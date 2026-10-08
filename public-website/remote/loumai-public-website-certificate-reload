@@ -1,0 +1,7 @@
+#!/bin/sh
+# Only this website certificate. Existing API/admin/H5 renewal hooks are untouched.
+set -eu
+if [ "${RENEWED_LINEAGE:-}" = "/etc/letsencrypt/live/yinlizhangyu.com" ]; then
+    /usr/sbin/nginx -t
+    /usr/bin/systemctl reload nginx
+fi

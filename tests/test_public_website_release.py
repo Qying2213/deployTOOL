@@ -289,6 +289,16 @@ class PublicWebsiteReleaseTest(unittest.TestCase):
         self.assertIn("proxy_set_header X-Real-IP $remote_addr;", source)
         self.assertNotIn("$proxy_add_x_forwarded_for", source)
         self.assertNotIn("root /srv/workway-site", source)
+        self.assertIn("proxy_pass http://@NEW_IPV4@;", source)
+
+    def test_certificate_reload_hook_is_scoped_to_website_certificate(self):
+        source = (
+            ROOT / "public-website/remote/loumai-public-website-certificate-reload"
+        ).read_text()
+        self.assertIn("${RENEWED_LINEAGE:-}", source)
+        self.assertIn('= "/etc/letsencrypt/live/yinlizhangyu.com"', source)
+        self.assertIn("/usr/sbin/nginx -t", source)
+        self.assertNotIn("restart", source)
 
     def test_certificate_validation_failure_does_not_install_tls_directory(self):
         with tempfile.TemporaryDirectory() as directory:
