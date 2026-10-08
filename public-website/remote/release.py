@@ -521,22 +521,7 @@ def retire_old_site(new_ipv4):
         config.write_text(source.replace("@NEW_IPV4@", new_ipv4))
         run(["nginx", "-t"])
         run(["systemctl", "reload", "nginx"])
-        output = run(
-            [
-                "curl",
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--max-time",
-                "15",
-                "--noproxy",
-                "*",
-                "--resolve",
-                "yinlizhangyu.com:443:127.0.0.1",
-                "https://yinlizhangyu.com/_site_health",
-            ]
-        )
-        assert json.loads(output).get("read_only") is True
+        verify_old_forwarder()
         assert before == {
             name: run(["systemctl", "show", name, "--property=MainPID,ActiveState"])
             for name in SERVICES
@@ -555,6 +540,37 @@ def retire_old_site(new_ipv4):
             }
         )
     )
+
+
+def verify_old_forwarder():
+    # reload异步生效，旧worker可能暂时返回旧静态HTML；仅接受完整只读健康结果。
+    for _ in range(10):
+        try:
+            output = run(
+                [
+                    "curl",
+                    "--silent",
+                    "--show-error",
+                    "--fail",
+                    "--max-time",
+                    "15",
+                    "--noproxy",
+                    "*",
+                    "--resolve",
+                    "yinlizhangyu.com:443:127.0.0.1",
+                    "https://yinlizhangyu.com/_site_health",
+                ]
+            )
+            if json.loads(output) == {
+                "status": "ok",
+                "database": "ok",
+                "read_only": True,
+            }:
+                return
+        except (ValueError, subprocess.CalledProcessError):
+            pass
+        time.sleep(0.5)
+    raise RuntimeError("Old website forwarder verification failed")
 
 
 def status():

@@ -300,6 +300,23 @@ class PublicWebsiteReleaseTest(unittest.TestCase):
         self.assertIn("/usr/sbin/nginx -t", source)
         self.assertNotIn("restart", source)
 
+    def test_old_forwarder_waits_for_reload_and_requires_verified_readonly_health(self):
+        valid = json.dumps({"status": "ok", "database": "ok", "read_only": True})
+        with (
+            patch.object(
+                remote, "run", side_effect=["<html>old website</html>", valid]
+            ),
+            patch.object(remote.time, "sleep") as pause,
+        ):
+            remote.verify_old_forwarder()
+            pause.assert_called_once_with(0.5)
+        with (
+            patch.object(remote, "run", return_value='{"read_only":true}'),
+            patch.object(remote.time, "sleep"),
+        ):
+            with self.assertRaises(RuntimeError):
+                remote.verify_old_forwarder()
+
     def test_certificate_validation_failure_does_not_install_tls_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
