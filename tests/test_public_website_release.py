@@ -279,6 +279,7 @@ class PublicWebsiteReleaseTest(unittest.TestCase):
         self.assertNotIn("$request_uri", http)
         self.assertNotIn("$args", http)
         self.assertIn("return 405", site)
+        self.assertIn("error_log /dev/null;", site)
 
     def test_old_forwarder_verifies_tls_and_overwrites_client_identity(self):
         source = (
@@ -290,6 +291,7 @@ class PublicWebsiteReleaseTest(unittest.TestCase):
         self.assertNotIn("$proxy_add_x_forwarded_for", source)
         self.assertNotIn("root /srv/workway-site", source)
         self.assertIn("proxy_pass http://@NEW_IPV4@;", source)
+        self.assertIn("error_log /dev/null;", source)
 
     def test_certificate_reload_hook_is_scoped_to_website_certificate(self):
         source = (
