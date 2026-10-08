@@ -34,6 +34,10 @@ case "${TARGET}" in
     shift
     exec node "${TOOL_ROOT}/website/site-release.mjs" "$@"
     ;;
+  public-website)
+    shift
+    exec "${PYTHON_BIN:-python3}" "${TOOL_ROOT}/public-website/release.py" "$@"
+    ;;
   help|-h|--help|"")
     cat <<'EOF'
 工位有方统一部署工具
@@ -108,10 +112,15 @@ case "${TARGET}" in
   ./loumai-deploy website status
   ./loumai-deploy website rollback --release RELEASE_ID --dry-run
   ./loumai-deploy website rollback --release RELEASE_ID --yes
+
+  ./loumai-deploy public-website status
+  ./loumai-deploy public-website stage --yes
+  ./loumai-deploy public-website activate --release RELEASE_ID --yes
+  ./loumai-deploy public-website rollback --release RELEASE_ID --yes
 EOF
     ;;
   *)
-    printf '未知目标：%s（只能是 production、frontend、backend、admin、admin-backend、admin-frontend 或 website）\n' "${TARGET}" >&2
+    printf '未知目标：%s（只能是 production、frontend、backend、admin、admin-backend、admin-frontend、website 或 public-website）\n' "${TARGET}" >&2
     exit 2
     ;;
 esac

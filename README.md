@@ -2,7 +2,7 @@
 
 这个仓库只负责发布，不存放业务源码，也不保存测试服密码、Token、数据库连接串或私钥内容。
 
-它统一发布五个独立目标：
+它统一发布以下独立目标：
 
 | 目标 | 源码目录 | 线上内容 |
 | --- | --- | --- |
@@ -10,9 +10,45 @@
 | `backend` | `../loumai-ai` | 测试服/正式服 FastAPI、数据库迁移、IM/视频 Worker、定时任务 |
 | `admin-backend` | `../conpanyManagement` | 测试服/正式服独立企业管理后台后端 |
 | `admin-frontend` | 同事交付的后台 ZIP | 独立测试站/正式管理后台站点 |
-| `website` | `../guanwang` | 工位有方官网静态文件 |
+| `public-website` | 同名 P1-WEB-01 功能分支的后端与前端 `website/` | 新匿名查房官网：静态前端＋独立只读 API，不发布小程序 |
+| `website`（旧） | `../guanwang` | 原静态官网发布器；不可用于新查房官网 |
 
 日常操作只使用根目录的 `./loumai-deploy`。详细的一次性服务器安装说明放在 `docs/`，不要把安装步骤和日常发布混着执行。
+
+## 新主播查房官网：与主业务发布隔离
+
+本命令只针对 `yinlizhangyu.com`／`www`；不运行 `backend deploy`，不迁移数据库，也不发布 App、小程序、管理后台或 IM／视频 Worker。源码和部署工具使用同名分支 `feat/P1-WEB-01-public-property-website`，三个工作区须干净、提交已推送；不自动合并 `test/master`。
+
+本机非敏感配置按 `config/public-website.production.example.env` 填写，存入 Git 忽略的 `config/public-website.production.local.env`，权限600。真实只读连接和媒体凭据只从服务器既有配置提取，不上传业务 `.env`，不在日志显示。独立入口 `app.public_website_main:app` 只挂载7个公开查询／媒体路径及健康检查；实际生产账号必须无写入／CREATE／管理权限，TLS必须verify-full。
+
+首次迁移顺序：
+
+```bash
+./loumai-deploy public-website backup-old --yes
+./loumai-deploy public-website import-certificate --yes
+./loumai-deploy public-website stage --yes
+```
+
+`stage` 重新执行完整隔离门禁、前端测试／构建、固定三仓提交和产物哈希，并在服务器验证真实只读权限；只暂存，不启动服务、不切域名、不停止旧官网。人工素材审核、容量及网关实测属于额外上线门禁，不因暂存成功而通过。
+
+审核和预发布检查完成后，使用上一步输出的准确 release ID：
+
+```bash
+./loumai-deploy public-website activate --release RELEASE_ID --yes
+./loumai-deploy public-website status
+```
+
+新服务固定在 `/srv/loumai-public-website/current`，仅监听127.0.0.1:8011；环境在 `/etc/loumai-public-website/website.env`（root600）。Nginx只记录URI不记录查询参数或媒体票据，查询5次/秒＋burst20，媒体有独立并发上限。独立进程配置资源上限，不修改现有业务配置或重启业务服务；激活前后核对业务PID、环境／API站点哈希和现有release。失败恢复自己的配置和current。
+
+验证目标服务器有效证书下的HTTPS页面、API、图片／视频Range、安全路径、429和只读身份后，**才**由域名管理人把已有`@`和`www`两条A记录的值改为配置中的生产IPv4，线路／TTL保持原样；API、test、管理后台、邮箱记录都不改。随后运行：
+
+```bash
+./loumai-deploy public-website retire-old --yes
+```
+
+它用校验证书的HTTPS转发器替换旧站点配置，让旧DNS缓存也访问新站；原文件、证书和配置备份保留，不停止旧服务器上的测试服务。证书导入用于切换前验证；正式DNS生效后仍须建立生产证书续期并验收，不能把一次导入当作自动续期已完成。
+
+后续独立官网版本可回滚至已存在的官网release：`./loumai-deploy public-website rollback --release RELEASE_ID --yes`。首次迁移回旧站需另行恢复`backup-old`输出目录中的原站点配置，`nginx -t`通过后reload，再把两条DNS值恢复为旧服务器IPv4；只回滚业务后端不会恢复官网。
 
 四个正式服目标完成一次性初始化后，统一入口只有一条：
 
