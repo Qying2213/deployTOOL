@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from dotenv import dotenv_values
+from pydantic_settings import BaseSettings
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -55,6 +58,21 @@ def archive(path, values=None, extra=None):
 
 
 class PublicWebsiteReleaseTest(unittest.TestCase):
+    def test_allowed_hosts_environment_uses_a_json_array(self):
+        class HostSettings(BaseSettings):
+            backend_allowed_hosts: list[str]
+
+        values = dotenv_values(
+            ROOT / "public-website/remote/public-website.env.example"
+        )
+        with patch.dict(
+            os.environ, {"BACKEND_ALLOWED_HOSTS": values["BACKEND_ALLOWED_HOSTS"]}
+        ):
+            self.assertEqual(
+                HostSettings(_env_file=None).backend_allowed_hosts,
+                ["yinlizhangyu.com", "www.yinlizhangyu.com", "localhost", "127.0.0.1"],
+            )
+
     def test_old_python_is_rejected_before_gate_or_server_calls(self):
         with (
             patch.object(local.tarfile, "data_filter", None),

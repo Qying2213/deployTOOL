@@ -213,7 +213,9 @@ def stage(archive, expected_sha):
         APP_ENVIRONMENT="public_website",
         PUBLIC_WEBSITE_ENABLED="true",
         DATABASE_URL=database.render_as_string(hide_password=False),
-        BACKEND_ALLOWED_HOSTS="yinlizhangyu.com,www.yinlizhangyu.com,localhost,127.0.0.1",
+        BACKEND_ALLOWED_HOSTS=json.dumps(
+            ["yinlizhangyu.com", "www.yinlizhangyu.com", "localhost", "127.0.0.1"]
+        ),
         API_DOCS_ENABLED="false",
         ALLOW_INSECURE_TEST_SETTINGS="false",
         ALLOW_MOCK_WECHAT="false",
