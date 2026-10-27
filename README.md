@@ -55,6 +55,16 @@
 /Users/qinyang/Desktop/zuling/deploy--loumai/deploy-test-backend --dry-run-only
 ```
 
+该入口先用一次fetch锁定`origin/test`，自动快速比较Apifox与全量接口总览；文档统计或目录不一致会在连接服务器及运行完整测试前停止。Git SSH默认有连接心跳，已配置的`GIT_SSH_COMMAND`或`core.sshCommand`会保留。
+
+如果测试服已经运行同一commit，入口仍执行状态、环境审计和云库dry-run，并再次核对服务状态、cloud profile、数据库revision、运行时依赖约束及公网API/数据库健康。全部一致时输出`NO_DEPLOYMENT_NEEDED=true`，不重新构建、迁移或重启；新提交或任何不一致仍进入原完整发布链。相同版本要重建或让进程重新加载已评审配置时使用：
+
+```bash
+/Users/qinyang/Desktop/zuling/deploy--loumai/deploy-test-backend --force-redeploy
+```
+
+`--force-redeploy`仍执行完整Ruff、格式、影子库迁移及全量pytest，不是跳过门禁。`--dry-run-only`在同版本时也会核验只读快捷路径；新版本则只完成预检，始终不会真实发布。每次显示同步/预检/整体耗时便于追踪；本次优化仅在测试服固定入口，原始发布器、正式发布流程和服务器helper均保持不变。
+
 原始后端发布入口仍可按需单独使用：
 
 ```bash

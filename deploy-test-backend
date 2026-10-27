@@ -9,24 +9,33 @@ usage() {
 用法：
   ./deploy-test-backend
   ./deploy-test-backend --dry-run-only
+  ./deploy-test-backend --force-redeploy
   ./deploy-test-backend --help
 
 默认行为：
   1. 自动定位承载 loumai-ai/test 的本地 Git worktree。
   2. 快进同步 origin/test，并要求本地提交与远端完全一致。
-  3. 执行测试服状态检查、环境审计和云数据库发布预检。
-  4. 预检通过后真实发布，并检查部署状态与公网健康接口。
+  3. 自动快速核对接口文档，再执行状态、环境审计和云数据库发布预检。
+  4. 同版本且云库、依赖约束和服务健康一致时，只读复核后结束。
+  5. 新版本通过原完整测试和迁移门禁后发布，并检查公网健康。
 
 --dry-run-only 只执行到发布预检，不上传、迁移或切换测试服版本。
+--force-redeploy 同版本也重新执行完整门禁并发布，用于明确需要重建或加载配置。
 EOF
 }
 
 MODE="deploy"
+FORCE_REDEPLOY=false
+STARTED_SECONDS=$SECONDS
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
 case "${1:-}" in
   "")
     ;;
   --dry-run-only)
     MODE="dry-run"
+    ;;
+  --force-redeploy)
+    FORCE_REDEPLOY=true
     ;;
   -h|--help)
     usage
@@ -61,6 +70,7 @@ trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
 command -v git >/dev/null 2>&1 || fail "未找到 git。"
 command -v curl >/dev/null 2>&1 || fail "未找到 curl。"
+command -v node >/dev/null 2>&1 || fail "未找到 Node.js。"
 [ -d "$SOURCE_REPO/.git" ] || fail "主项目后端仓库不存在：$SOURCE_REPO"
 [ -d "$DEPLOY_REPO/.git" ] || fail "部署工具仓库不存在：$DEPLOY_REPO"
 [ -x "$DEPLOY_REPO/loumai-deploy" ] || fail "统一部署入口不可执行：$DEPLOY_REPO/loumai-deploy"
@@ -71,6 +81,10 @@ if [ -n "$(git -C "$DEPLOY_REPO" status --porcelain)" ]; then
   fail "部署工具仓库存在未提交修改，停止发布。"
 fi
 
+# Respect user-provided SSH commands and identity selection.
+if [ -z "${GIT_SSH_COMMAND:-}" ] && [ -z "$(git -C "$SOURCE_REPO" config --get core.sshCommand || true)" ]; then
+  export GIT_SSH_COMMAND='ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=12 -o TCPKeepAlive=yes'
+fi
 git -C "$SOURCE_REPO" fetch origin --prune
 
 TEST_WORKTREE="$(git -C "$SOURCE_REPO" worktree list --porcelain | awk '
@@ -93,7 +107,7 @@ if [ -n "$(git -C "$TEST_WORKTREE" status --porcelain)" ]; then
   fail "test 工作树存在未提交修改，停止发布。"
 fi
 
-git -C "$TEST_WORKTREE" pull --ff-only origin test
+git -C "$TEST_WORKTREE" merge --ff-only origin/test
 
 LOCAL_COMMIT="$(git -C "$TEST_WORKTREE" rev-parse HEAD)"
 REMOTE_COMMIT="$(git -C "$TEST_WORKTREE" rev-parse origin/test)"
@@ -103,26 +117,55 @@ printf '远端 test：%s\n' "$REMOTE_COMMIT"
 [ "$LOCAL_COMMIT" = "$REMOTE_COMMIT" ] || fail "本地 test 与 origin/test 不一致，停止发布。"
 
 git -C "$TEST_WORKTREE" log -5 --oneline --decorate
+node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" docs "$TEST_WORKTREE"
+printf '源码同步与文档快检：%s 秒。\n' "$((SECONDS - STARTED_SECONDS))"
 
 export BACKEND_REPO="$TEST_WORKTREE"
 export BACKEND_PYTHON_BIN="$BACKEND_PYTHON"
 
 cd "$DEPLOY_REPO"
 
-./loumai-deploy backend status --env test --database-profile active
+STATUS_FILE="$(mktemp "${TMPDIR:-/tmp}/loumai-test-status.XXXXXX")"
+trap 'rm -f "$STATUS_FILE"' EXIT
+./loumai-deploy backend status --env test --database-profile active | tee "$STATUS_FILE"
 ./loumai-deploy backend env-audit --env test
 ./loumai-deploy backend deploy-cloud --env test --dry-run
+
+if [ "$FORCE_REDEPLOY" = false ]; then
+  if node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" unchanged "$STATUS_FILE" "$LOCAL_COMMIT"; then
+    # Re-read runtime state after preflight; an earlier healthy snapshot is insufficient.
+    ./loumai-deploy backend status --env test --database-profile active | tee "$STATUS_FILE"
+    if node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" unchanged "$STATUS_FILE" "$LOCAL_COMMIT"; then
+      [ "$(git -C "$TEST_WORKTREE" rev-parse HEAD)" = "$LOCAL_COMMIT" ] \
+        && [ "$(git -C "$TEST_WORKTREE" rev-parse origin/test)" = "$LOCAL_COMMIT" ] \
+        && [ -z "$(git -C "$TEST_WORKTREE" status --porcelain)" ] \
+        || fail "只读核验期间源码发生变化，请重新执行。"
+      curl --fail --silent --show-error --retry 3 --retry-delay 2 --retry-connrefused \
+        https://test.yinlizhangyu.com/health | node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" health
+      printf '\nNO_DEPLOYMENT_NEEDED=true：测试服已运行 %s，核验耗时 %s 秒；未构建、迁移或重启。\n' \
+        "$LOCAL_COMMIT" "$((SECONDS - STARTED_SECONDS))"
+      exit 0
+    else
+      check_status=$?
+      [ "$check_status" -eq 3 ] || exit "$check_status"
+    fi
+  else
+    check_status=$?
+    [ "$check_status" -eq 3 ] || exit "$check_status"
+  fi
+fi
 
 if [ "$MODE" = "dry-run" ]; then
   printf '\n测试服主项目后端只读预检完成；没有执行真实发布。\n'
   exit 0
 fi
 
+printf '只读预检完成，开始原完整门禁与发布；已耗时 %s 秒。\n' "$((SECONDS - STARTED_SECONDS))"
 ./loumai-deploy backend deploy-cloud --env test --yes
 ./loumai-deploy backend status --env test --database-profile active
 
 curl --fail --silent --show-error \
   --retry 3 --retry-delay 2 --retry-connrefused \
-  https://test.yinlizhangyu.com/health
+  https://test.yinlizhangyu.com/health | node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" health
 
-printf '\n测试服主项目后端发布及健康检查完成。\n'
+printf '\n测试服主项目后端发布及健康检查完成，总耗时 %s 秒。\n' "$((SECONDS - STARTED_SECONDS))"
