@@ -1045,6 +1045,58 @@ test('双数据库 profile 模板不保存真实凭据，并要求所有 writer 
 	assert.match(unifiedEntry, /backend deploy-cloud --yes/)
 })
 
+test('正式服新增后台 worker 限定 jobs 身份并拒绝未知服务', () => {
+	const helper = remoteHelperContractSource()
+	const contract = helper.match(/validate_service_user_contract\(\) \{[\s\S]*?\n\}/)?.[0]
+	assert.ok(contract)
+	for (const [reportedUser, extraService, expected] of [
+		['loumai-jobs', '', 0],
+		['root', '', 1],
+		['loumai-api', '', 1],
+		['loumai-jobs', 'unreviewed.service', 1]
+	]) {
+		const result = spawnSync('bash', ['-c', `
+set -euo pipefail
+ENVIRONMENT=production
+SERVICE_USER=loumai-api
+IM_SERVICE_USER=loumai-im
+VIDEO_SERVICE=loumai-video-worker.service
+VIDEO_SERVICE_USER=loumai-video
+JOB_SERVICE_USER=loumai-jobs
+SERVICES=(loumai-api.service loumai-im-worker.service loumai-video-worker.service loumai-landlord-persona-refresh.service loumai-customer-appointment-preference.service)
+if [[ -n "$TEST_EXTRA_SERVICE" ]]; then SERVICES+=("$TEST_EXTRA_SERVICE"); fi
+fail() { printf '%s\\n' "$*" >&2; exit 1; }
+systemctl() {
+  case "$2" in
+    loumai-api.service) printf 'loumai-api\\n' ;;
+    loumai-im-worker.service) printf 'loumai-im\\n' ;;
+    loumai-video-worker.service) printf 'loumai-video\\n' ;;
+    *) printf '%s\\n' "$TEST_REPORTED_USER" ;;
+  esac
+}
+${contract}
+validate_service_user_contract
+`], { encoding: 'utf8', env: { ...process.env, TEST_REPORTED_USER: reportedUser, TEST_EXTRA_SERVICE: extraService } })
+		assert.equal(result.status, expected, result.stderr)
+	}
+	for (const [name, script] of [
+		['loumai-landlord-persona-refresh', 'run_landlord_persona_refresh_worker.py'],
+		['loumai-customer-appointment-preference', 'run_customer_appointment_preference_worker.py']
+	]) {
+		const source = readFileSync(join(TOOL_ROOT, `backend/remote/${name}.production.service.example`), 'utf8')
+		assert.match(source, /^Type=simple$/m)
+		assert.match(source, /^User=loumai-jobs$/m)
+		assert.match(source, /^SupplementaryGroups=loumai-db-ca$/m)
+		assert.match(source, /^ProtectSystem=strict$/m)
+		assert.match(source, /^NoNewPrivileges=true$/m)
+		assert.match(source, /^Restart=on-failure$/m)
+		assert.ok(source.includes(`ExecStart=/srv/loumai-backend/backend-current/.venv/bin/python scripts/${script}`))
+		const files = [...source.matchAll(/^EnvironmentFile=(.*)$/gm)].map(match => match[1])
+		assert.deepEqual(files, ['/etc/loumai/backend.env', '/etc/loumai/sms.env', '/etc/loumai/database-active.env'])
+		assert.doesNotMatch(source, /MIGRATION_DATABASE_URL|BACKUP_DATABASE_URL|\.env\.test|User=ubuntu/)
+	}
+})
+
 test('正式服 systemd 合同隔离 UID、固定时区并完整纳管三个 timer', () => {
 	const unit = (name) => readFileSync(join(TOOL_ROOT, `backend/remote/${name}`), 'utf8')
 	const productionGuide = readFileSync(
