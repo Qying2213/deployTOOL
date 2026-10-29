@@ -262,6 +262,9 @@ validate_service_user_contract() {
       "$VIDEO_SERVICE")
         expected_user="$VIDEO_SERVICE_USER"
         ;;
+      loumai-landlord-persona-refresh.service|loumai-customer-appointment-preference.service)
+        expected_user="$JOB_SERVICE_USER"
+        ;;
       *)
         fail "正式服包含未识别的长驻服务：$unit"
         ;;

@@ -252,6 +252,14 @@ LOUMAI_BACKEND_PROPERTY_VIDEO_DIRECT_UPLOAD_APPROVED=false
 
 ## 5. 日常发布和回滚
 
+### 新增画像与预约偏好常驻 Worker
+
+`loumai-landlord-persona-refresh.production.service.example`与`loumai-customer-appointment-preference.production.service.example`使用现有`loumai-jobs`身份及数据库CA组，只加载生产backend/sms和runtime-only活动数据库文件；不加载测试配置或迁移凭据。helper仅对这两个明确名称认可jobs身份，其他未知常驻服务继续拒绝。
+
+从尚未包含Worker脚本的旧正式版本升级时，先完成受保护的主后端发布和0128/0129迁移，确认新版本健康，再安装这两个root-owned unit并保持停止。备份`backend-release.env`后，仅将两个服务加入`LOUMAI_BACKEND_SERVICES`；在共享发布锁内启动，核对全部五进程cwd、数据库目标/TLS、运行用户及正式短信设置，再执行status/preflight。后续发布、备份和迁移会统一停写、启动及校验这两个Worker。不要放入独立管理后台名单或关闭身份校验来规避合同。
+
+安装helper须按2.2节独立审查、备份和原子替换，不使用正式服禁止的自动sync-helper。测试的游客、离职转换和模拟短信开关不会由服务模板带入生产；保持正式独立投放值，`ALLOW_TEST_MOCK_SMS=false`、真实短信和注册验证是发布前后必检项。
+
 后端：
 
 ```bash
