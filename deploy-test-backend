@@ -129,10 +129,17 @@ STATUS_FILE="$(mktemp "${TMPDIR:-/tmp}/loumai-test-status.XXXXXX")"
 trap 'rm -f "$STATUS_FILE"' EXIT
 ./loumai-deploy backend status --env test --database-profile active | tee "$STATUS_FILE"
 ./loumai-deploy backend env-audit --env test
-./loumai-deploy backend deploy-cloud --env test --dry-run
+PREFLIGHT_DONE=false
+if [ "$MODE" = "dry-run" ]; then
+  ./loumai-deploy backend deploy-cloud --env test --dry-run
+  PREFLIGHT_DONE=true
+fi
 
 if [ "$FORCE_REDEPLOY" = false ]; then
   if node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" unchanged "$STATUS_FILE" "$LOCAL_COMMIT"; then
+    if [ "$PREFLIGHT_DONE" = false ]; then
+      ./loumai-deploy backend deploy-cloud --env test --dry-run
+    fi
     # Re-read runtime state after preflight; an earlier healthy snapshot is insufficient.
     ./loumai-deploy backend status --env test --database-profile active | tee "$STATUS_FILE"
     if node "$SCRIPT_ROOT/backend/test-release-precheck.mjs" unchanged "$STATUS_FILE" "$LOCAL_COMMIT"; then

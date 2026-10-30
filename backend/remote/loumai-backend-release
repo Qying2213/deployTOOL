@@ -1585,15 +1585,30 @@ install_runtime() {
       --python "$backend/.venv/bin/python" \
       --constraint "$backend/runtime-constraints.txt" \
       setuptools
-  run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
-    HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
-    UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
-    "$UV_BIN" pip install \
-      --python "$backend/.venv/bin/python" \
-      --no-build-isolation \
-      --constraint "$backend/runtime-constraints.txt" \
-      "$build_source"
+  # Only a new isolated candidate environment is touched; a cache miss retries the original constrained install.
+  if [[ "$ENVIRONMENT" == "test" ]] && \
+    run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+      HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+      UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
+      "$UV_BIN" pip install --offline \
+        --python "$backend/.venv/bin/python" --no-build-isolation \
+        --constraint "$backend/runtime-constraints.txt" "$build_source" \
+        > "$build_dir/offline-check.log" 2>&1; then
+    printf 'TEST_RUNTIME_DEPENDENCIES=OFFLINE_CACHE\n'
+    cat "$build_dir/offline-check.log"
+  else
+    [[ "$ENVIRONMENT" != "test" ]] || printf 'TEST_RUNTIME_DEPENDENCIES=ONLINE_FALLBACK\n'
+    run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
+      HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \
+      UV_CACHE_DIR="$uv_cache" UV_LINK_MODE=copy \
+      "$UV_BIN" pip install \
+        --python "$backend/.venv/bin/python" \
+        --no-build-isolation \
+        --constraint "$backend/runtime-constraints.txt" \
+        "$build_source"
+  fi
   run_as_clean "$BUILD_USER" /usr/bin/env -i --chdir="$build_home" \
     HOME="$build_home" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 \

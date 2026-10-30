@@ -209,6 +209,15 @@ test("stale API docs fail before contacting any server", t => {
   assert.ok(!calls.some(call => call.name === "loumai-deploy" || call.name === "curl"));
 });
 
+test("new-version real deploy delegates preflight to the deployer without a redundant outer dry-run", t => {
+  const { result, calls } = runEntry(t, { env: { NEW_COMMIT: "1" } });
+  assert.equal(result.status, 0, result.stderr);
+  const remote = calls.filter(call => call.name === "loumai-deploy");
+  assert.equal(remote.filter(call => call.args.includes("--dry-run")).length, 0);
+  assert.equal(remote.filter(call => call.args.includes("--yes")).length, 1);
+  assert.ok(remote.some(call => call.args.includes("env-audit")));
+});
+
 test("dry-run remains read-only and respects the configured SSH command", t => {
   const { result, calls } = runEntry(t, { args: ["--dry-run-only"], env: { CORE_SSH: "ssh -i custom-key" } });
   assert.equal(result.status, 0, result.stderr);

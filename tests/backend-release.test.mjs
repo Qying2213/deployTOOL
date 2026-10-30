@@ -435,7 +435,8 @@ test('本地发布器从干净且已同步的精确 Git commit 打包，并避�
 	const rollbackStart = source.indexOf('function rollback(', deployStart)
 	assert.ok(deployStart > 0 && rollbackStart > deployStart)
 	assert.doesNotMatch(source.slice(deployStart, rollbackStart), /runQualityGates/)
-	assert.equal((source.match(/runQualityGates\(config/g) || []).length, 2)
+	assert.equal((source.match(/runQualityGates\(config/g) || []).length, 3)
+	assert.match(source, /if \(args.skipTests\) runQualityGates[\s\S]*else testQualityGates/)
 })
 
 test('后端长时间发布为 SSH 与 SCP 配置保活，避免依赖安装期间空闲断线', () => {
@@ -481,7 +482,7 @@ test('服务器激活器具备 root 信任边界、验签、并发锁和原子�
 	assert.match(helper, /run_as_clean "\$BUILD_USER"/)
 	assert.equal(
 		(helper.match(/\/usr\/bin\/env -i --chdir="\$build_home"/g) || []).length,
-		4,
+		5,
 		'所有 uv 子进程都必须从构建用户可访问的 HOME 启动',
 	)
 	assert.match(helper, /正式服部署用户与服务用户必须使用不同 UID/)
@@ -825,8 +826,8 @@ test('迁移发布先停写与备份，迁移后故障保持服务停止且不�
 test('真实发布在耗时质量门禁前校验 helper，上传前仍复核，离线 build 不连接服务器', () => {
 	const source = readFileSync(join(TOOL_ROOT, 'backend/backend-release.mjs'), 'utf8')
 	const mainSource = source.slice(source.indexOf('export function main('))
-	const earlyCheck = mainSource.indexOf("if (args.command !== 'build') {")
-	const qualityGates = mainSource.indexOf('runQualityGates(config,')
+	const earlyCheck = mainSource.indexOf("if (!['build', 'verify'].includes(args.command)) {")
+	const qualityGates = mainSource.indexOf('else testQualityGates(config,')
 	assert.ok(earlyCheck > 0 && earlyCheck < qualityGates)
 	assert.match(mainSource, /if \(args\.syncHelper\) syncRemoteHelper\(config\)/)
 	assert.match(mainSource, /else assertRemoteHelperExact\(config\)/)

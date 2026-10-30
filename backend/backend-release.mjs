@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readExpiryPlan, observeNotificationAcceptance } from './notification-health.mjs'
+import { testQualityGates } from './test-quality-receipt.mjs'
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -283,6 +284,7 @@ function usage() {
 
 用法：
   node backend/backend-release.mjs build [--env test|production] [--config FILE] [--skip-tests]
+  node backend/backend-release.mjs verify --env test [--config FILE]
   node backend/backend-release.mjs env-audit --env test|production [--all] [--config FILE]
   node backend/backend-release.mjs deploy --env test|production --dry-run [--config FILE]
   node backend/backend-release.mjs deploy --env test|production --yes [--config FILE]
@@ -473,6 +475,11 @@ function runQualityGates(config, { skipTests = false } = {}) {
 	if (skipTests) {
 		warn('仅 build 跳过 Ruff、迁移影子库和 pytest；该产物不能由 deploy 默认发布')
 		return
+	}
+	if (config.environment === 'test' && existsSync(join(config.repoRoot, 'scripts/check_im_ai_security.sh'))) {
+		run('/bin/bash', ['scripts/check_im_ai_security.sh'], {
+			cwd: config.repoRoot, env: { ...process.env, PYTHON_BIN: config.pythonBin }
+		})
 	}
 	run(config.pythonBin, ['-m', 'ruff', 'check', 'app', 'alembic', 'scripts'], {
 		cwd: config.repoRoot
@@ -1225,10 +1232,13 @@ export function main(argv = process.argv.slice(2)) {
 		return
 	}
 	if (![
-		'build', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit',
+		'build', 'verify', 'bootstrap', 'deploy', 'deploy-cloud', 'recover', 'env-audit',
 		'status', 'notification-status', 'rollback', 'sync-helper'
 	].includes(args.command)) {
 		fail(`未知命令：${args.command}`)
+	}
+	if (args.command === 'verify' && (args.environment !== 'test' || args.yes || args.dryRun || args.skipTests || args.syncHelper || args.releaseId || args.databaseProfile || args.ackDbSchemaCompatible)) {
+		fail('verify 仅用于测试服本地完整门禁，不接受发布或跳过参数')
 	}
 	if (args.notificationExpiryPlan && !['deploy', 'deploy-cloud', 'recover'].includes(args.command)) fail('通知清理计划只用于真实部署，不用于状态或回退')
 	if (args.notificationExpiryPlan && args.dryRun) fail('dry-run 不应用清理计划；请先单独预览')
@@ -1289,7 +1299,7 @@ export function main(argv = process.argv.slice(2)) {
 	if (['bootstrap', 'deploy', 'deploy-cloud', 'recover'].includes(args.command) && !args.dryRun && !args.yes) {
 		fail(`正式 ${args.command} 必须显式提供 --yes`)
 	}
-	const config = loadConfiguration(args, { requireRemote: args.command !== 'build' })
+	const config = loadConfiguration(args, { requireRemote: !['build', 'verify'].includes(args.command) })
 	if (args.command === 'notification-status') {
 		const result = notificationSnapshot(config)
 		if (result.RELEASE_ACCEPTANCE !== 'PASSED') process.exitCode = 2
@@ -1303,7 +1313,11 @@ export function main(argv = process.argv.slice(2)) {
 		rollback(config, args)
 		return
 	}
-	const gitState = inspectGitState(config)
+	// A clean feature branch can be checked before it is pushed or merged; deployment remains strict.
+	const checkConfig = args.command === 'verify'
+		? { ...config, expectedBranch: git(config.repoRoot, ['branch', '--show-current']), requireUpstreamMatch: false }
+		: config
+	const gitState = inspectGitState(checkConfig)
 	const artifactDbHead = inspectMigrationHead(config)
 	info(`锁定后端 commit=${gitState.commit}，alembic_head=${artifactDbHead}`)
 	const databaseProfile = args.command === 'recover'
@@ -1321,16 +1335,23 @@ export function main(argv = process.argv.slice(2)) {
 		return
 	}
 	// 提前发现安装版本漂移；耗时门禁后 deploy 的 preflight 仍会再次复核。
-	if (args.command !== 'build') {
+	if (!['build', 'verify'].includes(args.command)) {
 		if (args.syncHelper) syncRemoteHelper(config)
 		else assertRemoteHelperExact(config)
 	}
-	runQualityGates(config, { skipTests: args.skipTests })
-	const verifiedGitState = inspectGitState(config)
+	if (args.skipTests) runQualityGates(config, { skipTests: true })
+	else testQualityGates(config, artifactDbHead, () => {
+		if (config.environment === 'test' && ['deploy', 'deploy-cloud', 'recover'].includes(args.command)) {
+			remotePreflight(config, databaseProfile, { mode: operationMode })
+		}
+		runQualityGates(config)
+	}, { force: args.command === 'verify', report: info })
+	const verifiedGitState = inspectGitState(checkConfig)
 	const verifiedDbHead = inspectMigrationHead(config)
 	if (verifiedGitState.commit !== gitState.commit || verifiedDbHead !== artifactDbHead) {
 		fail('质量检查期间源码 commit 或 Alembic head 发生变化，请重新执行')
 	}
+	if (args.command === 'verify') return
 	if (args.command === 'build') {
 		buildRelease(config, gitState, artifactDbHead)
 		return
