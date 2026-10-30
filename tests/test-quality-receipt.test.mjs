@@ -78,6 +78,21 @@ test('force verify failure revokes a previous success', async t => {
 	assert.equal(f.run(), false); assert.equal(f.calls(), 2)
 })
 
+test('launcher identity and unused PATH entries do not rerun successful gates', async t => {
+	const f = await fixture(t); f.env.PATH = process.env.PATH; f.run()
+	f.env.CODEX_TOOL_CALL_ID = 'another-launch'; f.env.FPATH = '/unused/shell/functions'
+	f.env.PATH += ':/missing/launcher/path'
+	assert.equal(f.run(), true); assert.equal(f.calls(), 1)
+})
+
+test('a different resolved executable invalidates the receipt even when Python is unchanged', async t => {
+	const f = await fixture(t), bin = join(f.root, 'executables')
+	mkdirSync(bin); writeFileSync(join(bin, 'pg_dump'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+	f.env.PATH = bin + ':' + process.env.PATH; f.run()
+	writeFileSync(join(bin, 'pg_dump'), '#!/bin/sh\nexit 1\n')
+	assert.equal(f.run(), false); assert.equal(f.calls(), 2)
+})
+
 test('key permission fallback failure cannot resurrect an earlier success', async t => {
 	const f = await fixture(t); f.run()
 	const key = join(f.directory, 'signing-key')

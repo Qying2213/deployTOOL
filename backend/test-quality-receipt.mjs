@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -10,7 +10,8 @@ const IGNORED_ENV = new Set([
 	'PWD', 'OLDPWD', 'SHLVL', '_', 'TERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
 	'GIT_PAGER', 'GIT_SSH_COMMAND', 'PAGER', 'SYSTEMD_COLORS', 'SYSTEMD_PAGER',
 	'PYTHONUNBUFFERED', 'PYTHONDONTWRITEBYTECODE', 'NO_COLOR', 'FORCE_COLOR', 'CLICOLOR',
-	'BACKEND_REPO', 'BACKEND_PYTHON_BIN', 'LOUMAI_SOURCE_REPO', 'LOUMAI_PROJECT_ROOT', 'LOUMAI_BACKEND_PYTHON'
+	'BACKEND_REPO', 'BACKEND_PYTHON_BIN', 'LOUMAI_SOURCE_REPO', 'LOUMAI_PROJECT_ROOT', 'LOUMAI_BACKEND_PYTHON',
+	'CODEX_TOOL_CALL_ID', 'FPATH', 'PATH'
 ])
 const hash = value => createHash('sha256').update(value).digest('hex')
 
@@ -30,10 +31,24 @@ function fingerprint(config, dbHead, environment) {
 		'print(json.dumps({"version":sys.version,"prefix":sys.prefix,"packages":rows},sort_keys=True))'
 	].join(';')], config.repoRoot)
 	const env = Object.fromEntries(Object.entries(environment).filter(([key]) => !IGNORED_ENV.has(key)).sort(([a], [b]) => a.localeCompare(b)))
+	// PATH contains launcher-specific temporary directories. Bind the actual gate executables instead.
+	const executables = ['git', 'pg_dump', 'pg_restore'].map(name => {
+		for (const directory of String(environment.PATH || process.env.PATH || '').split(delimiter)) {
+			const path = resolve(config.repoRoot, directory || '.', name)
+			try {
+				accessSync(path, constants.X_OK)
+				const resolved = realpathSync(path)
+				return [name, resolved, hash(readFileSync(resolved))]
+			} catch { /* Continue searching PATH, matching ordinary executable lookup. */ }
+		}
+		return [name, 'MISSING']
+	})
+	executables.push(['/bin/bash', hash(readFileSync('/bin/bash'))])
 	const dotenv = join(config.repoRoot, '.env')
 	const identity = {
 		version: 1, tree, common, dbHead, environment: config.environment,
 		node: [process.version, process.platform, process.arch],
+		executables,
 		constraints: hash(readFileSync(config.constraintsPath)),
 		python: hash(realpathSync(config.pythonBin) + '\n' + hash(readFileSync(realpathSync(config.pythonBin))) + '\n' + python),
 		settings: hash(JSON.stringify(env) + '\n' + (existsSync(dotenv) ? hash(readFileSync(dotenv)) : 'NO_ENV_FILE')),
